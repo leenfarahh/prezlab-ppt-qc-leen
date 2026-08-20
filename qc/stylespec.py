@@ -70,6 +70,8 @@ GUIDE_UNIT_EMU = 12700 / 8
 # Page furniture sits in the margins by design and must never teach the grid
 # where the content area begins.
 FURNITURE_PH = frozenset({"ftr", "sldNum", "dt"})
+# The header roles. A frame that starts below these is a frame around the BODY.
+HEADER_PH = frozenset({"title", "ctrTitle", "subTitle"})
 
 
 # ------------------------------------------------------------------- master
@@ -624,57 +626,120 @@ def read_guides(master) -> dict:
 
 PRESENTATION_SPACE_NAMES = ("presentationspace", "presentationarea",
                             "contentspace", "contentarea")
+# The marker an ADD-IN writes, and the one the design team actually produces.
+# ToolsToo stamps its presentation-space rectangle's ALT TEXT with "ToolsToo_PS"
+# and leaves the shape NAME as PowerPoint made it ("Rectangle 2"), so a
+# name-only read missed the only marker here that is written by a tool rather
+# than typed by hand: the client master in data/templates carries exactly this
+# one, and every frame read on it fell through to the guides.
+#
+# Alt text also OUTRANKS a matching name. A name is typed and survives copying,
+# so it can be a leftover; the alt text is written by the add-in that owns the
+# concept, on the rectangle it is currently driving.
+PRESENTATION_SPACE_ALT = ("toolstoops",)
 # A frame drawn a hair off the canvas edge is rounding, not a mistake.
 EDGE_SLACK = 36000              # 1mm
+# Two markers whose boxes differ by less than this are the same frame typed
+# twice, not a disagreement worth a designer's attention.
+SPACE_AGREE_SLACK = 36000       # 1mm
 
 
 def _norm_name(name: str) -> str:
     return "".join(ch for ch in (name or "").lower() if ch.isalnum())
 
 
+def alt_text(shape) -> str:
+    """A shape's alt text (cNvPr/@descr), "" when it carries none."""
+    cNvPr = find(shape._element, ".//p:cNvPr")
+    return (cNvPr.get("descr") or "") if cNvPr is not None else ""
+
+
+def space_marker(shape) -> str | None:
+    """"alt_text" or "name" when this shape is a presentation-space marker,
+    else None. The kind is carried through the read because it says how the
+    frame was declared, and a designer asked to move or fix one needs to be
+    told which of the two to look for."""
+    if _norm_name(alt_text(shape)) in PRESENTATION_SPACE_ALT:
+        return "alt_text"
+    if _norm_name(shape.name) in PRESENTATION_SPACE_NAMES:
+        return "name"
+    return None
+
+
 def _space_from(container, sw, sh):
-    """The presentation-space rectangle among a container's own shapes."""
+    """The presentation-space rectangle among a container's own shapes.
+
+    Every candidate is read, not just the first: a container carrying two
+    markers that disagree would otherwise hand every downstream pass a frame
+    picked by document order, which is nobody's decision. The add-in marker
+    wins, and a real disagreement is reported without refusing the frame -
+    falling back to the guides over a duplicate rectangle would throw away the
+    better statement of the two."""
+    found = []
     for shape in container.shapes:
-        if _norm_name(shape.name) not in PRESENTATION_SPACE_NAMES:
+        kind = space_marker(shape)
+        if kind is None:
             continue
         l, t, w, h = shape.left, shape.top, shape.width, shape.height
         if None in (l, t, w, h) or w <= 0 or h <= 0:
             continue
-        # A marker is meant to be invisible, and a rectangle a designer just
-        # drew is not: its fill and line come from the shape STYLE (p:style
-        # fillRef / lnRef), with nothing in spPr to find. So invisibility has to
-        # be stated - an explicit noFill on both - and anything else prints on
-        # every slide of every deck, which the read says out loud.
-        spPr = find(shape._element, "p:spPr")
-        fill_off = find(spPr, "a:noFill") is not None
-        ln = find(spPr, "a:ln")
-        line_off = ln is not None and find(ln, "a:noFill") is not None
-        # A frame has to be ON the page. A rectangle hanging off the canvas -
-        # left over from a resized master, or drawn on the wrong slide size -
-        # would hand every downstream pass a negative margin, so it is read,
-        # reported and NOT used.
-        problem = None
-        if l < -EDGE_SLACK or t < -EDGE_SLACK \
-                or l + w > sw + EDGE_SLACK or t + h > sh + EDGE_SLACK:
-            problem = ("the rectangle is not inside the slide, so it cannot be "
-                       "a content frame; check it against this master's slide "
-                       "size")
-        return {"left": l, "top": t, "right": sw - (l + w),
-                "bottom": sh - (t + h), "box_emu": [l, t, l + w, t + h],
-                "prints": not (fill_off and line_off), "name": shape.name,
-                "problem": problem}
-    return None
+        found.append((0 if kind == "alt_text" else 1, kind, shape, (l, t, w, h)))
+    if not found:
+        return None
+
+    found.sort(key=lambda f: f[0])
+    _rank, kind, shape, (l, t, w, h) = found[0]
+    # A marker is meant to be invisible, and a rectangle a designer just
+    # drew is not: its fill and line come from the shape STYLE (p:style
+    # fillRef / lnRef), with nothing in spPr to find. So invisibility has to
+    # be stated - an explicit noFill on both - and anything else prints on
+    # every slide of every deck, which the read says out loud.
+    spPr = find(shape._element, "p:spPr")
+    fill_off = find(spPr, "a:noFill") is not None
+    ln = find(spPr, "a:ln")
+    line_off = ln is not None and find(ln, "a:noFill") is not None
+    # A frame has to be ON the page. A rectangle hanging off the canvas -
+    # left over from a resized master, or drawn on the wrong slide size -
+    # would hand every downstream pass a negative margin, so it is read,
+    # reported and NOT used.
+    problem = None
+    if l < -EDGE_SLACK or t < -EDGE_SLACK \
+            or l + w > sw + EDGE_SLACK or t + h > sh + EDGE_SLACK:
+        problem = ("the rectangle is not inside the slide, so it cannot be "
+                   "a content frame; check it against this master's slide "
+                   "size")
+    rivals = [f for f in found[1:]
+              if any(abs(a - b) > SPACE_AGREE_SLACK
+                     for a, b in zip(f[3], (l, t, w, h)))]
+    return {"left": l, "top": t, "right": sw - (l + w),
+            "bottom": sh - (t + h), "box_emu": [l, t, l + w, t + h],
+            "prints": not (fill_off and line_off), "name": shape.name,
+            "marker": kind, "alt_text": alt_text(shape) or None,
+            "rivals": [{"name": f[2].name, "marker": f[1],
+                        "box_emu": [f[3][0], f[3][1],
+                                    f[3][0] + f[3][2], f[3][1] + f[3][3]]}
+                       for f in rivals],
+            "problem": problem}
 
 
 def read_presentation_space(prs, master) -> dict | None:
     """The designer's declared content frame, as margins from each edge, or
     None when the master does not carry one.
 
+    A marker is either a rectangle NAMED "Presentation space" or one whose ALT
+    TEXT an add-in stamped (ToolsToo_PS). Both are read; see space_marker.
+
     Looked for on the MASTER first, because a frame that governs the deck
-    belongs where the deck's every slide inherits from. A marker found only on a
-    layout is still read - a designer trying this out will put it wherever seems
-    natural - and `source` says where it came from so the read can ask for it to
-    be moved."""
+    belongs where the deck's every slide inherits from - that outranks which
+    kind of marker it is, since a marker on the master is a statement about the
+    whole deck and one on a layout is a statement about that layout. A marker
+    found only on a layout is still read - the client masters put it there, and
+    a designer trying this out will put it wherever seems natural - and `source`
+    says where it came from so the read can ask for it to be moved.
+
+    Layouts are walked in order, so the first layout carrying a marker states
+    the frame. Where several layouts disagree the read says so rather than
+    letting layout order decide silently."""
     if master is None:
         return None
     sw, sh = prs.slide_width, prs.slide_height
@@ -682,12 +747,23 @@ def read_presentation_space(prs, master) -> dict | None:
     if space:
         space["source"] = "master"
         return space
+
+    chosen = None
     for layout in master.slide_layouts:
         space = _space_from(layout, sw, sh)
-        if space:
+        if not space:
+            continue
+        if chosen is None:
             space["source"] = f"layout '{layout.name}'"
-            return space
-    return None
+            chosen = space
+            continue
+        if any(abs(a - b) > SPACE_AGREE_SLACK
+               for a, b in zip(space["box_emu"], chosen["box_emu"])):
+            chosen["rivals"].append({"name": space["name"],
+                                     "marker": space["marker"],
+                                     "box_emu": space["box_emu"],
+                                     "source": f"layout '{layout.name}'"})
+    return chosen
 
 
 # A guide within this of the canvas centre line is a CENTRE guide: masters
@@ -749,6 +825,20 @@ def _infer_columns(vertical, tolerance_emu: int = 9525):
     return len(widths), int(statistics.median(gutters))
 
 
+def _header_floor(container) -> int:
+    """Bottom of the master's own title/subtitle boxes: the line below which a
+    heading no longer lives. 0 when the master states no header at all."""
+    floor = 0
+    for ph in container.placeholders:
+        if _ph_token(ph) not in HEADER_PH:
+            continue
+        t, h = ph.top, ph.height
+        if None in (t, h):
+            continue
+        floor = max(floor, t + h)
+    return floor
+
+
 def _content_extent(container):
     """Bounding box of the container's CONTENT placeholders. Page furniture
     is excluded: footers and slide numbers live in the margins by design and
@@ -792,15 +882,50 @@ def infer_grid(prs, master) -> dict:
     out = {"guides": guides, "margins_emu": None, "columns": None,
            "gutter_emu": None, "source": None,
            "subtitle_floor_emu": None, "body_top_emu": None,
-           "presentation_space": space}
+           "presentation_space": space, "space_states": None}
 
     # The band is read whenever the guides state one, whatever the frame source.
     if len(h) >= 3:
         out["subtitle_floor_emu"], out["body_top_emu"] = read_content_band(h, sh)
 
     if space is not None and not space.get("problem"):
-        out["margins_emu"] = {side: space[side]
-                              for side in ("left", "top", "right", "bottom")}
+        margins = {side: space[side]
+                   for side in ("left", "top", "right", "bottom")}
+        # WHAT the rectangle is a frame around. Designers draw it both ways and
+        # the two mean different things: around the whole page, its top is the
+        # page's top margin; around the BODY, its top is where content begins,
+        # and the header lives above it by design. Which one this is, is a fact
+        # rather than a guess - a frame starting at or below the master's own
+        # title and subtitle boxes excludes the header by construction. The
+        # client master draws it around the body, landing on the master's body
+        # placeholder to the EMU (1.90in), 1.45in below the page's own top
+        # margin.
+        #
+        # Read as a page margin, that top would become the deck's safe-zone
+        # ceiling, and every title on every slide - all of which sit above it,
+        # where the master puts them - would be reported as breaking a margin
+        # the designer never drew there.
+        floor = _header_floor(master)
+        top = space["box_emu"][1]
+        if floor and top >= floor - EDGE_SLACK:
+            out["space_states"] = "body"
+            # Where content begins is exactly what the rectangle states. It
+            # only takes the field when the guides do not already: two
+            # statements of the same line agree on these masters, and the
+            # guides also carry the subtitle floor above it, which one
+            # rectangle cannot.
+            if not out["body_top_emu"]:
+                out["body_top_emu"] = top
+            # The PAGE's top margin then comes from the next-best statement,
+            # the same ranking the rest of this function uses.
+            page_top = h[0] if len(h) >= 2 else None
+            if page_top is None:
+                box = _content_extent(master)
+                page_top = box[1] if box else None
+            margins["top"] = page_top if page_top is not None else top
+        else:
+            out["space_states"] = "page"
+        out["margins_emu"] = margins
         out["columns"], out["gutter_emu"] = _infer_columns(v)
         out["source"] = "presentation_space"
         return out
@@ -955,6 +1080,10 @@ def spec_to_profile(spec: dict, profile_id: str, name: str) -> dict:
                 "spec_version": spec.get("spec_version"),
                 "extracted_at": spec.get("meta", {}).get("extracted_at"),
                 "grid_source": grid.get("source"),
+                # Whether the rectangle framed the page or the body, because it
+                # decides which of these margins is the page's top and a stale
+                # profile otherwise looks identical to a misread one.
+                "space_states": grid.get("space_states"),
             },
             "master_slide": {
                 "enforce_existing_only": True, "pinned_layout_id": None,

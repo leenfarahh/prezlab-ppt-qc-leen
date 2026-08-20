@@ -478,7 +478,7 @@ def format_deck(request: Request, deck: UploadFile = File(...),
     from pptx import Presentation
 
     from .applymaster import apply_master, plan_assignments
-    from .stylespec import dominant_master, extract_layouts
+    from .stylespec import dominant_master, extract_layouts, infer_grid
     from .templates import load_master
     from .ui_format import render_format_intake, render_format_result
     from .unify import com_available
@@ -515,6 +515,13 @@ def format_deck(request: Request, deck: UploadFile = File(...),
         # spec: the file is the source of truth and cannot drift from itself.
         plans = plan_assignments(deck_prs,
                                  extract_layouts(target, embed_assets=False))
+        # The submitted master's own frame, kept only as a fallback: the output
+        # deck is asked first, because PowerPoint resizes a loaded design to the
+        # deck's slide size and the file it writes is the only place the frame's
+        # real numbers are (qc.pspace).
+        master_space = (infer_grid(master_prs, target)
+                        or {}).get("presentation_space")
+        master_size = (master_prs.slide_width, master_prs.slide_height)
     except Exception as exc:
         return _fail(f"Could not read that deck: {type(exc).__name__}: {exc}", 422)
 
@@ -524,6 +531,23 @@ def format_deck(request: Request, deck: UploadFile = File(...),
     result = apply_master(data, master_bytes, plans)
     if result.fatal:
         return _fail(result.fatal, 503)
+
+    # The presentation space goes in BEFORE the content moves. The migration
+    # seats every slide's body on the frame it reads from that slide's own
+    # master, so a deck whose masters carry the marker seats its stragglers on
+    # the new frame too, instead of on whatever the original design implied.
+    from .pspace import ensure_presentation_space
+
+    try:
+        result.deck, space_notes = ensure_presentation_space(
+            result.deck,
+            fallback_box=(master_space or {}).get("box_emu")
+            if not (master_space or {}).get("problem") else None,
+            fallback_size=master_size)
+    except Exception as exc:
+        space_notes = [f"The presentation space could not be written into the "
+                       f"deck ({type(exc).__name__}: {exc}). The layouts were "
+                       f"still applied; the marker is missing from the masters."]
 
     # Applying the layout is only half of it: PowerPoint remaps placeholder
     # content, but a deck of free-floating shapes keeps them exactly where
@@ -552,6 +576,7 @@ def format_deck(request: Request, deck: UploadFile = File(...),
                                 "applied": result.applied,
                                 "masters": result.masters,
                                 "stragglers": result.stragglers,
+                                "space_notes": space_notes,
                                 "changes": content_changes, "restored": []}
         while len(_format_jobs) > MAX_FORMAT_JOBS:
             _format_jobs.popitem(last=False)
@@ -561,7 +586,8 @@ def format_deck(request: Request, deck: UploadFile = File(...),
         deck_name=filename, profile_name=(profile_meta or {}).get("name", profile),
         job_id=job_id, plans=result.plans, errors=result.errors,
         applied=result.applied, content_changes=content_changes,
-        masters=result.masters, stragglers=result.stragglers))
+        masters=result.masters, stragglers=result.stragglers,
+        space_notes=space_notes))
 
 
 @app.post("/format/{job_id}/restore", response_class=HTMLResponse)
@@ -619,7 +645,8 @@ def format_restore(job_id: str, restore_ids: list[str] = Form(None)):
         restored_notes=job.get("restored_notes") or {},
         restore_error=job.get("restore_error"),
         masters=job.get("masters") or 1,
-        stragglers=job.get("stragglers") or []))
+        stragglers=job.get("stragglers") or [],
+        space_notes=job.get("space_notes") or []))
 
 
 @app.get("/format/{job_id}/download")

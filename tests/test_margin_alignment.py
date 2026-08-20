@@ -603,3 +603,142 @@ def test_spacing_fix_reverts_if_it_would_create_a_collision(make_prs, en_profile
     cleaned = Presentation(io.BytesIO(fix.cleaned_bytes))
     by_id = {str(sh.shape_id): sh for sh in cleaned.slides[0].shapes}
     assert by_id[str(third.shape_id)].left == third.left  # untouched
+
+
+# --------------------------------------- the text inside an aligned box
+#
+# The one alignment defect the box-edge rules cannot see: boxes that share a
+# top edge to the EMU, holding text that sits at different heights inside them
+# because their vertical anchors disagree. The anchor is stated in the file, so
+# this stays a fact about the deck rather than a rendering estimate.
+
+
+def _anchored(slide, left, top, anchor, text="Label text",
+              width=1000000, height=500000, autofit=False):
+    """A fixed-height text box, which is the only kind whose anchor draws
+    anything. python-pptx (like PowerPoint's own Insert > Text Box) writes
+    a:spAutoFit, so the box hugs its copy and sits wherever the anchor puts
+    nothing; `autofit=False` is the designer's "do not autofit"."""
+    from pptx.oxml.ns import qn
+
+    tb = _box(slide, left, top, width=width, height=height, text=text)
+    bodyPr = tb.text_frame._txBody.find(qn("a:bodyPr"))
+    if not autofit:
+        for el in bodyPr.findall(qn("a:spAutoFit")):
+            bodyPr.remove(el)
+    if anchor:
+        bodyPr.set("anchor", anchor)
+    return tb
+
+
+def _anchor_records(records):
+    return [r for r in records
+            if r.issue_type == "margin_alignment.text_anchor_mismatch"]
+
+
+def test_one_box_in_an_aligned_row_anchors_its_text_differently(
+        make_prs, en_profile, tmp_path):
+    prs = make_prs()
+    slide = _blank_slide(prs)
+    _anchored(slide, IN, IN, "t")
+    _anchored(slide, 3 * IN, IN, "t")
+    odd = _anchored(slide, 5 * IN, IN, "b")
+    ctx = save_and_ctx(prs, tmp_path, en_profile)
+
+    found = _anchor_records(detect(ctx))
+    assert len(found) == 1
+    rec = found[0]
+    assert rec.shape_id == str(odd.shape_id)
+    assert rec.property == "bodyPr.anchor"
+    assert rec.old_value == "b"
+    assert rec.new_value == "t"
+    assert rec.action == "flagged"
+    assert rec.severity == "warning"
+    assert "bottom" in rec.message and "top" in rec.message
+
+
+def test_a_row_that_agrees_says_nothing(make_prs, en_profile, tmp_path):
+    prs = make_prs()
+    slide = _blank_slide(prs)
+    for i in range(3):
+        _anchored(slide, IN + i * 2 * IN, IN, "ctr")
+    ctx = save_and_ctx(prs, tmp_path, en_profile)
+
+    assert _anchor_records(detect(ctx)) == []
+
+
+def test_an_unstated_anchor_is_the_ooxml_default_not_a_deviation(
+        make_prs, en_profile, tmp_path):
+    """A box that states nothing is anchored top, which is what the two that
+    say so are: three agreeing boxes, no finding."""
+    prs = make_prs()
+    slide = _blank_slide(prs)
+    _anchored(slide, IN, IN, "t")
+    _anchored(slide, 3 * IN, IN, "t")
+    _anchored(slide, 5 * IN, IN, None)
+    ctx = save_and_ctx(prs, tmp_path, en_profile)
+
+    assert _anchor_records(detect(ctx)) == []
+
+
+def test_boxes_of_different_heights_are_not_one_row_of_labels(
+        make_prs, en_profile, tmp_path):
+    """Different-size boxes starting on the same line are assorted content,
+    and their anchors are not comparable."""
+    prs = make_prs()
+    slide = _blank_slide(prs)
+    _anchored(slide, IN, IN, "t")
+    _anchored(slide, 3 * IN, IN, "t")
+    _anchored(slide, 5 * IN, IN, "b", height=2000000)
+    ctx = save_and_ctx(prs, tmp_path, en_profile)
+
+    assert _anchor_records(detect(ctx)) == []
+
+
+def test_a_row_with_no_majority_is_left_alone(make_prs, en_profile, tmp_path):
+    """Three boxes, three anchors: there is no line to have deviated from."""
+    prs = make_prs()
+    slide = _blank_slide(prs)
+    _anchored(slide, IN, IN, "t")
+    _anchored(slide, 3 * IN, IN, "ctr")
+    _anchored(slide, 5 * IN, IN, "b")
+    ctx = save_and_ctx(prs, tmp_path, en_profile)
+
+    assert _anchor_records(detect(ctx)) == []
+
+
+def test_a_box_that_hugs_its_text_is_excluded(make_prs, en_profile, tmp_path):
+    """With a:spAutoFit the box height tracks the copy, so the anchor draws
+    nothing and every such row would report a difference nobody can see."""
+    prs = make_prs()
+    slide = _blank_slide(prs)
+    _anchored(slide, IN, IN, "t")
+    _anchored(slide, 3 * IN, IN, "t")
+    _anchored(slide, 5 * IN, IN, "b", autofit=True)
+    ctx = save_and_ctx(prs, tmp_path, en_profile)
+
+    assert _anchor_records(detect(ctx)) == []
+
+
+def test_the_anchor_mismatch_is_never_offered_as_a_fix(make_prs, en_profile,
+                                                       tmp_path):
+    """A deliberately bottom-anchored caption is a real design, so the tool
+    states the difference and the designer settles it."""
+    from qc.fixer import FIXABLE_ISSUES
+
+    assert "margin_alignment.text_anchor_mismatch" not in FIXABLE_ISSUES
+
+
+def test_arabic_text_anchors_are_compared_the_same_way(make_prs, en_profile,
+                                                       tmp_path):
+    """The anchor is vertical, so it is direction-neutral: an Arabic row is
+    judged by the same rule and the record is marked for review."""
+    prs = make_prs()
+    slide = _blank_slide(prs)
+    for i, anchor in enumerate(("t", "t", "b")):
+        _anchored(slide, IN + i * 2 * IN, IN, anchor, text="نص عربي هنا")
+    ctx = save_and_ctx(prs, tmp_path, en_profile)
+
+    found = _anchor_records(detect(ctx))
+    assert len(found) == 1
+    assert found[0].arabic_flag is True

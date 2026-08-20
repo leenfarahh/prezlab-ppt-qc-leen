@@ -304,7 +304,8 @@ def render_format_result(*, deck_name: str, profile_name: str, job_id: str,
                          restored_notes: dict | None = None,
                          restore_error: str | None = None,
                          masters: int = 1,
-                         stragglers: list | None = None) -> str:
+                         stragglers: list | None = None,
+                         space_notes: list | None = None) -> str:
     counts = {}
     for p in plans:
         key = "failed" if p.slide_index in errors else p.match_rule
@@ -347,6 +348,16 @@ def render_format_result(*, deck_name: str, profile_name: str, job_id: str,
             f"as they were. The deck is still usable; those slides simply did "
             f"not change.")
 
+    # Whether the frame came across, stated rather than left to be discovered
+    # in master view: a marker the designer drew on one layout serves only that
+    # layout, and "the presentation space was not copied" is how that reads.
+    space_note = ""
+    if space_notes:
+        space_note = ("<div class='card'><div class='tag'>Presentation space</div>"
+                      "<ul style='margin:0.4rem 0 0 1.1rem'>"
+                      + "".join(f"<li>{esc(n)}</li>" for n in space_notes)
+                      + "</ul></div>")
+
     body = f"""
 <h1>{esc(deck_name)}</h1>
 <p class="sub">Rebuilt <b>{applied}</b> of <b>{len(plans)}</b> slides on
@@ -358,6 +369,7 @@ and the original deleted.</p>
 </div>
 {fallback_note}{failed_note}{_masters_note(masters, stragglers or [], plans)}{restored_note}
 <div class="kpis">{''.join(chips)}</div>
+{space_note}
 {_content_section(content_changes or [], job_id, restored or [], restore_error,
                   restored_notes or {})}
 <div class="card">

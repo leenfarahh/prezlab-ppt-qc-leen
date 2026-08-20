@@ -31,6 +31,11 @@ states. So all four sides compare box edges - left/top against the margin,
 left+width / top+height against the opposite one - and a line of text spilling
 outside a box that sits correctly is not a margin breach here.
 
+The one thing inside a box that IS compared is its vertical anchor, because
+that is an attribute the deck states rather than a rendering: a row of aligned
+boxes whose text anchors disagree reads as ragged however the fonts resolve.
+See _text_anchor_mismatch.
+
 A HEADING past a margin is flagged and never acted on. Whether a title or
 standfirst may break the margin is the client's house style, not a defect, so
 it gets its own issue type, no computed target, and no place in the rescale
@@ -46,6 +51,7 @@ block. See _band_intrusion and qc.stylespec.read_content_band.
 """
 
 import statistics
+from collections import Counter
 
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.oxml.ns import qn
@@ -64,6 +70,12 @@ CONTAIN_MIN = 0.66               # 2/3 of a shape inside another = contained
                                  # (keep in sync with qc/fixer.py)
 SQUEEZED_MAX_WIDTH = 548640      # 0.6 inch
 SQUEEZED_MIN_ASPECT = 3.0        # height > 3x width reads as a strip
+# Boxes within this height ratio of each other are one line of labels rather
+# than assorted content that happens to start on the same line, which is what
+# makes their text anchors comparable at all.
+ANCHOR_H_RATIO = 1.25
+_ANCHOR_LABEL = {"t": "top", "ctr": "middle", "b": "bottom",
+                 "just": "top", "dist": "top"}
 OVERLAP_MIN_RATIO = 0.4          # of either shape's area: substantial cover
 MAX_PAIRWISE_SHAPES = 80         # overlap check stays O(n^2)-sane
 
@@ -535,6 +547,7 @@ def detect(ctx):
                     if (r.shape_id, direction) not in lifted)
             records.extend(_squeezed_text(s_idx, pool, scope))
             records.extend(_text_overlap(s_idx, pool, scope))
+            records.extend(_text_anchor_mismatch(s_idx, free, window, scope))
 
         records.extend(_content_overflow(s_idx, placed, margins,
                                          slide_w, slide_h, head_ids,
@@ -1179,6 +1192,100 @@ def _uneven_spacing(s_idx, placed, direction, window, spacing_tol, scope=""):
                              f"distributes them evenly (~{equal_gap} EMU "
                              f"gaps), first and last stay put{where}",
                              arabic),
+            ))
+    return records
+
+
+def _anchor_of(shape):
+    """The vertical anchor a text box STATES, or None when its anchor cannot
+    honestly be compared with its neighbours'.
+
+    Three exclusions, each because the comparison would otherwise be a guess:
+
+    A PLACEHOLDER's anchor comes from the master, and the master's own vertical
+    anchor is followed rather than overridden anywhere in this tool - a title
+    the master hangs at the bottom of its box is a design decision
+    (qc.migrate). Reading it here would mean reporting the master as a defect.
+
+    A box with a:spAutoFit has a height that TRACKS its text, so the anchor
+    draws nothing: the box hugs the copy either way, and every such row would
+    report a difference nobody can see.
+
+    An empty box has no text for an anchor to place."""
+    if getattr(shape, "is_placeholder", False):
+        return None
+    if not getattr(shape, "has_text_frame", False):
+        return None
+    if not shape.text_frame.text.strip():
+        return None
+    bodyPr = shape.text_frame._txBody.find(qn("a:bodyPr"))
+    if bodyPr is None or bodyPr.find(qn("a:spAutoFit")) is not None:
+        return None
+    # OOXML's default when a:bodyPr states no anchor.
+    return bodyPr.get("anchor") or "t"
+
+
+def _text_anchor_mismatch(s_idx, placed, window, scope=""):
+    """Boxes that line up, holding text that does not.
+
+    The one alignment defect the box-edge rules cannot see. A row of equal-size
+    labels whose boxes share a top edge to the EMU still reads as ragged when
+    one of them anchors its text to the middle or the bottom of the box: the
+    boxes are aligned and the words are not (design lead's caution: align the
+    text box AND the text inside it). Nothing here measures a glyph - the
+    anchor is an attribute the deck states, so the disagreement is a fact and
+    not a rendering estimate, which is what keeps this inside the module's
+    standing rule about boxes versus text.
+
+    Flag-only, and warning severity, for the same reason a heading past a
+    margin is: a deliberately bottom-anchored caption under a row of top-
+    anchored ones is a real design, so the tool states the difference and lets
+    the designer settle it. Absent from qc.fixer.FIXABLE_ISSUES, so there is
+    nothing to tick.
+
+    Reported only where the row's intent is unambiguous - three or more boxes,
+    one height class, and a clear majority anchor - the same evidence bar the
+    edge-cluster rules use."""
+    records = []
+    where = f" (inside {scope})" if scope else ""
+    items = []
+    for shape, left, top, width, height, arabic in placed:
+        anchor = _anchor_of(shape)
+        if anchor is not None:
+            items.append((shape, left, top, width, height, arabic, anchor))
+
+    for row in _clusters(items, 2, window):
+        if len(row) < 3:
+            continue
+        heights = [it[4] for it in row]
+        if min(heights) <= 0 or max(heights) / min(heights) > ANCHOR_H_RATIO:
+            continue    # different-size boxes are not one line of labels
+        counts = Counter(it[6] for it in row)
+        if len(counts) < 2:
+            continue
+        majority, agreed = counts.most_common(1)[0]
+        deviants = [it for it in row if it[6] != majority]
+        if len(deviants) > len(row) / 3:
+            continue    # no clear intent to deviate FROM
+        for shape, _l, _t, _w, _h, arabic, anchor in deviants:
+            records.append(make_record(
+                slide_index=s_idx, shape_id=shape.shape_id, shape_path=None,
+                module=MODULE,
+                issue_type="margin_alignment.text_anchor_mismatch",
+                severity="warning", action="flagged", confidence="medium",
+                property="bodyPr.anchor",
+                old_value=anchor, new_value=majority,
+                profile_rule_id="geometry.alignment.edge_tolerance_emu",
+                arabic_flag=arabic,
+                message=_geo_msg(
+                    f"this box lines up with {agreed} others on the same row, "
+                    f"but its text sits at the "
+                    f"{_ANCHOR_LABEL.get(anchor, anchor)} of the box while "
+                    f"theirs sits at the "
+                    f"{_ANCHOR_LABEL.get(majority, majority)}, so the words do "
+                    f"not line up even though the boxes do. Nothing is changed: "
+                    f"a deliberately different anchor is a design decision"
+                    f"{where}", arabic),
             ))
     return records
 

@@ -34,5 +34,3 @@ Outputs land in `out/`. Files written there (round-trip and enforcement outputs)
 
 - The synthetic corpus covers the mechanics. Before the spike is signed off, re-run against 5-10 real (anonymized) Prezlab decks, including one 150-plus-slide deck and real Arabic client decks (PRD 11.1).
 - Engine decision (python-pptx vs Aspose.Slides) is made at spike close per PRD 11.1.
-
-123

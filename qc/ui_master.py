@@ -148,9 +148,12 @@ _GRID_SOURCE_NOTE = {
     "guides": ("Read from the drawing guides on the master. These are a stated "
                "intention, so they are the most trustworthy numbers here. To "
                "remove any doubt where a master carries several sets of "
-               "margins, draw a rectangle around the content area, name it "
-               "<b>Presentation space</b>, and give it no fill and no line: "
-               "the read will use that instead."),
+               "margins, draw a rectangle around the content area, give it no "
+               "fill and no line, and mark it either by naming it "
+               "<b>Presentation space</b> or by setting its alt text to "
+               "<code>ToolsToo_PS</code> (which is what ToolsToo writes when "
+               "you set a presentation space with it): the read will use that "
+               "instead."),
     "placeholders": ("<b>Inferred.</b> This master has no presentation-space "
                      "rectangle and no drawing guides, so the margins come "
                      "from the extent of its own content placeholders. Worth a "
@@ -193,14 +196,30 @@ def _grid_block(grid: dict) -> str:
         warn = ("" if not space.get("prints") else
                 " <b>It has a fill or a line, so it will print on every "
                 "slide.</b> Set it to no fill and no line.")
+        # How it was declared, because the two markers are found and fixed in
+        # different places: one is the shape's name, the other its alt text.
+        how = (f" (alt text <code>{esc(space.get('alt_text') or '')}</code>)"
+               if space.get("marker") == "alt_text" else " (named)")
         space_row = (f"<tr><td>Presentation space</td><td>"
-                     f"'{esc(space.get('name') or '')}' {esc(where)}: "
+                     f"'{esc(space.get('name') or '')}'{how} {esc(where)}: "
                      f"{_in(space['box_emu'][2] - space['box_emu'][0])} &times; "
                      f"{_in(space['box_emu'][3] - space['box_emu'][1])}"
                      f"{warn}</td></tr>")
         if space.get("source") != "master":
             space_row += ("<tr><td></td><td class='note'>Move it to the slide "
                           "master so every layout inherits it.</td></tr>")
+        # A second marker that disagrees is named rather than silently losing:
+        # the frame it states would govern every slide of every deck on this
+        # profile, so "which rectangle won" has to be answerable.
+        for rival in space.get("rivals") or []:
+            box = rival["box_emu"]
+            where_r = rival.get("source") or "the same container"
+            space_row += (
+                f"<tr><td></td><td class='note'>A second marker disagrees: "
+                f"'{esc(rival['name'])}' on {esc(where_r)} states "
+                f"{_in(box[2] - box[0])} &times; {_in(box[3] - box[1])} at "
+                f"{_in(box[0])} from the left, {_in(box[1])} from the top. The "
+                f"one above was used. Delete whichever is stale.</td></tr>")
     return f"""
 <table class="w3"><tbody>
 {space_row}
@@ -402,6 +421,7 @@ def _title_size_note(layouts: list) -> str:
 
 _FRAME_SLACK_EMU = 36000    # 1mm: a box a designer placed exactly on the line
 _CONTENT_PH = ("title", "ctrTitle", "subTitle", "body")
+_HEADER_PH = ("title", "ctrTitle", "subTitle")
 
 
 def _space_agreement_note(grid: dict, layouts: list) -> str:
@@ -414,10 +434,17 @@ def _space_agreement_note(grid: dict, layouts: list) -> str:
     rectangle says 1.20in and the title box says 0.48in, a formatted deck shows
     headers on one line and body on another - "the presentation space was
     copied but not applied", which is exactly how it reads (design lead,
-    21/08/2026). One of the two has to move, in the master."""
+    21/08/2026). One of the two has to move, in the master.
+
+    A rectangle drawn around the BODY is the exception, and only for its top
+    edge: the header lives above such a frame by design, so a title sitting
+    above it agrees with the master rather than contradicting it. Its sides and
+    its floor are still compared, because those are page-wide statements
+    whatever the frame is drawn around (qc.stylespec.infer_grid space_states)."""
     space = (grid or {}).get("presentation_space")
     if not space or space.get("problem"):
         return ""
+    states_body = (grid or {}).get("space_states") == "body"
     sl, st, sr, sb = space["box_emu"]
     # Worst deviation per placeholder role per side, plus how many layouts show
     # it. One line per role reads; one line per layout per side does not.
@@ -437,6 +464,9 @@ def _space_agreement_note(grid: dict, layouts: list) -> str:
                                ("above it", st - t),
                                ("below it", b - sb)):
                 if over <= _FRAME_SLACK_EMU:
+                    continue
+                if (side == "above it" and states_body
+                        and ph["type"] in _HEADER_PH):
                     continue
                 key = (ph["type"], side)
                 seen, layout_names = worst.get(key, (0, []))

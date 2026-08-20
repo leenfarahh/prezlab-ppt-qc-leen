@@ -39,6 +39,7 @@ ISSUE_LABELS = {
     "margin_alignment.body_band_intrusion": "Content in the reserved header band",
     "margin_alignment.text_overlap": "Text overlapping text",
     "margin_alignment.squeezed_text": "Squeezed text box",
+    "margin_alignment.text_anchor_mismatch": "Text anchored differently in an aligned row",
     "color_palette.off_palette_rgb": "Off-palette color",
     "font.family_out_of_set": "Font not in set",
     "font.size_off_role": "Font size off",

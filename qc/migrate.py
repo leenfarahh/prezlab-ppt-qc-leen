@@ -778,7 +778,11 @@ def _heading_margin_notes(slide_index, slide, prs, frame) -> list[ContentChange]
     inference from where the master's own title happens to sit, so measuring a
     heading against them compares a heading to a heading: on a master whose
     placeholders no longer span its slide (a 4:3 template widened to 16:9) every
-    slide reports a title breaking a margin nobody ever drew."""
+    slide reports a title breaking a margin nobody ever drew.
+
+    The frame's top is the PAGE's top margin, never a body ceiling: a
+    presentation space drawn around the body only states where the body begins,
+    and qc.stylespec.infer_grid separates the two before this ever sees them."""
     left, top, right, bottom, source, _body_top = frame
     if left is None or source not in STATED_FRAME_SOURCES:
         return []

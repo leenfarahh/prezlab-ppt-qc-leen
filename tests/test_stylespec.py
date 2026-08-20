@@ -15,6 +15,7 @@ import zlib
 
 from lxml import etree
 from pptx import Presentation
+from pptx.oxml.ns import qn
 from pptx.oxml.shapes.picture import CT_Picture
 from pptx.util import Emu
 
@@ -309,10 +310,14 @@ def test_no_note_when_every_layout_agrees():
 
 
 def _draw_space(container, left_in, top_in, w_in, h_in,
-                name="Presentation space", fill=False):
+                name="Presentation space", fill=False, alt=None):
     """Plant the rectangle a designer would draw. python-pptx cannot add shapes
     to a master or a layout, so the element goes in directly - the same approach
-    the guide fixtures take."""
+    the guide fixtures take.
+
+    `alt` is the shape's alt text (cNvPr/@descr), which is where the ToolsToo
+    add-in stamps its marker: the shape name stays whatever PowerPoint made it.
+    """
     from pptx.oxml.shapes.autoshape import CT_Shape
 
     sp = CT_Shape.new_autoshape_sp(next(_SHAPE_IDS), name, "rect",
@@ -320,6 +325,8 @@ def _draw_space(container, left_in, top_in, w_in, h_in,
                                    int(w_in * IN), int(h_in * IN))
     container.shapes._spTree.insert_element_before(sp, "p:extLst")
     shape = next(s for s in container.shapes if s.name == name)
+    if alt is not None:
+        shape._element.find(qn("p:nvSpPr")).find(qn("p:cNvPr")).set("descr", alt)
     if not fill:
         shape.fill.background()
         shape.line.fill.background()
@@ -398,6 +405,138 @@ def test_the_name_match_is_forgiving_but_not_loose():
                 name="Presentation notes")
     assert infer_grid(prs2, prs2.slide_masters[0])["source"] != \
         "presentation_space"
+
+
+def test_a_marker_declared_by_alt_text_is_read():
+    """What the add-in actually writes. ToolsToo stamps the alt text and leaves
+    the shape name as PowerPoint made it, so a name-only read missed the only
+    marker on the client's own master."""
+    prs = _master_only()
+    master = prs.slide_masters[0]
+    _draw_space(master, 0.5, 1.0, 9.0, 5.5, name="Rectangle 2",
+                alt="ToolsToo_PS")
+
+    grid = infer_grid(prs, master)
+    assert grid["source"] == "presentation_space"
+    assert grid["margins_emu"]["left"] == HALF
+    space = grid["presentation_space"]
+    assert space["marker"] == "alt_text"
+    assert space["alt_text"] == "ToolsToo_PS"
+    assert space["name"] == "Rectangle 2"
+
+
+def test_the_alt_text_marker_outranks_a_typed_name():
+    """A name is typed and survives copying, so it can be a leftover; the alt
+    text is on the rectangle the add-in is currently driving."""
+    prs = _master_only()
+    master = prs.slide_masters[0]
+    _draw_space(master, 2.0, 1.0, 6.0, 5.0, name="Presentation space")
+    _draw_space(master, 0.5, 1.0, 9.0, 5.5, name="Rectangle 9",
+                alt="ToolsToo_PS")
+
+    grid = infer_grid(prs, master)
+    assert grid["presentation_space"]["marker"] == "alt_text"
+    assert grid["margins_emu"]["left"] == HALF, "the add-in's rectangle binds"
+    rivals = grid["presentation_space"]["rivals"]
+    assert [r["name"] for r in rivals] == ["Presentation space"]
+
+
+def test_two_markers_that_agree_are_not_reported_as_a_disagreement():
+    prs = _master_only()
+    master = prs.slide_masters[0]
+    _draw_space(master, 0.5, 1.0, 9.0, 5.5, name="Presentation space")
+    _draw_space(master, 0.5, 1.0, 9.0, 5.5, name="Rectangle 9",
+                alt="ToolsToo_PS")
+
+    assert infer_grid(prs, master)["presentation_space"]["rivals"] == []
+
+
+def test_markers_on_two_layouts_that_disagree_are_both_named():
+    """Which rectangle won has to be answerable: the frame governs every slide
+    of every deck on the profile, and layout order is nobody's decision."""
+    prs = _master_only()
+    master = prs.slide_masters[0]
+    first, second = master.slide_layouts[0], master.slide_layouts[1]
+    _draw_space(first, 0.5, 1.0, 9.0, 5.5, name="Rectangle 2",
+                alt="ToolsToo_PS")
+    _draw_space(second, 1.5, 1.0, 7.0, 5.0, name="Rectangle 3",
+                alt="ToolsToo_PS")
+
+    space = infer_grid(prs, master)["presentation_space"]
+    assert space["box_emu"][0] == HALF, "the first layout's marker states it"
+    assert [r["name"] for r in space["rivals"]] == ["Rectangle 3"]
+    assert second.name in space["rivals"][0]["source"]
+
+
+# ------------------------------------------- what the rectangle is a frame AROUND
+#
+# Designers draw it both ways. Around the whole page, its top is the page's top
+# margin. Around the BODY - which is how the client master draws it, landing on
+# the master's own body placeholder to the EMU - its top is where CONTENT
+# begins, and the header sits above it by design. Read as a page margin, that
+# top becomes the deck's safe-zone ceiling and every title on every slide is
+# reported as breaking a margin nobody drew there.
+
+
+def test_a_frame_around_the_body_does_not_become_the_page_margin():
+    prs = _master_only()
+    master = prs.slide_masters[0]          # its title box ends at 1.55in
+    _plant_guides(master, vertical_pt=(36, 684), horizontal_pt=(36, 504))
+    _draw_space(master, 0.5, 2.0, 9.0, 4.0)
+
+    grid = infer_grid(prs, master)
+    assert grid["source"] == "presentation_space"
+    assert grid["space_states"] == "body"
+    assert grid["margins_emu"]["top"] == HALF, "the page top comes from the guides"
+    assert grid["body_top_emu"] == 2 * IN, "the rectangle states where body starts"
+    # The sides and the floor are still the rectangle's: those it does state.
+    assert grid["margins_emu"]["left"] == HALF
+    assert grid["margins_emu"]["bottom"] == int(1.5 * IN)
+
+
+def test_a_frame_around_the_whole_page_keeps_its_top_margin():
+    prs = _master_only()
+    master = prs.slide_masters[0]
+    _plant_guides(master, vertical_pt=(36, 684), horizontal_pt=(36, 504))
+    _draw_space(master, 0.5, 1.0, 9.0, 5.5)   # above the title's floor
+
+    grid = infer_grid(prs, master)
+    assert grid["space_states"] == "page"
+    assert grid["margins_emu"]["top"] == IN
+    assert grid["body_top_emu"] is None, "no band guides, so nothing states one"
+
+
+def test_a_body_frame_leaves_the_guides_band_alone():
+    """The client master states the same line twice - the rectangle's top and
+    the second interior guide are both 1.90in - and the guides also carry the
+    subtitle floor above it, which one rectangle cannot state."""
+    prs = _master_only()
+    master = prs.slide_masters[0]
+    _plant_guides(master, vertical_pt=(36, 684),
+                  horizontal_pt=(36, 119, 137, 504))
+    _draw_space(master, 0.5, 137 * 12700 / IN, 9.0, 4.0)
+
+    grid = infer_grid(prs, master)
+    assert grid["space_states"] == "body"
+    assert grid["subtitle_floor_emu"] == 119 * 12700
+    assert grid["body_top_emu"] == 137 * 12700
+    assert grid["margins_emu"]["top"] == HALF
+
+
+def test_a_body_frame_falls_back_to_placeholders_for_the_page_top():
+    """No guides to read the page's own top margin from, so it comes from the
+    next-best statement rather than from the body frame."""
+    prs = _master_only()
+    master = prs.slide_masters[0]
+    _draw_space(master, 0.5, 2.0, 9.0, 4.0)
+
+    title_top = min(ph.top for ph in master.placeholders
+                    if ph.top is not None and ph.top < 2 * IN)
+
+    grid = infer_grid(prs, master)
+    assert grid["space_states"] == "body"
+    assert grid["margins_emu"]["top"] == title_top, "the title box's own top"
+    assert grid["body_top_emu"] == 2 * IN
 
 
 def test_a_rectangle_off_the_canvas_is_reported_and_not_used():

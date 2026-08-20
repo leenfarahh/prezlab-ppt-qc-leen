@@ -1,0 +1,271 @@
+{
+  "id": "pif_master",
+  "name": "pif master",
+  "client_scope": null,
+  "project_scope": null,
+  "is_default": false,
+  "version": 2,
+  "owner": "Leen (edited 19/08/2026)",
+  "config": {
+    "theme": {
+      "colors": {
+        "dk1": "000000",
+        "lt1": "FFFFFF",
+        "dk2": "A32020",
+        "lt2": "DEDEDE",
+        "accent1": "A32020",
+        "accent2": "DB536A",
+        "accent3": "000000",
+        "accent4": "464646",
+        "accent5": "7D7D7D",
+        "accent6": "DEDEDE",
+        "hlink": "A32020",
+        "folHlink": "A32020"
+      },
+      "color_map": {
+        "bg1": "lt1",
+        "tx1": "dk1",
+        "bg2": "lt2",
+        "tx2": "dk2",
+        "accent1": "accent1",
+        "accent2": "accent2",
+        "accent3": "accent3",
+        "accent4": "accent4",
+        "accent5": "accent5",
+        "accent6": "accent6",
+        "hlink": "hlink",
+        "folHlink": "folHlink"
+      },
+      "fonts": {
+        "major": {
+          "latin": "Georgia",
+          "east_asian": null,
+          "complex_script": null
+        },
+        "minor": {
+          "latin": "Arial",
+          "east_asian": null,
+          "complex_script": null
+        }
+      }
+    },
+    "brand": {
+      "logo": null,
+      "logo_alternates": []
+    },
+    "style_spec_source": {
+      "spec_version": 1,
+      "extracted_at": "2026-08-19T09:03:13+00:00",
+      "grid_source": "guides"
+    },
+    "master_slide": {
+      "enforce_existing_only": true,
+      "pinned_layout_id": null,
+      "layout_allowlist": [
+        "USE",
+        "USE THIS",
+        "1_One Column",
+        "One Column",
+        "2_Title Only",
+        "USE THIS LAYOUT",
+        "1_Logos",
+        "2_One Column",
+        "3_One Column",
+        "1_Title Only - White",
+        "1_Title and Content",
+        "Title Only - White - TO USE"
+      ],
+      "geometry_tolerance_emu": 9525
+    },
+    "font": {
+      "roles": {
+        "title": {
+          "latin": [
+            "Georgia"
+          ],
+          "complex_script": [
+            "+mj-cs"
+          ],
+          "allowed_weights": [
+            "regular",
+            "bold"
+          ],
+          "size_pt": 25.0
+        },
+        "subtitle": {
+          "latin": [
+            "Georgia"
+          ],
+          "complex_script": [
+            "+mj-cs"
+          ],
+          "allowed_weights": [
+            "regular",
+            "bold"
+          ],
+          "size_pt": 25.0
+        },
+        "body": {
+          "latin": [
+            "Arial"
+          ],
+          "complex_script": [
+            "+mn-cs"
+          ],
+          "allowed_weights": [
+            "regular",
+            "bold"
+          ]
+        },
+        "caption": {
+          "latin": [
+            "Arial"
+          ],
+          "complex_script": [
+            "+mn-cs"
+          ],
+          "allowed_weights": [
+            "regular",
+            "bold"
+          ]
+        }
+      },
+      "theme_font_refs_allowed": true,
+      "size_tolerance_pt": 0.5
+    },
+    "color_palette": {
+      "theme_color_slots": [
+        "dk1",
+        "lt1",
+        "dk2",
+        "lt2",
+        "accent1",
+        "accent2",
+        "accent3",
+        "accent4",
+        "accent5",
+        "accent6"
+      ],
+      "named_colors": [
+        {
+          "name": "dk1",
+          "hex": "000000",
+          "theme_ref": "dk1",
+          "allowed_tints": [],
+          "allowed_shades": []
+        },
+        {
+          "name": "lt1",
+          "hex": "FFFFFF",
+          "theme_ref": "lt1",
+          "allowed_tints": [],
+          "allowed_shades": []
+        },
+        {
+          "name": "dk2",
+          "hex": "A32020",
+          "theme_ref": "dk2",
+          "allowed_tints": [],
+          "allowed_shades": []
+        },
+        {
+          "name": "lt2",
+          "hex": "DEDEDE",
+          "theme_ref": "lt2",
+          "allowed_tints": [],
+          "allowed_shades": []
+        },
+        {
+          "name": "accent1",
+          "hex": "A32020",
+          "theme_ref": "accent1",
+          "allowed_tints": [],
+          "allowed_shades": []
+        },
+        {
+          "name": "accent2",
+          "hex": "DB536A",
+          "theme_ref": "accent2",
+          "allowed_tints": [],
+          "allowed_shades": []
+        },
+        {
+          "name": "accent3",
+          "hex": "000000",
+          "theme_ref": "accent3",
+          "allowed_tints": [],
+          "allowed_shades": []
+        },
+        {
+          "name": "accent4",
+          "hex": "464646",
+          "theme_ref": "accent4",
+          "allowed_tints": [],
+          "allowed_shades": []
+        },
+        {
+          "name": "accent5",
+          "hex": "7D7D7D",
+          "theme_ref": "accent5",
+          "allowed_tints": [],
+          "allowed_shades": []
+        },
+        {
+          "name": "accent6",
+          "hex": "DEDEDE",
+          "theme_ref": "accent6",
+          "allowed_tints": [],
+          "allowed_shades": []
+        }
+      ],
+      "on_palette_mode": "by_name",
+      "match_tolerance_deltaE": 2.0,
+      "auto_replace_max_deltaE": 5.0,
+      "ambiguity_band_deltaE": 10.0
+    },
+    "geometry": {
+      "safe_zone_margins_emu": {
+        "left": 441325,
+        "right": 436562,
+        "top": 407988,
+        "bottom": 639762
+      },
+      "body_band_emu": {
+        "subtitle_floor": 1509712,
+        "body_top": 1739900
+      },
+      "grid": {
+        "columns": 12,
+        "gutter_emu": 0,
+        "enabled": false
+      },
+      "alignment": {
+        "edge_tolerance_emu": 28575,
+        "center_tolerance_emu": 28575,
+        "spacing_tolerance_emu": 28575,
+        "intent_window_emu": 137160
+      }
+    },
+    "shape_size": {
+      "size_tolerance_emu": 9525,
+      "min_cohort_size": 3,
+      "preserve_picture_aspect": true,
+      "dominant_size_strategy": "median"
+    },
+    "header_footer": {
+      "template": {
+        "footer_text": "PIF Strategy & VRP",
+        "slide_number": true,
+        "date": {
+          "enabled": false,
+          "format": "DD/MM/YYYY"
+        },
+        "position_emu": null,
+        "font_role": "caption"
+      }
+    },
+    "typography": {
+      "label_case": null
+    }
+  }
+}

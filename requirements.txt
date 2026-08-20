@@ -1,0 +1,17 @@
+# Runtime
+python-pptx==1.0.2
+fastapi==0.139.0
+uvicorn[standard]==0.50.0
+python-multipart
+reportlab
+psycopg[binary]        # Postgres/Supabase backend (cloud deploy; unused locally)
+anthropic              # assistant triage (qc/assist.py); works offline without a key
+
+# Windows desktop only (PowerPoint COM renderer). Not installed in the
+# Linux/cloud image, which renders via LibreOffice instead.
+pywin32; sys_platform == "win32"
+
+# Development / testing
+pytest
+httpx
+playwright

@@ -1,0 +1,60 @@
+{
+  "id": "prezlab_en",
+  "name": "Prezlab default (EN primary)",
+  "client_scope": null,
+  "project_scope": null,
+  "is_default": true,
+  "version": 1,
+  "owner": "seed",
+  "config": {
+    "master_slide": {
+      "enforce_existing_only": true,
+      "pinned_layout_id": null,
+      "layout_allowlist": [],
+      "geometry_tolerance_emu": 9525
+    },
+    "font": {
+      "roles": {
+        "title":    { "latin": ["Georgia"], "complex_script": ["Dubai"], "size_pt": 40, "allowed_weights": ["regular", "bold"] },
+        "subtitle": { "latin": ["Georgia"], "complex_script": ["Dubai"], "size_pt": 24, "allowed_weights": ["regular"] },
+        "body":     { "latin": ["Trebuchet MS"], "complex_script": ["Dubai"], "size_pt": 18, "allowed_weights": ["regular", "bold"] },
+        "caption":  { "latin": ["Trebuchet MS"], "complex_script": ["Dubai"], "size_pt": 12, "allowed_weights": ["regular"] }
+      },
+      "theme_font_refs_allowed": true,
+      "size_tolerance_pt": 0.5
+    },
+    "color_palette": {
+      "theme_color_slots": ["dk1", "lt1", "dk2", "lt2", "accent1", "accent2", "accent3", "accent4", "accent5", "accent6"],
+      "named_colors": [
+        { "name": "prezlab_navy", "hex": "1F4E79", "theme_ref": null, "allowed_tints": [], "allowed_shades": [] },
+        { "name": "prezlab_red",  "hex": "C00000", "theme_ref": null, "allowed_tints": [], "allowed_shades": [] },
+        { "name": "white",        "hex": "FFFFFF", "theme_ref": null, "allowed_tints": [], "allowed_shades": [] },
+        { "name": "black",        "hex": "000000", "theme_ref": null, "allowed_tints": [], "allowed_shades": [] }
+      ],
+      "on_palette_mode": "by_name",
+      "match_tolerance_deltaE": 2.0,
+      "auto_replace_max_deltaE": 5.0,
+      "ambiguity_band_deltaE": 10.0
+    },
+    "geometry": {
+      "safe_zone_margins_emu": { "left": 457200, "right": 457200, "top": 274638, "bottom": 365125 },
+      "grid": { "columns": 12, "gutter_emu": 0, "enabled": false },
+      "alignment": { "edge_tolerance_emu": 9525, "center_tolerance_emu": 9525, "spacing_tolerance_emu": 9525 }
+    },
+    "shape_size": {
+      "size_tolerance_emu": 9525,
+      "min_cohort_size": 3,
+      "preserve_picture_aspect": true,
+      "dominant_size_strategy": "median"
+    },
+    "header_footer": {
+      "template": {
+        "footer_text": null,
+        "slide_number": false,
+        "date": { "enabled": false, "format": "DD/MM/YYYY" },
+        "position_emu": null,
+        "font_role": "caption"
+      }
+    }
+  }
+}

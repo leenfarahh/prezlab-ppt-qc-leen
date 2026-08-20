@@ -1,0 +1,25 @@
+# Render Blueprint for the Prezlab PPT QC demo/eval instance.
+# Connect this repo in Render, then set the two secret env vars in the
+# dashboard (marked sync:false below). See DEPLOY.md for the full walkthrough.
+services:
+  - type: web
+    name: prezlab-ppt-qc-demo
+    runtime: docker
+    region: frankfurt        # closest Render region to the UAE (no ME region)
+    plan: free               # spins down when idle; upgrade to starter for always-on
+    healthCheckPath: /health
+    envVars:
+      - key: QC_AUTH_REQUIRED
+        value: "1"           # mandatory sign-in on every route
+      - key: QC_STRICT_SESSIONS
+        value: "1"           # ignore the guessable legacy name cookie
+      - key: QC_RENDERER
+        value: libreoffice   # no PowerPoint on Linux
+      - key: QC_DEMO_BANNER
+        value: "DEMO INSTANCE - do not upload confidential client decks"
+      - key: QC_MAX_UPLOAD_MB
+        value: "60"          # free tier has 512 MB RAM; decks are held in memory
+      - key: DATABASE_URL
+        sync: false          # Supabase connection string (secret, set in dashboard)
+      - key: QC_BOOTSTRAP_ADMIN
+        sync: false          # first admin name, e.g. Sanad (sets PIN on first sign-in)

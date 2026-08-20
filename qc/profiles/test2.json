@@ -1,0 +1,234 @@
+{
+  "id": "test2",
+  "name": "test2",
+  "client_scope": null,
+  "project_scope": null,
+  "is_default": false,
+  "version": 1,
+  "owner": "Leen (from reference PPT Formatting Technical Setup Audit.pptx, 18/08/2026)",
+  "config": {
+    "theme": {
+      "colors": {
+        "dk1": "000000",
+        "lt1": "FFFFFF",
+        "dk2": "44546A",
+        "lt2": "E7E6E6",
+        "accent1": "4472C4",
+        "accent2": "ED7D31",
+        "accent3": "A5A5A5",
+        "accent4": "FFC000",
+        "accent5": "5B9BD5",
+        "accent6": "70AD47",
+        "hlink": "0563C1",
+        "folHlink": "954F72"
+      },
+      "color_map": {
+        "bg1": "lt1",
+        "tx1": "dk1",
+        "bg2": "lt2",
+        "tx2": "dk2",
+        "accent1": "accent1",
+        "accent2": "accent2",
+        "accent3": "accent3",
+        "accent4": "accent4",
+        "accent5": "accent5",
+        "accent6": "accent6",
+        "hlink": "hlink",
+        "folHlink": "folHlink"
+      },
+      "fonts": {
+        "major": {
+          "latin": "Calibri Light",
+          "east_asian": null,
+          "complex_script": null
+        },
+        "minor": {
+          "latin": "Calibri",
+          "east_asian": null,
+          "complex_script": null
+        }
+      }
+    },
+    "brand": {
+      "logo": null,
+      "logo_alternates": []
+    },
+    "master_slide": {
+      "enforce_existing_only": true,
+      "pinned_layout_id": null,
+      "layout_allowlist": [
+        "DEFAULT"
+      ],
+      "geometry_tolerance_emu": 9525
+    },
+    "font": {
+      "roles": {
+        "title": {
+          "latin": [
+            "Calibri"
+          ],
+          "complex_script": [],
+          "allowed_weights": [
+            "regular",
+            "bold"
+          ]
+        },
+        "subtitle": {
+          "latin": [
+            "Calibri"
+          ],
+          "complex_script": [],
+          "allowed_weights": [
+            "regular",
+            "bold"
+          ]
+        },
+        "body": {
+          "latin": [
+            "Calibri"
+          ],
+          "complex_script": [],
+          "allowed_weights": [
+            "regular",
+            "bold"
+          ]
+        },
+        "caption": {
+          "latin": [
+            "Calibri"
+          ],
+          "complex_script": [],
+          "allowed_weights": [
+            "regular",
+            "bold"
+          ]
+        }
+      },
+      "theme_font_refs_allowed": true,
+      "size_tolerance_pt": 0.5
+    },
+    "color_palette": {
+      "theme_color_slots": [
+        "dk1",
+        "lt1",
+        "dk2",
+        "lt2",
+        "accent1",
+        "accent2",
+        "accent3",
+        "accent4",
+        "accent5",
+        "accent6"
+      ],
+      "named_colors": [
+        {
+          "name": "color_01",
+          "hex": "1E2761",
+          "theme_ref": null,
+          "allowed_tints": [],
+          "allowed_shades": []
+        },
+        {
+          "name": "color_02",
+          "hex": "2B2B45",
+          "theme_ref": null,
+          "allowed_tints": [],
+          "allowed_shades": []
+        },
+        {
+          "name": "color_03",
+          "hex": "FFFFFF",
+          "theme_ref": "lt1",
+          "allowed_tints": [],
+          "allowed_shades": []
+        },
+        {
+          "name": "color_04",
+          "hex": "F3F6FC",
+          "theme_ref": null,
+          "allowed_tints": [],
+          "allowed_shades": []
+        },
+        {
+          "name": "color_05",
+          "hex": "E8A33D",
+          "theme_ref": null,
+          "allowed_tints": [],
+          "allowed_shades": []
+        },
+        {
+          "name": "color_06",
+          "hex": "6B7280",
+          "theme_ref": null,
+          "allowed_tints": [],
+          "allowed_shades": []
+        },
+        {
+          "name": "color_07",
+          "hex": "CADCFC",
+          "theme_ref": null,
+          "allowed_tints": [],
+          "allowed_shades": []
+        },
+        {
+          "name": "color_08",
+          "hex": "3B4A9E",
+          "theme_ref": null,
+          "allowed_tints": [],
+          "allowed_shades": []
+        },
+        {
+          "name": "color_09",
+          "hex": "FCF1DE",
+          "theme_ref": null,
+          "allowed_tints": [],
+          "allowed_shades": []
+        }
+      ],
+      "on_palette_mode": "by_name",
+      "match_tolerance_deltaE": 2.0,
+      "auto_replace_max_deltaE": 5.0,
+      "ambiguity_band_deltaE": 10.0
+    },
+    "geometry": {
+      "safe_zone_margins_emu": {
+        "left": 520065,
+        "right": 157353,
+        "top": 337185,
+        "bottom": 108585
+      },
+      "grid": {
+        "columns": 12,
+        "gutter_emu": 0,
+        "enabled": false
+      },
+      "alignment": {
+        "edge_tolerance_emu": 28575,
+        "center_tolerance_emu": 28575,
+        "spacing_tolerance_emu": 28575,
+        "intent_window_emu": 137160
+      }
+    },
+    "shape_size": {
+      "size_tolerance_emu": 9525,
+      "min_cohort_size": 3,
+      "preserve_picture_aspect": true,
+      "dominant_size_strategy": "median"
+    },
+    "header_footer": {
+      "template": {
+        "footer_text": null,
+        "slide_number": false,
+        "date": {
+          "enabled": false,
+          "format": "DD/MM/YYYY"
+        },
+        "position_emu": null,
+        "font_role": "caption"
+      }
+    },
+    "typography": {
+      "label_case": null
+    }
+  }
+}

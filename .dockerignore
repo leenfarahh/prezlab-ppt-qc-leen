@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+tests/
+fixtures/
+data/
+out/
+supabase/
+*.md
+*.pdf
+*.pptx
+Dockerfile
+.dockerignore
+render.yaml
+tools/

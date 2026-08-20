@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Generated / runtime (never commit client or run data)
+out/
+data/
+fixtures/*.pptx
+fixtures/*.truth.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# Client-derived profiles stay on the local box (confidentiality)
+qc/profiles/client_*.json
+
+# Local secrets (API keys); never commit
+.env

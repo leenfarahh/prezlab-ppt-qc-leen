@@ -570,14 +570,19 @@ def format_deck(request: Request, deck: UploadFile = File(...),
         # The job keeps the changes as well as the deck: putting a removed
         # piece back re-renders this same page, and re-deriving the change list
         # would mean running the whole migration again.
-        _format_jobs[job_id] = {"deck": result.deck, "filename": filename,
+        # `source` is the deck exactly as it was uploaded, kept for the review
+        # page: "before" is not derivable from the output, and re-uploading the
+        # file to see what changed is the thing the review exists to avoid.
+        _format_jobs[job_id] = {"deck": result.deck, "source": data,
+                                "filename": filename,
                                 "profile": profile, "plans": result.plans,
                                 "errors": result.errors,
                                 "applied": result.applied,
                                 "masters": result.masters,
                                 "stragglers": result.stragglers,
                                 "space_notes": space_notes,
-                                "changes": content_changes, "restored": []}
+                                "changes": content_changes, "restored": [],
+                                "undone": [], "undo_notes": {}}
         while len(_format_jobs) > MAX_FORMAT_JOBS:
             _format_jobs.popitem(last=False)
 
@@ -647,6 +652,216 @@ def format_restore(job_id: str, restore_ids: list[str] = Form(None)):
         masters=job.get("masters") or 1,
         stragglers=job.get("stragglers") or [],
         space_notes=job.get("space_notes") or []))
+
+
+# How many slides the deck view renders on ONE PAGE. Every render is a
+# PowerPoint export, so an uncapped page on a 200-slide deck is a several-minute
+# wait. This is a page size, not a limit on what can be reviewed: the page pages
+# through the rest, because a review that silently ends at slide 20 of a 26-slide
+# deck reads as six slides the tool declined to show (design lead, 23/08/2026).
+REVIEW_PAGE_SIZE = 20
+
+
+def _reviewable(job) -> list[int]:
+    """Every slide worth reviewing: the ones this run changed, plus any that
+    failed. A slide the content pass did not touch has nothing to review and
+    would only push the ones that do further down the page."""
+    changed = {c.slide_index for c in (job.get("changes") or [])}
+    changed |= set((job.get("errors") or {}).keys())
+    return sorted(changed)
+
+
+def _review_slides(job, page: int = 0) -> list[int]:
+    """One page of reviewable slides."""
+    every = _reviewable(job)
+    start = max(0, page) * REVIEW_PAGE_SIZE
+    return every[start:start + REVIEW_PAGE_SIZE]
+
+
+def _layout_use(plans, key: str) -> dict:
+    """{layout name: slides on it} from the assignment plans, for the badges on
+    the master view. A layout nothing sits on is worth seeing as unused."""
+    counts: dict[str, int] = {}
+    for p in plans or []:
+        name = getattr(p, key, None)
+        if name:
+            counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _url_keys(images: dict, prefix: str) -> dict:
+    """Re-key renders as the page asks for them: "before:7" -> "slide_before_7".
+
+    One namespace, URL-safe, and prefixed per view. Without the prefix a
+    12-layout master and a 12-slide deck collide on "before:3" and the master
+    view starts serving slide pictures - which is a wrong answer that looks like
+    a right one, the worst kind for a review page."""
+    return {f"{prefix}_{k.replace(':', '_', 1)}": png
+            for k, png in (images or {}).items()}
+
+
+def _ensure_review(job, view: str, page: int = 0) -> str | None:
+    """Render what this view needs, once per page, and cache it on the job.
+    Returns a readable reason when nothing could be rendered - the page then
+    shows the change list and the Undo buttons without pictures, which is the
+    part a designer cannot do without."""
+    from .render import layout_previews, slide_previews
+
+    key = "review_master" if view == "master" else f"review_deck_{page}"
+    if job.get(key) is not None:
+        return job.get(key + "_error")
+    if job.get("source") is None:
+        job[key] = {}
+        job[key + "_error"] = ("the uploaded deck is no longer in memory, so "
+                              "there is nothing to compare against")
+        return job[key + "_error"]
+    try:
+        if view == "master":
+            out = layout_previews(job["source"], job["deck"])
+            out["images"] = _url_keys(out.get("images"), "layout")
+        else:
+            out = slide_previews(job["source"], job["deck"],
+                                 _review_slides(job, page))
+            out["images"] = _url_keys(out.get("images"), "slide")
+    except Exception as exc:  # reading the DECK failed: there is no answer at all
+        job[key] = {}
+        job[key + "_error"] = f"{type(exc).__name__}: {exc}."
+        return job[key + "_error"]
+    # A render failure is kept WITH the result, not instead of it. Which layouts
+    # the deck arrived with and which it has now needs no PowerPoint; discarding
+    # the whole answer made the page say "No layouts to show" about a master
+    # carrying twelve (design lead, 23/08/2026).
+    job[key] = out
+    job[key + "_error"] = out.get("error")
+    return out.get("error")
+
+
+def _drop_review_renders(job) -> None:
+    """Forget every cached render. Called after an undo: the deck has changed,
+    and a stale "after" picture beside a row marked undone is the one thing this
+    page must never show."""
+    for key in [k for k in list(job) if k.startswith(("review_master",
+                                                      "review_deck"))]:
+        job[key] = None
+
+
+def _review_page(job_id: str, job, view: str, undo_error: str | None = None,
+                 page: int = 0):
+    from .ui_review import render_review
+
+    error = _ensure_review(job, view, page)
+    key = "review_master" if view == "master" else f"review_deck_{page}"
+    previews = job.get(key) or {}
+    every = _reviewable(job)
+    profile = job.get("profile")
+    meta = next((p for p in _profiles_meta() if p["id"] == profile), None)
+    return HTMLResponse(render_review(
+        deck_name=job["filename"],
+        profile_name=(meta or {}).get("name", profile or ""),
+        job_id=job_id, view=view, previews=previews,
+        changes=job.get("changes") or [], plans=job.get("plans") or [],
+        errors=job.get("errors") or {},
+        undone=set(job.get("undone") or []),
+        notes=job.get("undo_notes") or {},
+        shown=_review_slides(job, page),
+        reviewable=len(every),
+        page=page, page_size=REVIEW_PAGE_SIZE,
+        total_slides=len(job.get("plans") or []),
+        masters=job.get("masters") or 1,
+        used_before=_layout_use(job.get("plans"), "source_layout"),
+        used_after=_layout_use(job.get("plans"), "target_layout"),
+        truncated=bool(previews.get("truncated")),
+        render_error=error, undo_error=undo_error))
+
+
+@app.get("/format/{job_id}/review", response_class=HTMLResponse)
+def format_review(job_id: str, view: str = "master", page: int = 0):
+    """Before and after for one format run, as the template and as the deck."""
+    with _format_lock:
+        job = _format_jobs.get(job_id)
+    if job is None or job.get("deck") is None:
+        return HTMLResponse(
+            "<p>Unknown or expired job. Format the deck again.</p>",
+            status_code=404)
+    return _review_page(job_id, job, "deck" if view == "deck" else "master",
+                        page=max(0, page))
+
+
+@app.post("/format/{job_id}/undo", response_class=HTMLResponse)
+def format_undo(job_id: str, change_ids: list[str] = Form(None),
+                page: int = Form(0)):
+    """Take one reported change back, exactly as it was.
+
+    Anything already undone is skipped rather than replayed: a browser
+    resubmitting this POST would otherwise insert a second copy of a restored
+    shape, or reset a shape a later undo has since moved."""
+    from .undo import apply_undo, expand
+
+    with _format_lock:
+        job = _format_jobs.get(job_id)
+    if job is None or job.get("deck") is None:
+        return HTMLResponse(
+            "<p>Unknown or expired job. Format the deck again.</p>",
+            status_code=404)
+
+    # Expanded before it is filtered: undoing a change means undoing what came
+    # after it on that slide too, or the slide lands in a state the run never
+    # produced (qc.undo.followers).
+    changes = job.get("changes") or []
+    wanted = set(change_ids or []) - set(job.get("undone") or [])
+    already = set(job.get("undone") or [])
+    items = [{"change_id": c.change_id, "slide_index": c.slide_index,
+              "action": c.action, "ops": c.undo}
+             for c in expand(changes, wanted)
+             if c.change_id not in already]
+    error = None
+    if items:
+        try:
+            deck, outcomes = apply_undo(job["deck"], items)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        else:
+            with _format_lock:
+                job["deck"] = deck
+                notes = dict(job.get("undo_notes") or {})
+                for o in outcomes:
+                    if o.get("change_id"):
+                        notes[o["change_id"]] = o["detail"]
+                job["undo_notes"] = notes
+                job["undone"] = sorted(
+                    set(job.get("undone") or [])
+                    | {o["change_id"] for o in outcomes
+                       if o.get("done") and o.get("change_id")})
+                _drop_review_renders(job)
+    return _review_page(job_id, job, "deck", undo_error=error,
+                        page=max(0, page))
+
+
+@app.get("/review-img/{job_id}/{key}.png")
+def review_img(job_id: str, key: str):
+    from fastapi.responses import Response
+
+    with _format_lock:
+        job = _format_jobs.get(job_id)
+    if job is None:
+        return JSONResponse({"error": "unknown or expired job"}, status_code=404)
+    # Every review bucket is searched by PREFIX, not by an exact name: the deck
+    # view caches per page ("review_deck_0", "review_deck_1"), and naming the two
+    # buckets literally here meant page 0's images were cached under a key this
+    # route never looked in, so the deck view rendered 18 pictures and served
+    # none of them. The image keys themselves are already unique across views
+    # (_url_keys), so a prefix scan cannot return the wrong picture.
+    png = None
+    for bucket, value in job.items():
+        if not str(bucket).startswith("review_") or not isinstance(value, dict):
+            continue
+        png = (value.get("images") or {}).get(key)
+        if png is not None:
+            break
+    if png is None:
+        return JSONResponse({"error": "no such render"}, status_code=404)
+    return Response(content=png, media_type="image/png",
+                    headers={"Cache-Control": "private, max-age=600"})
 
 
 @app.get("/format/{job_id}/download")
@@ -734,6 +949,7 @@ def audit(request: Request, deck: UploadFile = File(...),
     return render_report(manifest, job_id, can_fix=True,
                          promoted=promoted_issue_types(),
                          comments=comment_counts(filename),
+                         design=design_count(_jobs[job_id]),
                          assist=AI_ENABLED and not _ephemeral(profile))
 
 
@@ -787,6 +1003,9 @@ def apply(request: Request, job_id: str = Form(...),
         job["diff"] = None               # invalidate any cached render
         job["thumbs"] = None             # slides changed: thumbnails are stale
         job["rects"] = None
+        job["design"] = None             # and so are the design findings: a fix
+                                         # that moved a shape may have created
+                                         # or cleared an overlap
         job["manifest"] = manifest
         job["deck"] = fx.cleaned_bytes   # further fixes build on the cleaned deck
         job["cleaned"] = fx.cleaned_bytes
@@ -806,7 +1025,409 @@ def apply(request: Request, job_id: str = Form(...),
                          has_cleaned=True, diff_href=f"/diff/{job_id}",
                          promoted=promoted_issue_types(),
                          comments=comment_counts(job["filename"]),
+                         design=design_count(job),
                          assist=AI_ENABLED and not _ephemeral(job["profile"]))
+
+
+# ------------------------------------------------------------- design QC
+#
+# The audit's own modules answer "does this deck match the profile". These are
+# the questions that only have answers once a master is on the deck - a palette
+# meeting the deck's own colours, text meeting a new background, the master's
+# furniture meeting content that was already there - and each of them has more
+# than one right fix, so the designer picks and the pick is reversible. Detection
+# is qc.design, applying a pick is qc.remedy, taking it back is qc.undo (the same
+# machinery the format review page uses, reaching one step further).
+
+
+def _palette_cfg(job) -> dict:
+    profile = job.get("profile_obj")
+    try:
+        return profile.module_config("color_palette") if profile else {}
+    except Exception:
+        return {}
+
+
+def _ensure_design(job) -> str | None:
+    """Run the design pass once per state of the deck, and cache it on the job.
+
+    Cleared (design=None) after every apply and every undo, because the findings
+    ARE a description of the current bytes: a card offering to fix something the
+    designer just fixed is the one thing this page must not show."""
+    if job.get("design") is not None:
+        return job.get("design_error")
+    if job.get("deck") is None:
+        job["design"] = []
+        return None
+    from .design import scan
+
+    try:
+        job["design"] = scan(job["deck"], _palette_cfg(job))
+        job["design_error"] = None
+    except Exception as exc:
+        job["design"] = []
+        job["design_error"] = (f"The design checks could not run on this deck: "
+                               f"{type(exc).__name__}: {exc}")
+    return job.get("design_error")
+
+
+def design_count(job) -> int | None:
+    """How many open design decisions this deck has, for the badge on the audit
+    report. None when the pass could not run - the link still appears, because a
+    missing link reads as a missing feature."""
+    if _ensure_design(job):
+        return None
+    answered = {a.finding_id for a in job.get("design_applied") or []}
+    return sum(1 for f in job.get("design") or []
+               if f.finding_id not in answered)
+
+
+def _reaudit_in_place(job) -> str | None:
+    """Re-run the audit over the deck as the design pass has left it, keeping
+    the SAME job.
+
+    In place, and that is the whole point: /reaudit mints a new job id, which
+    would strand every design decision recorded against this one. The rule the
+    audit flow already follows - verify after write, never assume - applies
+    just as much to a change made from this page."""
+    if job.get("deck") is None:
+        return None
+    fd, tmp_name = tempfile.mkstemp(suffix=".pptx")
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        tmp.write_bytes(job["deck"])
+        profile = job.get("profile_obj") or Profile.load(job["profile"])
+        result = run_audit(tmp, profile)
+    except Exception as exc:
+        return (f"The deck was changed, but it could not be re-audited "
+                f"({type(exc).__name__}: {exc}), so the audit report's counts "
+                f"are from before these changes.")
+    finally:
+        tmp.unlink(missing_ok=True)
+    manifest = result.to_manifest()
+    manifest["deck"] = job["filename"]
+    job["manifest"] = manifest
+    return None
+
+
+# How many slides are rendered per PowerPoint call. Flipping one slide at a time
+# would mean one COM round trip per click (a second or more each); rendering the
+# whole deck up front would mean minutes of wait on a 200-slide deck before the
+# first slide appears. A window is neither: the first click pays for eight
+# slides, the next seven are instant.
+DESIGN_WINDOW = 8
+
+
+def _ensure_design_shot(job, index: int) -> str | None:
+    """Render the window of slides containing `index`, once. Returns a readable
+    reason when nothing could be rendered - the page then shows every finding
+    and every remedy without a picture, which is the part a designer cannot do
+    without."""
+    shots = job.setdefault("design_shots", {})
+    if index in shots:
+        return None
+    if job.get("deck") is None:
+        return "the deck is no longer held in memory."
+    start = (index // DESIGN_WINDOW) * DESIGN_WINDOW
+    total = job["manifest"]["slides"]
+    wanted = [i for i in range(start, min(total, start + DESIGN_WINDOW))
+              if i not in shots]
+    if not wanted:
+        return None
+    from .render import export_decks_png
+
+    lock = _thumb_locks.setdefault(f"design:{id(job)}", threading.Lock())
+    with lock:
+        if index in shots:
+            return None
+        try:
+            images = export_decks_png({"deck": job["deck"]}, wanted,
+                                      width=THUMB_WIDTH)
+        except Exception as exc:
+            job["design_shot_error"] = f"{type(exc).__name__}: {exc}."
+            return job["design_shot_error"]
+        for key, png in (images or {}).items():
+            shots[int(key.split(":", 1)[1])] = png
+    if index not in shots:
+        return ("PowerPoint returned no image for this slide. Rendering needs "
+                "desktop PowerPoint or LibreOffice on this machine.")
+    return None
+
+
+def _design_severity_map(findings, records, answered) -> dict:
+    """{slide_index: {severity: n}} for the dots on the slide strip, from both
+    passes: a slide the designer should stop at is one with anything on it, and
+    which check found it is not the question the strip answers."""
+    out: dict[int, dict] = {}
+    for f in findings:
+        if f.finding_id in answered:
+            continue
+        for index in f.slides:
+            slot = out.setdefault(index, {})
+            slot[f.severity] = slot.get(f.severity, 0) + 1
+    for r in records or []:
+        if r.get("module") == "preflight":
+            continue
+        slot = out.setdefault(r["slide_index"], {})
+        slot[r["severity"]] = slot.get(r["severity"], 0) + 1
+    return out
+
+
+def _design_page(job_id: str, job, banner: str = "", error: str | None = None,
+                 view: str = "slide", current: int = 0):
+    from .design import slide_rects
+    from .ui_design import render_design
+
+    err = _ensure_design(job) or error
+    meta = next((p for p in _profiles_meta() if p["id"] == job.get("profile")),
+                None)
+    applied = job.get("design_applied") or []
+    answered = {a.finding_id for a in applied}
+    every = [f for f in (job.get("design") or [])
+             if f.finding_id not in answered]
+    total = job["manifest"]["slides"]
+    current = max(0, min(current, max(0, total - 1)))
+    records = [r for r in job["manifest"]["records"]
+               if r.get("module") != "preflight"]
+
+    # A finding that touches ONE slide belongs to that slide's page. One that
+    # spans several is a single decision about the deck and cannot honestly be
+    # asked on any one of them, so it goes to the deck view (and is counted
+    # there, on the tab, so it is not lost).
+    on_slide = [f for f in every if f.slides == [current]]
+    deck_wide = [f for f in every if len(f.slides) != 1]
+
+    shot_error = None
+    rects: list = []
+    if view != "deck":
+        shot_error = _ensure_design_shot(job, current)
+        if shot_error is None and job.get("deck") is not None:
+            try:
+                rects = slide_rects(job["deck"], on_slide).get(current, [])
+            except Exception:
+                rects = []
+
+    return HTMLResponse(render_design(
+        deck_name=job["filename"],
+        profile_name=(meta or {}).get("name") or job.get("profile") or "",
+        job_id=job_id, view=view, current=current, total_slides=total,
+        findings=on_slide, deck_findings=deck_wide, applied=applied,
+        audit_records=[r for r in records if r["slide_index"] == current],
+        rects=rects,
+        per_slide=_design_severity_map(every, records, answered),
+        banner=banner, error=err, render_error=shot_error,
+        has_deck=job.get("deck") is not None))
+
+
+def _invalidate_renders(job) -> None:
+    """Everything derived from the deck bytes, dropped. A cached thumbnail beside
+    a row marked applied is a picture of the deck before the fix."""
+    job["diff"] = None
+    job["thumbs"] = None
+    job["rects"] = None
+    job["design"] = None
+    job["design_shots"] = {}
+    job.pop("design_shot_error", None)
+
+
+@app.get("/audit/{job_id}", response_class=HTMLResponse)
+def audit_view(request: Request, job_id: str):
+    """The audit report for a job that already ran.
+
+    The report used to exist only as the response to the POST that produced it,
+    so navigating away from it - to the design page, say - was one-way. A page a
+    designer cannot get back to is a page they will not leave."""
+    from .promotion import promoted_issue_types
+    from .store import comment_counts
+
+    job = _job(job_id)
+    if job is None:
+        return HTMLResponse(render_index(_pickable_profiles(), MODULES,
+                                         "Unknown or expired job."),
+                            status_code=404)
+    return render_report(job["manifest"], job_id,
+                         can_fix=job.get("deck") is not None,
+                         has_cleaned=job.get("cleaned") is not None,
+                         promoted=promoted_issue_types(),
+                         comments=comment_counts(job["filename"]),
+                         design=design_count(job),
+                         assist=AI_ENABLED and not _ephemeral(job["profile"]))
+
+
+@app.get("/design/{job_id}", response_class=HTMLResponse)
+def design_page(job_id: str, view: str = "slide", n: int = 0):
+    job = _job(job_id)
+    if job is None:
+        return HTMLResponse(render_index(_pickable_profiles(), MODULES,
+                                         "Unknown or expired job."),
+                            status_code=404)
+    return _design_page(job_id, job,
+                        view="deck" if view == "deck" else "slide",
+                        current=max(0, n))
+
+
+@app.get("/design-img/{job_id}/{idx}.png")
+def design_img(job_id: str, idx: int):
+    """One rendered slide for the design page.
+
+    Its own route and its own cache rather than /thumb: that one is filled by
+    _ensure_thumbs, which renders the WHOLE deck and whose callers (the visual
+    PDF, the preview overlay) rely on it being complete. This page fills a
+    window at a time, and a half-filled thumbs cache would make those callers
+    think they had every slide."""
+    from fastapi.responses import Response
+
+    job = _job(job_id)
+    if job is None:
+        return JSONResponse({"error": "unknown or expired job"}, status_code=404)
+    error = _ensure_design_shot(job, idx)
+    png = (job.get("design_shots") or {}).get(idx)
+    if png is None:
+        return JSONResponse({"error": error or "no such slide"}, status_code=503)
+    return Response(content=png, media_type="image/png",
+                    headers={"Cache-Control": "private, max-age=600"})
+
+
+@app.post("/design/{job_id}/apply", response_class=HTMLResponse)
+async def design_apply(request: Request, job_id: str):
+    """Perform the remedy picked on each card, and nothing else.
+
+    The radio group per finding is named pick_<finding_id>, so the form is read
+    rather than declared: the set of findings is not known until the deck is
+    scanned, and a fixed signature would have to be a list of opaque pairs."""
+    from .remedy import apply as apply_remedies
+
+    job = _job(job_id)
+    if job is None:
+        return HTMLResponse(render_index(_pickable_profiles(), MODULES,
+                                         "Unknown or expired job."),
+                            status_code=404)
+    if job.get("deck") is None:
+        return _design_page(job_id, job)
+
+    _ensure_design(job)
+    by_id = {f.finding_id: f for f in job.get("design") or []}
+    already = {a.finding_id for a in job.get("design_applied") or []}
+    form = await request.form()
+    try:
+        back_to = max(0, int(form.get("n") or 0))
+    except (TypeError, ValueError):
+        back_to = 0
+    picks = []
+    for key, value in form.multi_items():
+        if not str(key).startswith("pick_"):
+            continue
+        finding = by_id.get(str(key)[5:])
+        if finding is None or finding.finding_id in already:
+            continue
+        remedy = next((o for o in finding.options
+                       if o.remedy_id == str(value)), None)
+        if remedy is not None:
+            picks.append((finding, remedy))
+    if not picks:
+        return _design_page(job_id, job, current=back_to,
+                            banner="No card had an answer picked, so nothing "
+                                   "was changed.")
+
+    try:
+        deck, applied = apply_remedies(job["deck"], picks)
+    except Exception as exc:
+        return _design_page(job_id, job, current=back_to,
+                            error=f"Nothing was changed: {type(exc).__name__}: "
+                                  f"{exc}")
+
+    acted = [a for a in applied if a.done and a.undo]
+    left = [a for a in applied if a.done and not a.undo]
+    failed = [a for a in applied if not a.done]
+    with _jobs_lock:
+        if acted:
+            job["prev_deck"] = job["deck"]   # pre-change bytes, for the diff
+            job["deck"] = deck
+            job["cleaned"] = deck
+        job["design_applied"] = (job.get("design_applied") or []) + applied
+        _invalidate_renders(job)
+
+    note = []
+    if acted:
+        note.append(f"Applied {len(acted)} change"
+                    f"{'s' if len(acted) != 1 else ''}")
+    if left:
+        note.append(f"recorded {len(left)} as deliberate")
+    if failed:
+        note.append(f"{len(failed)} could not be applied and say why below")
+    stale = _reaudit_in_place(job) if acted else None
+    return _design_page(job_id, job, current=back_to,
+                        banner="; ".join(note) + ".", error=stale)
+
+
+@app.post("/design/{job_id}/undo", response_class=HTMLResponse)
+def design_undo(job_id: str, finding_ids: list[str] = Form(None),
+                n: int = Form(None)):
+    """Take one decision back, exactly, and say what came with it."""
+    from .remedy import followers, undo_items
+    from .undo import apply_undo
+
+    job = _job(job_id)
+    if job is None:
+        return HTMLResponse(render_index(_pickable_profiles(), MODULES,
+                                         "Unknown or expired job."),
+                            status_code=404)
+    # Which view to answer on: the slide the button was pressed on, or the
+    # deck-wide tab when it carried no slide.
+    view = "slide" if n is not None else "deck"
+    back_to = max(0, n or 0)
+    applied = list(job.get("design_applied") or [])
+    wanted = set(finding_ids or [])
+    if not wanted:
+        return _design_page(job_id, job, view=view, current=back_to)
+
+    # Chains are unioned before anything is replayed: two requested decisions
+    # can drag the same third one, and undoing it twice would put back a state
+    # from before the first replay.
+    chain_ids: set = set()
+    for finding_id in wanted:
+        chain_ids.update(a.finding_id for a in followers(applied, finding_id))
+    chain = [a for a in applied if a.finding_id in chain_ids]
+    dragged = [a for a in chain if a.finding_id not in wanted]
+
+    error = None
+    outcomes = []
+    items = undo_items([a for a in chain if a.undo])
+    if items and job.get("deck") is not None:
+        try:
+            deck, outcomes = apply_undo(job["deck"], items)
+        except Exception as exc:
+            error = f"The undo failed and nothing was changed: {type(exc).__name__}: {exc}"
+        else:
+            with _jobs_lock:
+                job["deck"] = deck
+                job["cleaned"] = deck
+                _invalidate_renders(job)
+    elif items:
+        error = ("The deck is no longer in memory, so these changes cannot be "
+                 "reversed here. The decision has been cleared from the list.")
+
+    if error is None or not items:
+        with _jobs_lock:
+            job["design_applied"] = [a for a in applied
+                                     if a.finding_id not in chain_ids]
+        if items:
+            _reaudit_in_place(job)
+
+    put_back = sum(1 for o in outcomes if o.get("done"))
+    note = [f"{len(chain)} decision{'s' if len(chain) != 1 else ''} reopened"]
+    if put_back:
+        note.append(f"{put_back} change{'s' if put_back != 1 else ''} put back "
+                    f"exactly as {'they were' if put_back != 1 else 'it was'}")
+    if dragged:
+        note.append(f"including {len(dragged)} that touched the same shape and "
+                    f"could not come back on its own")
+    # Back to the view the Undo button was on. Returning a designer to slide 1
+    # after they pressed a button on slide 7 is the small rudeness that makes a
+    # tool tiring to use.
+    return _design_page(job_id, job, view=view, current=back_to,
+                        banner="; ".join(note) + ".", error=error)
 
 
 _thumb_locks: dict[str, threading.Lock] = {}

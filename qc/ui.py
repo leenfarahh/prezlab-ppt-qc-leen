@@ -553,7 +553,8 @@ def render_report(manifest: dict, job_id: str, can_fix: bool = False,
                   promoted: set | None = None,
                   comments: dict | None = None,
                   archived: bool = False,
-                  assist: bool = False) -> str:
+                  assist: bool = False,
+                  design: int | None = None) -> str:
     from .fixer import is_fixable, tick_reason
 
     s = manifest["summary"]
@@ -578,6 +579,15 @@ def render_report(manifest: dict, job_id: str, can_fix: bool = False,
               f'download>Download cleaned .pptx</a>') if has_cleaned else ""
     diff_btn = (f'<a class="btn success" href="{esc(diff_href)}">Review changes</a>'
                 if diff_href else "")
+    # The design pass is a separate door on purpose. Its findings are decisions
+    # with several right answers, not rule violations with one fix, and mixing a
+    # "pick one of three" control into a list whose every other row is a single
+    # tick teaches the tick to mean something it does not.
+    design_btn = "" if archived else (
+        f'<a class="btn ghost" href="/design/{esc(job_id)}" '
+        f'title="Palette conflicts, unreadable text, overlapping shapes and '
+        f'content outside the frame - each with the ways to fix it">Design QC'
+        + (f' <b>{design}</b>' if design else "") + '</a>')
     exports_span = "" if archived else (
         f'<span class="exports">Export: '
         f'<a href="/report/{esc(job_id)}.pdf">PDF</a> &middot; '
@@ -594,7 +604,7 @@ def render_report(manifest: dict, job_id: str, can_fix: bool = False,
     <span><span class="dot" style="background:var(--lavender)"></span>{s.get('arabic_flagged', 0)} Arabic review</span>
   </span>
   <span class="grow"></span>
-  {apply_btn}{diff_btn}{dl_btn}
+  {apply_btn}{diff_btn}{dl_btn}{design_btn}
   {exports_span}
   <a class="btn ghost" href="/">New audit</a>
 </div>"""

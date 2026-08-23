@@ -96,13 +96,12 @@ def _props_from_rpr(rpr) -> dict:
     return out
 
 
-def _lstStyle_props(txBody, level: int) -> dict:
+def _lstStyle_defRPr(txBody, level: int):
     """defRPr from a txBody's lstStyle at the given paragraph level (0-based)."""
     lst = find(txBody, "a:lstStyle")
     if lst is None:
-        return {}
-    lvl = find(lst, f"a:lvl{level + 1}pPr")
-    return _props_from_rpr(find(lvl, "a:defRPr"))
+        return None
+    return find(find(lst, f"a:lvl{level + 1}pPr"), "a:defRPr")
 
 
 def _layout_placeholder(shape, slide):
@@ -128,51 +127,67 @@ def _master_placeholder(shape, master):
     return None
 
 
-def _master_txstyle_props(shape, master, level: int) -> dict:
+def _master_txstyle_defRPr(shape, master, level: int):
     """p:txStyles on the master: titleStyle for title placeholders, bodyStyle
     for body placeholders, otherStyle for everything else (incl. free shapes)."""
     txStyles = find(master.element, "p:txStyles")
     if txStyles is None:
-        return {}
+        return None
     if shape.is_placeholder and shape.placeholder_format.type in _TITLE_TYPES:
         style = find(txStyles, "p:titleStyle")
     elif shape.is_placeholder:
         style = find(txStyles, "p:bodyStyle")
     else:
         style = find(txStyles, "p:otherStyle")
-    lvl = find(style, f"a:lvl{level + 1}pPr")
-    return _props_from_rpr(find(lvl, "a:defRPr"))
+    return find(find(style, f"a:lvl{level + 1}pPr"), "a:defRPr")
 
 
-def _presentation_default_props(prs, level: int) -> dict:
+def _presentation_default_defRPr(prs, level: int):
     pres_el = getattr(prs.part, "_element", None)
     dts = find(pres_el, "p:defaultTextStyle")
-    lvl = find(dts, f"a:lvl{level + 1}pPr")
-    return _props_from_rpr(find(lvl, "a:defRPr"))
+    return find(find(dts, f"a:lvl{level + 1}pPr"), "a:defRPr")
+
+
+def rpr_layers(run, paragraph, shape, slide, prs) -> list[tuple[str, object]]:
+    """(source name, rPr-shaped element or None) for every level of the cascade,
+    highest priority first.
+
+    Split out because two different questions walk the same ladder: which font
+    and size a run ends up with (resolve_run, below) and what COLOUR it ends up
+    with (qc.design, for the contrast check). A second copy of this walk would
+    drift from this one, and then the tool's idea of which run is 12pt would not
+    match its idea of what colour that same run is - two answers about one run,
+    which is worse than either being wrong on its own.
+    """
+    master = slide.slide_layout.slide_master
+    level = paragraph.level
+    layers: list[tuple[str, object]] = [
+        ("run.rPr", find(run._r, "a:rPr")),
+        ("paragraph.defRPr", find(find(paragraph._p, "a:pPr"), "a:defRPr")),
+        ("shape.lstStyle", _lstStyle_defRPr(shape.text_frame._txBody, level)),
+    ]
+    lp = _layout_placeholder(shape, slide)
+    if lp is not None and lp.has_text_frame:
+        layers.append(("layout.placeholder",
+                       _lstStyle_defRPr(lp.text_frame._txBody, level)))
+    mp = _master_placeholder(shape, master)
+    if mp is not None and mp.has_text_frame:
+        layers.append(("master.placeholder",
+                       _lstStyle_defRPr(mp.text_frame._txBody, level)))
+    layers.append(("master.txStyles",
+                   _master_txstyle_defRPr(shape, master, level)))
+    layers.append(("presentation.default",
+                   _presentation_default_defRPr(prs, level)))
+    return layers
 
 
 def resolve_run(run, paragraph, shape, slide, prs) -> EffectiveFont:
     """Walk the cascade; first level that defines a property wins."""
     master = slide.slide_layout.slide_master
-    level = paragraph.level
-
-    layers: list[tuple[str, dict]] = [
-        ("run.rPr", _props_from_rpr(find(run._r, "a:rPr"))),
-        ("paragraph.defRPr", _props_from_rpr(find(find(paragraph._p, "a:pPr"), "a:defRPr"))),
-        ("shape.lstStyle", _lstStyle_props(shape.text_frame._txBody, level)),
-    ]
-    lp = _layout_placeholder(shape, slide)
-    if lp is not None and lp.has_text_frame:
-        layers.append(("layout.placeholder", _lstStyle_props(lp.text_frame._txBody, level)))
-    mp = _master_placeholder(shape, master)
-    if mp is not None and mp.has_text_frame:
-        layers.append(("master.placeholder", _lstStyle_props(mp.text_frame._txBody, level)))
-    layers.append(("master.txStyles", _master_txstyle_props(shape, master, level)))
-    layers.append(("presentation.default", _presentation_default_props(prs, level)))
 
     resolved: dict[str, Resolved] = {}
-    for source, props in layers:
-        for key, val in props.items():
+    for source, rpr in rpr_layers(run, paragraph, shape, slide, prs):
+        for key, val in _props_from_rpr(rpr).items():
             if key not in resolved:
                 resolved[key] = Resolved(val, source)
 

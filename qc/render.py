@@ -100,21 +100,53 @@ def _export_libreoffice(decks: dict[str, bytes], slide_indices: list[int],
 
 
 def _export_com(decks: dict[str, bytes], slide_indices: list[int],
-                width: int = RENDER_WIDTH) -> dict[str, bytes]:
+                width: int = RENDER_WIDTH, attempts: int = 2) -> dict[str, bytes]:
+    """Render through desktop PowerPoint, with one retry on a fresh instance.
+
+    Presentations.Open fails intermittently - roughly one run in three when the
+    suite starts and quits PowerPoint many times - with a bare "Failed." and no
+    reason. The instance is wedged by then, so retrying against it is pointless;
+    _export_com_once tears its own instance down completely (qc.unify.force_quit)
+    and the second attempt starts clean, which is what actually recovers.
+
+    A DISPATCH refusal is not retried. That is the host saying PowerPoint cannot
+    be automated at all, and the advice it carries is the answer."""
+    last = None
+    for _attempt in range(max(1, attempts)):
+        try:
+            return _export_com_once(decks, slide_indices, width)
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            last = exc
+    from .unify import com_failure_advice
+
+    raise RuntimeError(com_failure_advice(last))
+
+
+def _export_com_once(decks: dict[str, bytes], slide_indices: list[int],
+                     width: int = RENDER_WIDTH) -> dict[str, bytes]:
     import pythoncom
     import win32com.client
+
+    from .unify import automation_pids
 
     out: dict[str, bytes] = {}
     with _RENDER_LOCK:
         pythoncom.CoInitialize()
         tmp_dir = Path(tempfile.mkdtemp(prefix="qc-render-"))
         app = None
+        # Taken before the instance exists, so the teardown knows which headless
+        # PowerPoint is ours to end (qc.unify.force_quit).
+        started = automation_pids()
         try:
             try:
                 app = win32com.client.DispatchEx("PowerPoint.Application")
                 app.DisplayAlerts = 1  # ppAlertsNone
             except Exception as exc:
-                raise RuntimeError(f"PowerPoint automation unavailable: {exc}") from exc
+                from .unify import com_failure_advice
+
+                raise RuntimeError(com_failure_advice(exc)) from exc
 
             for name, data in decks.items():
                 deck_path = tmp_dir / f"{name}.pptx"
@@ -131,13 +163,18 @@ def _export_com(decks: dict[str, bytes], slide_indices: list[int],
                                                     width, height)
                         out[f"{name}:{idx}"] = png_path.read_bytes()
                 finally:
-                    pres.Close()
+                    try:
+                        pres.Close()
+                    except Exception:
+                        pass  # a wedged presentation is force_quit's problem
         finally:
             if app is not None:
-                try:
-                    app.Quit()
-                except Exception:
-                    pass
+                # Quit, and make sure. A Quit that quietly fails leaves a
+                # windowless POWERPNT.EXE behind, and every later render on the
+                # host fails against it and leaks another (qc.unify.force_quit).
+                from .unify import force_quit
+
+                force_quit(app, started)
             # release the COM proxy BEFORE CoUninitialize, or the teardown
             # trips RPC_E_DISCONNECTED (0x80010108) while PowerPoint exits
             app = None
@@ -158,6 +195,110 @@ def _export_com(decks: dict[str, bytes], slide_indices: list[int],
             except OSError:
                 pass
     return out
+
+
+# Enough to see a master's whole vocabulary without asking PowerPoint to render
+# a hundred slides for one page view. A master carrying more than this is
+# truncated and the page says so; a silent cut reads as "the master has fewer
+# layouts than it does".
+MAX_LAYOUTS = 24
+
+
+def layout_catalogue(deck_bytes: bytes) -> tuple[bytes, list[dict]]:
+    """A deck holding ONE blank slide per layout, and what each one is.
+
+    This is how a layout gets rendered at all: PowerPoint exports SLIDES, not
+    layouts, so the only way to photograph a layout is to put an empty slide on
+    it. Adding those slides to a copy whose own slides have been dropped keeps
+    the render honest - what you see is the layout's own furniture, placeholders
+    and background, with nothing of the deck's content on top of it - and keeps
+    it quick, because PowerPoint then opens a file with fifteen slides instead
+    of the deck's two hundred.
+
+    Every master is walked, not just the dominant one. A deck that could not
+    rebuild every slide keeps its ORIGINAL master alive alongside the applied
+    one (qc.applymaster.ApplyResult.stragglers), and which layouts came from
+    which master is exactly what the review is for.
+
+    Returns (deck_bytes, entries, skipped) where each entry is
+    {"index", "master", "layout"} - index being the slide index to render - and
+    `skipped` counts the layouts past MAX_LAYOUTS, so the page can say it
+    truncated instead of implying the master is smaller than it is.
+    """
+    from pptx.oxml.ns import qn
+
+    prs = Presentation(io.BytesIO(deck_bytes))
+    id_list = prs.slides._sldIdLst
+    for sldId in list(id_list):
+        rId = sldId.get(qn("r:id"))
+        id_list.remove(sldId)
+        if rId:
+            try:
+                prs.part.drop_rel(rId)
+            except KeyError:
+                pass
+
+    entries: list[dict] = []
+    skipped = 0
+    for m_index, master in enumerate(prs.slide_masters):
+        for layout in master.slide_layouts:
+            if len(entries) >= MAX_LAYOUTS:
+                skipped += 1
+                continue
+            prs.slides.add_slide(layout)
+            entries.append({"index": len(entries), "master": m_index,
+                            "layout": layout.name or f"Layout {len(entries) + 1}"})
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue(), entries, skipped
+
+
+def layout_previews(before: bytes, after: bytes) -> dict:
+    """Every layout of the submitted deck, and every layout of the rebuilt one.
+
+    Returns {"before": [entry...], "after": [entry...], "images": {key: png},
+    "error": str|None} with image keys "before:<i>" / "after:<i>" matching each
+    entry's index, i.e. the same shape build_diff returns, so the page renders
+    both the same way.
+
+    A RENDER failure does not lose the entries. Which layouts a deck arrived with
+    and which it has now is read out of the file by python-pptx and needs no
+    PowerPoint at all; letting an export failure take the whole answer down left
+    the page saying "No layouts to show" about a master carrying twelve of them
+    (design lead, 23/08/2026). The pictures are the illustration, not the
+    finding."""
+    before_deck, before_entries, cut_b = layout_catalogue(before)
+    after_deck, after_entries, cut_a = layout_catalogue(after)
+    images: dict[str, bytes] = {}
+    error = None
+    try:
+        if before_entries:
+            images.update(export_decks_png({"before": before_deck},
+                                           [e["index"] for e in before_entries]))
+        if after_entries:
+            images.update(export_decks_png({"after": after_deck},
+                                           [e["index"] for e in after_entries]))
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    return {"before": before_entries, "after": after_entries, "images": images,
+            "truncated": bool(cut_b or cut_a), "error": error}
+
+
+def slide_previews(before: bytes, after: bytes, indices: list[int]) -> dict:
+    """The deck itself, before and after, for the given slides.
+
+    Separate from build_diff because there is nothing to highlight here: the
+    format pass rewrites a whole slide onto a new layout rather than fixing
+    named shapes, so a rectangle around "the changed shape" would be a rectangle
+    around the slide. The comparison IS the finding."""
+    if not indices:
+        return {"indices": [], "images": {}, "error": None}
+    try:
+        images = export_decks_png({"before": before, "after": after}, indices)
+    except Exception as exc:
+        return {"indices": list(indices), "images": {},
+                "error": f"{type(exc).__name__}: {exc}"}
+    return {"indices": list(indices), "images": images, "error": None}
 
 
 def shape_rects(deck_bytes: bytes, wanted: dict[int, list[dict]]) -> dict[int, list[dict]]:

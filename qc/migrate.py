@@ -58,7 +58,7 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
 
 from spike.ns import find
 from .util import (full_height_panel, heading_ids, iter_shapes_deep,
-                   max_font_pt, slide_is_rtl)
+                   max_font_pt, recurring_anchors, slide_is_rtl)
 
 # Placeholder roles this pass will fill from free content.
 _TITLE_TYPES = (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE)
@@ -82,6 +82,19 @@ FURNITURE_BAND = 0.88
 # Content this wide is a deliberate full-bleed element, not indented content,
 # and the left margin does not apply to it.
 FULL_BLEED_SHARE = 0.97
+# A shape sharing this much of its own area with a full-bleed element is sitting
+# ON it - a logo stamped on a footer band, a mark on a coloured stripe - and
+# belongs to it rather than to the text elsewhere on the slide. Not strict
+# containment: a logo routinely overhangs the band it sits on by a hair.
+ON_A_BLEED_SHARE = 0.9
+# A shape smaller than this on BOTH sides is a marker, not content, and does not
+# get to say where the content block begins. think-cell parks a 0.0017in square
+# named "think-cell data - do not delete" in the top-left corner of every slide
+# it has ever touched, and PowerPoint leaves the same stub behind for any
+# embedded OLE object; a shape 0.04mm across cannot be the thing a designer
+# seated on a margin. BOTH sides have to fail: a hairline rule or a thin divider
+# is degenerate on ONE axis and is content.
+MIN_ANCHOR_SIDE_EMU = 45720  # 0.05in
 # Frame sources the master STATES rather than the tool inferring: a rectangle
 # the designer drew and named, or the guides they set. A frame derived from
 # placeholder extents is an inference and does not get to bind anything.
@@ -116,6 +129,20 @@ class ContentChange:
     # were removed").
     removed_xml: str | None = None
     restore_id: str | None = None
+    # How to put THIS change back, exactly, and a handle to ask for it by. A
+    # list of operations replayed in order (qc.undo); None means there is
+    # nothing to revert, which is two different things and the review page says
+    # which: a change that only REPORTS (a heading left sitting past a margin
+    # moved nothing), or one this pass did not make in the first place (the
+    # layout assignment is PowerPoint's own work - see qc.applymaster - and
+    # cannot be taken back a slide at a time from here).
+    #
+    # Every operation stores the STATE, never a delta to re-derive: an offset
+    # carries the coordinates the shape had, a removal carries the element
+    # itself. Re-deriving would make undo a second guess at the same problem,
+    # and a wrong guess here silently damages a deck a designer has approved.
+    change_id: str | None = None
+    undo: list[dict] | None = None
 
     def __str__(self) -> str:
         mark = "!! " if self.severity == "alert" else ""
@@ -127,6 +154,23 @@ def _box(shape):
     if None in (l, t, w, h) or w <= 0 or h <= 0:
         return None
     return (l, t, l + w, t + h)
+
+
+def _anchor_boxes(boxes) -> list:
+    """The boxes allowed to define the content block's edges.
+
+    Degenerate shapes are dropped here and nowhere else: they still TRAVEL with
+    the block, because leaving a stub behind while its slide moves serves
+    nobody, but they do not get to say where the block BEGINS. A think-cell data
+    object sitting at (0.002in, 0.002in) made itself the top-left corner of the
+    block on 24 of a 26-slide deck's slides, so seating the block on the
+    master's body line moved the real content - which was already on that line -
+    1.90in DOWN, and 1.1in to 1.9in of every slide off the bottom of the page
+    (real deck, 23/08/2026). The move was reported as an overflow each time,
+    which is not the same as not making it."""
+    return [b for b in boxes
+            if (b[2] - b[0]) >= MIN_ANCHOR_SIDE_EMU
+            or (b[3] - b[1]) >= MIN_ANCHOR_SIDE_EMU]
 
 
 def _overlap_share(shape_box, ph_box) -> float:
@@ -169,6 +213,23 @@ def _shape_xml(shape) -> str | None:
         return etree.tostring(shape._element, encoding="unicode")
     except Exception:
         return None
+
+
+def _insert_undo(shape) -> list[dict] | None:
+    """The undo for a REMOVAL: put this element back. Called before the delete,
+    because after it the element is no longer reachable from the tree."""
+    xml = _shape_xml(shape)
+    return [{"op": "insert", "xml": xml}] if xml else None
+
+
+def _offset_undo(shapes) -> list[dict] | None:
+    """The undo for a MOVE: the coordinates these shapes hold right now. Called
+    before the move, and it records where each one WAS rather than how far it
+    is about to travel, so replaying it cannot drift."""
+    ops = [{"op": "offset", "shape_id": str(s.shape_id),
+            "left": int(s.left), "top": int(s.top)}
+           for s in shapes if s.left is not None and s.top is not None]
+    return ops or None
 
 
 def _renumber(element, first_id: int) -> None:
@@ -445,6 +506,99 @@ def _header_sized(box, text: str, header_floor: int, prs) -> bool:
     return len(text) <= MAX_SUBTITLE_CHARS
 
 
+# A shape sharing this much of its own HEIGHT with a body shape is standing in
+# the same row as that shape. A quarter is deliberately low: the whole point is
+# a row whose members do not line up exactly, and two labels set 0.25in apart on
+# the client's table shared only a third of their height.
+ROW_SHARE = 0.25
+
+
+def _row_bound(box, body_boxes) -> bool:
+    """Whether a header-band shape lines up with CONTENT rather than with the
+    page's header.
+
+    Vertical overlap only, and no test of horizontal distance. A row's members
+    are side by side by definition, so the gap between them says nothing, and
+    requiring adjacency would have failed on the very case this is for: the
+    client's two column headings sit 0.9in and 2.6in from the left with the
+    numbers they label starting at 4.3in."""
+    height = box[3] - box[1]
+    if height <= 0:
+        return False
+    return any(min(box[3], other[3]) - max(box[1], other[1])
+               >= ROW_SHARE * height for other in body_boxes)
+
+
+def _band_candidates(slide, prs):
+    """(candidates, everything) for one slide: the header-band text that COULD be
+    a stray, and every free box on the slide that could vouch for it."""
+    boxes = [(s, _box(s)) for s in slide.shapes
+             if not getattr(s, "is_placeholder", False)]
+    boxes = [(s, b) for s, b in boxes if b is not None]
+    by_type = _placeholders_by_type(slide)
+    title = next(iter(sum((by_type.get(t, []) for t in _TITLE_TYPES), [])), None)
+    sub = next(iter(sum((by_type.get(t, []) for t in _SUBTITLE_TYPES), [])), None)
+    floor = _header_floor(title, sub)
+    return ([(s, b) for s, b in boxes
+             if _header_sized(b, _text_of(s), floor, prs)], boxes)
+
+
+def stray_texts(prs) -> set:
+    """The header-band texts this deck treats as STRAYS, decided once for the
+    whole deck. Anything else up there is content that happens to sit high.
+
+    Three things make this a deck-wide question rather than a per-slide one, and
+    each of them was a wrong answer first.
+
+    A ROW HAS NO BODY TO LINE UP WITH when the whole row sits above the line. A
+    Gantt's eighteen month numbers all ended at 1.27in against a body beginning
+    at 1.90in, so asking each one whether it lines up with the BODY answered no
+    eighteen times and the sweep took the lot. They line up with each OTHER,
+    which is what a row is, so mates are looked for among everything on the
+    slide - not only among what the block will move.
+
+    BOILERPLATE IS BOILERPLATE WHEREVER IT LANDS. "To be translated" sat alone
+    at the top of most slides and, on the seven where it happened to share a band
+    with a numbered badge, looked exactly like a row member. Judged per slide it
+    came off five slides and stayed on seven, which is the worst of both
+    outcomes. Judged by TEXT across the deck it goes from all of them or none.
+
+    AND A STRAY CANNOT VOUCH FOR ANOTHER STRAY. Two working notes stamped side by
+    side at the top of a slide each made the other look like a row, so both
+    survived until the set was iterated to a fixpoint.
+
+    On the client's deck (23/08/2026) this removes 25 pieces of text - every one
+    of the 21 "To be translated" stamps, three "not comprehensive" notes and one
+    orphaned column heading - and keeps the rest, including all eighteen month
+    labels and every numbered badge and card heading. Removing everything above
+    the line took 60 and gutted the tables.
+
+    Known gap, and it errs the safe way: two strays that appear ONLY side by side
+    and nowhere else vouch for each other forever, and both survive. The fixpoint
+    can add to the set but never break a mutual cycle. Keeping two notes is a far
+    better failure than a member count that would delete a two-label row, so it
+    is left alone until a deck actually shows the problem."""
+    slides = [_band_candidates(slide, prs) for slide in prs.slides]
+    strays: set = set()
+    # Bounded: each pass can only ADD to the set, and there are finitely many
+    # texts, so this settles. The cap is a backstop, not a strategy.
+    for _pass in range(8):
+        grew = False
+        for candidates, everything in slides:
+            for shape, box in candidates:
+                text = _text_of(shape)
+                if text in strays:
+                    continue
+                mates = [b for other, b in everything
+                         if other is not shape and _text_of(other) not in strays]
+                if not _row_bound(box, mates):
+                    strays.add(text)
+                    grew = True
+        if not grew:
+            break
+    return strays
+
+
 def _rank_header_text(candidates, header_floor: int, slide, prs) -> list:
     """Header text ordered biggest type first: [title, subtitle, ...].
 
@@ -551,12 +705,16 @@ def _drop_background_override(slide, slide_index) -> list[ContentChange]:
     if not inherits:
         return []
 
+    from lxml import etree
+
+    kept = [etree.tostring(bg, encoding="unicode") for bg in own]
     for bg in own:
         cSld.remove(bg)
     return [ContentChange(
         slide_index, "dropped background override",
         "the slide carried its own background, which beats the master's; "
-        "removed so the master's background applies")]
+        "removed so the master's background applies",
+        undo=[{"op": "bg", "xml": x} for x in kept if x])]
 
 
 def _remove_duplicates(slide_index, free, filled_phs) -> list[ContentChange]:
@@ -579,13 +737,15 @@ def _remove_duplicates(slide_index, free, filled_phs) -> list[ContentChange]:
             changes.append(ContentChange(
                 slide_index, "removed duplicated text",
                 f"{_text_of(shape)[:40]!r} was a second copy of the text now "
-                f"in the {_ph_label(ph)} placeholder"))
+                f"in the {_ph_label(ph)} placeholder",
+                undo=_insert_undo(shape)))
             free.remove(shape)
             _delete(shape)
     return changes
 
 
-def _resolve_collisions(slide_index, free, filled_phs, prs) -> list[ContentChange]:
+def _resolve_collisions(slide_index, free, filled_phs, prs,
+                        was_clear=None) -> list[ContentChange]:
     """Clear anything this pass would otherwise leave printing on top of a
     placeholder it just filled.
 
@@ -594,6 +754,14 @@ def _resolve_collisions(slide_index, free, filled_phs, prs) -> list[ContentChang
     the same box. Handing that to a later audit stage would make a designer
     clean up after the tool, and the audit would have to re-derive with
     heuristics what this function knows for certain, having just done it.
+
+    `was_clear` is the set of shape ids that did NOT overlap the header band
+    BEFORE this pass moved anything, and it is what holds that sentence to its
+    word. A shape already standing in the band arrived that way: this pass did
+    not cause it, and clearing it means moving one member of a row on its own -
+    a Gantt's twenty-one month labels were pushed 0.93in clear of the table they
+    label (design lead, 23/08/2026). Those are reported instead. Omit it and
+    every collision is treated as ours, which is the old behaviour.
 
     Colour is deliberately NOT touched here. Text may now be unreadable on a
     new dark background, but choosing a colour is a design judgment and the
@@ -617,18 +785,56 @@ def _resolve_collisions(slide_index, free, filled_phs, prs) -> list[ContentChang
 
         label = _text_of(shape)[:40] or "a shape"
         names = ", ".join(sorted({_ph_label(ph) for ph, _b in hits}))
+
+        if was_clear is not None and str(shape.shape_id) not in was_clear:
+            changes.append(ContentChange(
+                slide_index, "overlap needs a designer",
+                f"{label!r} was already standing in the header band before this "
+                f"pass moved anything, so the overlap with the {names} "
+                f"placeholder is not this pass's doing. Nothing was moved: "
+                f"clearing it would move one member of its row on its own. "
+                f"Check it"))
+            continue
         # Clear the whole header band, not just the placeholders currently hit.
         # Shifting only past the title dropped the eyebrow straight onto the
         # subtitle, trading one collision for another; header placeholders span
         # the slide width, so the band is the thing to get below.
         band_bottom = max(b[3] for _ph, b in boxes)
         shift = band_bottom + CONTENT_GAP_EMU - box[1]
+
+        # Only TEXT is nudged. This function exists because the pass puts text
+        # into a placeholder and can leave a sibling line of text printing on top
+        # of it; a graphic has no such problem, and the same reasoning that keeps
+        # a corner rule, a bracket or a mark out of the remnant sweep
+        # (_header_sized) keeps it out of this move. It is part of a composition,
+        # and a header placeholder spans the whole slide width, so a box overlap
+        # with one says little about where its words actually are.
+        #
+        # Nudging graphics broke the arrangement it was meant to protect. A
+        # 1.70x0.02in decorative bar sitting at 0.37in was pushed 1.53in down
+        # into the body on three slides, and two full-width table rules were
+        # pushed 0.63in and 0.40in - different distances, so they collapsed onto
+        # each other and onto the row beneath (design lead, 23/08/2026). One
+        # block, one move; anything else here is a report.
+        if not _text_of(shape):
+            changes.append(ContentChange(
+                slide_index, "overlap needs a designer",
+                f"{label!r} overlaps the {names} placeholder. Nothing was moved: "
+                f"it carries no text, so it is part of a composition rather than "
+                f"a line competing with the heading, and moving it alone would "
+                f"break whatever it was drawn with. A header placeholder spans "
+                f"the whole slide width, so the two may not touch on screen at "
+                f"all. Check it"))
+            continue
+
         if shift > 0 and box[3] + shift <= prs.slide_height:
+            back = _offset_undo([shape])
             shape.top += shift
             changes.append(ContentChange(
                 slide_index, "nudged clear of a placeholder",
                 f"{label!r} moved down {shift / 914400:.2f}in so it no longer "
-                f"prints over the {names} placeholder"))
+                f"prints over the {names} placeholder",
+                undo=back))
         else:
             changes.append(ContentChange(
                 slide_index, "overlap needs a designer",
@@ -855,12 +1061,32 @@ def _is_page_furniture(shape, slide_number: int, sh_height: int,
     return None
 
 
-def migrate_slide(slide, slide_index: int, prs) -> list[ContentChange]:
+def migrate_slide(slide, slide_index: int, prs, anchors=None,
+                  strays=None) -> list[ContentChange]:
+    """`anchors` is qc.util.recurring_anchors and `strays` is stray_texts, both
+    read over the WHOLE deck: one tells page furniture from content low on a
+    single slide, the other tells a boilerplate note from content sitting high.
+    Neither question can be answered from one slide, and both are passed in
+    because computing them per slide would make the pass quadratic. Computed here
+    when a caller has only one slide in mind."""
+    if anchors is None:
+        anchors = recurring_anchors(prs)
+    if strays is None:
+        strays = stray_texts(prs)
     changes: list[ContentChange] = _drop_background_override(slide, slide_index)
     by_type = _placeholders_by_type(slide)
     title_ph = next(iter(sum((by_type.get(t, []) for t in _TITLE_TYPES), [])), None)
     sub_ph = next(iter(sum((by_type.get(t, []) for t in _SUBTITLE_TYPES), [])), None)
     furniture_phs = sum((by_type.get(t, []) for t in _FURNITURE_TYPES), [])
+
+    # Recorded before anything moves: who was clear of the header band to begin
+    # with. Read afterwards it is unanswerable, and it is the difference between
+    # a collision this pass caused and one it inherited
+    # (_resolve_collisions).
+    band_floor_now = _header_floor(title_ph, sub_ph)
+    was_clear = {str(s.shape_id) for s in slide.shapes
+                 if not getattr(s, "is_placeholder", False)
+                 and (_box(s) or (0, band_floor_now + 1, 0, 0))[1] >= band_floor_now}
 
     free = [s for s in slide.shapes if not getattr(s, "is_placeholder", False)]
 
@@ -873,7 +1099,8 @@ def migrate_slide(slide, slide_index: int, prs) -> list[ContentChange]:
             if what:
                 changes.append(ContentChange(
                     slide_index, "removed duplicate furniture",
-                    f"{what} {_text_of(shape)!r}; the master supplies this"))
+                    f"{what} {_text_of(shape)!r}; the master supplies this",
+                    undo=_insert_undo(shape)))
                 free.remove(shape)
                 _delete(shape)
 
@@ -906,14 +1133,26 @@ def migrate_slide(slide, slide_index: int, prs) -> list[ContentChange]:
             continue
         ranked.remove(pick)
         text = _text_of(pick)
+        # Both halves of the move, captured before either happens: the
+        # placeholder as it was (empty, and styled by the master) and the shape
+        # the text came out of. Undoing one without the other would either lose
+        # the wording or print it twice.
+        was_empty = _shape_xml(ph)
+        came_from = _shape_xml(pick)
         rtl_marked = _set_text(ph, text, source=pick)
         grouped = pick not in free
+        back = [op for op in (
+            {"op": "replace", "shape_id": str(ph.shape_id), "xml": was_empty}
+            if was_empty else None,
+            {"op": "insert", "xml": came_from} if came_from else None,
+        ) if op]
         changes.append(ContentChange(
             slide_index, f"{label} into placeholder",
             f"{text[:60]!r} now styled by the master; run-level formatting "
             f"dropped" + (" (lifted out of a group)" if grouped else "")
             + ("; kept right-to-left, which the master's own paragraph "
-               "direction would have reversed" if rtl_marked else "")))
+               "direction would have reversed" if rtl_marked else ""),
+            undo=back or None))
         placed.add(text.casefold())
         if not grouped:
             free.remove(pick)
@@ -945,15 +1184,30 @@ def migrate_slide(slide, slide_index: int, prs) -> list[ContentChange]:
     # ceiling move pushed an entire slide off the canvas (real-master check,
     # 20/08/2026). Parked, it stays exactly where the designer put it while the
     # body seats itself on the guide.
+    # The bottom strip alone is not enough to call something furniture, and on
+    # its own it parked 25 shapes on this deck of which NONE were furniture: the
+    # bottom row of a table at 6.61in, a chart's axis labels at 6.80in, a legend
+    # at 7.09in, a band of arrows at 6.65in. Each stayed behind while the
+    # composition it belongs to moved (design lead, 23/08/2026). Real page
+    # furniture on these decks is a PLACEHOLDER the master supplies, so it never
+    # reaches this test at all.
+    #
+    # So both halves are required, exactly as qc.fixer._pinned_furniture already
+    # asks it: low on the slide AND recurring at one position across the deck. A
+    # source line low on one slide is content; a logo strip on twenty slides is
+    # not. The risk this trades against is real - content dragged past the bottom
+    # edge - and it is reported as an overflow rather than hidden by leaving the
+    # shape behind.
     band_top = FURNITURE_BAND * prs.slide_height
 
     def _pinned(shape) -> bool:
         box = _box(shape)
         if box is None:
             return False
+        if full_height_panel(box[1], box[3] - box[1], prs.slide_height):
+            return True
         return (box[1] >= band_top
-                or full_height_panel(box[1], box[3] - box[1],
-                                     prs.slide_height))
+                and (slide_index, str(shape.shape_id)) in anchors)
 
     movable = [s for s in free if not _pinned(s)]
     parked = len(free) - len(movable)
@@ -966,25 +1220,104 @@ def migrate_slide(slide, slide_index: int, prs) -> list[ContentChange]:
     # content down by however far the EYEBROW had to travel. The cards landed
     # 1.5in below where the master says the body begins. Body content is now
     # placed against the master's body margin regardless of what sits above it.
-    remnants, body = [], []
+    # RIDERS: shapes that cannot be MEASURED but must still travel. A perfectly
+    # horizontal or vertical connector has a width or a height of exactly zero,
+    # so _box refuses it - correctly, since it has no area to overlap, contain or
+    # anchor anything with - and dropping it here meant it never moved at all.
+    # A deck of tables came back with every rule and divider stranded where it
+    # was while the rows it separates moved beneath it (design lead, 23/08/2026:
+    # "boxes and lines that are supposed to be moved as one entity should stay
+    # that way"). It is one line of code and it was silent on 14 of 26 slides.
+    #
+    # They ride and nothing more: no say in where the block starts, no part in
+    # the remnant sweep, no vote on the bleed. A line is not content to be
+    # judged, it is content to be carried.
+    remnants, body, riders = [], [], []
     for shape in movable:
         box = _box(shape)
         if box is None:
+            if shape.left is not None and shape.top is not None:
+                riders.append(shape)
             continue
-        # Gated on _header_sized, not on the top edge alone: a diagram whose
-        # top sits just above the header floor is body content, and an
-        # earlier top-edge-only test deleted one.
-        if _header_sized(box, _text_of(shape), header_floor, prs):
+        # Two gates, and both are needed. _header_sized asks whether this could
+        # be a line of header text at all - a diagram whose top sits just above
+        # the floor is body content, and an earlier top-edge-only test deleted
+        # one. `strays` then asks whether the DECK treats this text as a stray,
+        # which is the question a single slide cannot answer (stray_texts).
+        if (_header_sized(box, _text_of(shape), header_floor, prs)
+                and _text_of(shape) in strays):
             remnants.append((shape, box))
         else:
             body.append((shape, box))
 
+    # Second look, and the sweep below is why it has to happen: a shape that
+    # lines up with CONTENT is content, whatever band its box happens to end in.
+    #
+    # A table's column headings are the case that proves it. On the client's
+    # Gantt slide, "team members" and "months of work" ended at 1.84in and
+    # 1.59in - just above the 1.90in header cutoff - while the month numbers
+    # labelling the same row ended at 2.01in, just below it. Same row, same 14pt
+    # type, drawn as one thing by the designer; the cutoff fell between them and
+    # the two words were deleted while the numbers were kept (design lead,
+    # 23/08/2026). The cutoff cannot be moved to fix that - wherever it sits,
+    # some row straddles it - so the question has to be asked of the content
+    # instead of the band.
+    #
+    # Keeping is the safe direction. A spared shape travels with the block and
+    # gets nudged clear of the master's header if it still collides; a swept one
+    # is gone, and a designer has to notice and put it back.
+    # Whether this pass PLACED anything is deliberately not consulted. Gating
+    # the sweep on it was tried and withdrawn (design lead, 23/08/2026): a slide
+    # whose placeholders PowerPoint had already filled then kept every stray in
+    # the band, and the strays travelled into the body with the block - so a
+    # working note reading "To be translated" ended up inside the content area
+    # instead of out of the deck. Text above the line where the body begins is
+    # unplaced whatever put the heading there, and the client's instruction is
+    # plain: remove it, flag it, let me put it back.
+    #
+    # The cost of that instruction, stated because it is real: on a slide where
+    # PowerPoint widened the subtitle placeholder to the layout's full width, the
+    # heading it absorbed now prints at the far margin, so a stray restored to
+    # its own coordinates can land under it. That is the layout assignment's
+    # doing, not the sweep's, and the restore says what it now covers.
+    #
     # Remnants stack directly under the header band; the body starts below
     # them. A missing eyebrow slot in the master is why they need somewhere to
     # go at all, and stacking keeps reading order without coupling the body's
     # position to the remnant's original one.
     boxes = [b for _s, b in body]
+    # What the block is MEASURED from, which is not the same as what moves:
+    # every body shape below travels, and only these say where it starts
+    # (_anchor_boxes).
+    anchors = _anchor_boxes(boxes)
     body_top_target = region[1]
+
+    # Header furniture does not get to be the body's top edge either. A rule, a
+    # bracket or a corner mark drawn above the line where content begins is part
+    # of the header's composition and carries no text, so the remnant sweep
+    # leaves it alone - correctly, since it is not "unplaced text" - but leaving
+    # it in the ANCHOR set made a 0.02in decorative bar sitting at 0.37in the top
+    # of the block on the client's deck, and seating THAT on the body line pushed
+    # the real content 1.53in down and off the page.
+    #
+    # Dropped only while something else still reaches the body region. A deck
+    # whose whole body sits above the line has to be brought DOWN to it, and
+    # excluding every anchor there would leave exactly those slides untouched.
+    if body_top_target:
+        reaching = [b for b in anchors if b[3] > body_top_target]
+        if reaching:
+            anchors = reaching
+
+    # Nor does anything down in the bottom strip. It still TRAVELS - that is what
+    # keeps a legend with its chart and a table's last row with its table - but a
+    # footnote, an axis label or a legend low on the page is not where the body
+    # begins or ends. Leaving them in made a slide whose only free content is one
+    # footer bar at 7.17in seat that bar on the body line, hoisting it 5.27in to
+    # the top of an otherwise empty page.
+    #
+    # With nothing above the strip there is nothing to seat, and the block is
+    # left alone rather than invented a position for.
+    anchors = [b for b in anchors if b[1] < band_top]
 
     # Header text that reached no placeholder is unaccounted for: the master
     # defines no slot for it, and leaving it floating is what produced the
@@ -995,21 +1328,26 @@ def migrate_slide(slide, slide_index: int, prs) -> list[ContentChange]:
     # and it collided on full slides.
     for shape, box in remnants:
         text = _text_of(shape)
+        where = (f"ended at {box[3] / 914400:.2f}in, above the "
+                 f"{body_top_target / 914400:.2f}in where the body begins"
+                 if body_top_target else "sat above the body")
         changes.append(ContentChange(
             slide_index, "removed unplaced text",
-            f"{text!r} sat in the header band but the master has no "
-            f"placeholder for it, so it was removed",
+            f"{text!r} {where}, and the master has no placeholder for it. "
+            f"Removed rather than carried into the content: put it back with "
+            f"Undo if it belongs in the deck",
             severity="alert", removed_text=text,
             removed_xml=_shape_xml(shape),
-            restore_id=f"{slide_index}-{shape.shape_id}"))
+            restore_id=f"{slide_index}-{shape.shape_id}",
+            undo=_insert_undo(shape)))
         if shape in free:
             free.remove(shape)
         _delete(shape)
-    if boxes:
-        cl = min(b[0] for b in boxes)
-        ct = min(b[1] for b in boxes)
-        cr = max(b[2] for b in boxes)
-        cb = max(b[3] for b in boxes)
+    if anchors:
+        cl = min(b[0] for b in anchors)
+        ct = min(b[1] for b in anchors)
+        cr = max(b[2] for b in anchors)
+        cb = max(b[3] for b in anchors)
 
         # All four sides are consulted, and they divide the way a translate
         # forces them to: TOP and LEFT bind (the block's edge is set to the
@@ -1048,6 +1386,13 @@ def migrate_slide(slide, slide_index: int, prs) -> list[ContentChange]:
         stated = frame[4] in STATED_FRAME_SOURCES
         if not stated:
             dy = min(dy, max(0, region[3] - cb))
+        # Not even the CANVAS outranks a stated frame. Holding a too-tall block
+        # back to keep it on the page was tried and refused: the frame's top line
+        # binds on every slide or the deck loses the one line that makes its
+        # headers read as one, and an overflow that is reported is better than a
+        # header band that is quietly broken on the busy slides (design lead,
+        # 23/08/2026, re-confirming the 21/08 decision against the alternative).
+        # What the overflow costs is stated instead, in inches, below.
         # The START margin BINDS, the same way the body-top margin does: the
         # block's edge is set to it rather than merely kept inside it.
         # Correcting only breaches left content sitting a few millimetres
@@ -1062,22 +1407,70 @@ def migrate_slide(slide, slide_index: int, prs) -> list[ContentChange]:
         rtl = slide_is_rtl(slide)
         dx = (region[2] - cr) if rtl else (region[0] - cl)
 
-        # Full-bleed content is exempt. A band or image deliberately running
-        # edge to edge is not indented content, and dragging it to the margin
-        # would destroy the effect.
-        if (cr - cl) >= FULL_BLEED_SHARE * prs.slide_width:
-            dx = 0
-        too_wide = (cr - cl) > (region[2] - region[0])
+        # Full-bleed content is exempt from the sideways move, and exempt ALONE.
+        # A band or image deliberately running edge to edge is not indented
+        # content and dragging it to the margin would destroy the effect - but it
+        # is one shape's exemption, not the slide's. Vetoing the whole block on
+        # its account left the deck's Arabic cover title sitting in the left half
+        # of the page because a 1.28in white footer band happened to run edge to
+        # edge underneath it (design lead, 23/08/2026, "the title should be right
+        # aligned since it's Arabic"). It was: right-aligned inside a box the
+        # width of half the slide, which is not what anyone means.
+        #
+        # So the block's SIDE edges are measured from the shapes the margin can
+        # actually apply to, and the bleed elements keep their x while still
+        # travelling in y with everything else. Vertically the block stays one
+        # thing; horizontally a bleed element was never part of the arrangement,
+        # which is the same reading that parks a page-deep panel above.
+        # What "alone" covers: the bleed element AND whatever is sitting on it.
+        # A logo stamped on a full-width footer band belongs to the band, not to
+        # the text three inches above it, and carrying it along took the client's
+        # MWAN mark from the bottom-left corner of its cover to the middle of the
+        # strip. Anything mostly inside a bleed element keeps its x with it.
+        #
+        # The cost, stated: where a bleed element covers the content area itself
+        # rather than a strip of it, everything is inside it and the slide gets no
+        # sideways seat at all. That is what the old whole-block veto did on every
+        # such slide, so it is no loss, and the move report names what was held.
+        bleed_width = FULL_BLEED_SHARE * prs.slide_width
+        bleed_boxes = [b for b in boxes if (b[2] - b[0]) >= bleed_width]
 
-        fits = ((cb + dy) <= region[3]
-                and (cl + dx) >= region[0] and (cr + dx) <= region[2])
+        def _bleeds(box) -> bool:
+            if (box[2] - box[0]) >= bleed_width:
+                return True
+            return any(_overlap_share(box, b) >= ON_A_BLEED_SHARE
+                       for b in bleed_boxes)
+
+        indented = [b for b in anchors if not _bleeds(b)]
+        if indented:
+            il = min(b[0] for b in indented)
+            ir = max(b[2] for b in indented)
+            dx = (region[2] - ir) if rtl else (region[0] - il)
+        else:
+            # Nothing but bleed elements: there is no indented content to seat,
+            # and moving them sideways is the one thing this must not do.
+            il, ir, dx = cl, cr, 0
+        too_wide = (ir - il) > (region[2] - region[0])
+
+        # The MOVE is decided from the anchors; the OVERFLOW is measured from
+        # everything that actually travels. They are different sets now that a
+        # legend low on the page rides along without saying where the block ends,
+        # and reporting only the anchors let that legend leave the page unsaid.
+        low = max([b[3] for _s, b in body] or [cb])
+        fits = ((low + dy) <= region[3]
+                and (il + dx) >= region[0] and (ir + dx) <= region[2])
         movable = [s for s, _b in body]
         edge = "right" if rtl else "left"
         if dx or dy:
-            for shape in movable:
-                if _box(shape) is None:
-                    continue
-                shape.left += dx
+            travelling = [s for s, _b in body] + riders
+            back = _offset_undo(travelling)
+            held = 0
+            for shape in travelling:
+                box = _box(shape)
+                if box is not None and _bleeds(box):
+                    held += 1
+                else:
+                    shape.left += dx
                 shape.top += dy
             # Names the frame it was seated on, because "was the presentation
             # space used on this slide?" is otherwise unanswerable from the
@@ -1088,7 +1481,7 @@ def migrate_slide(slide, slide_index: int, prs) -> list[ContentChange]:
                                       "(no guides or presentation space to "
                                       "read)"}.get(frame[4], "the master")
             landed = ct + dy
-            detail = (f"{len(movable)} shape(s) shifted {dx / 914400:+.2f}in, "
+            detail = (f"{len(travelling)} shape(s) shifted {dx / 914400:+.2f}in, "
                       f"{dy / 914400:+.2f}in onto {source}: body now starts at "
                       f"{landed / 914400:.2f}in"
                       + ("" if abs(landed - body_top_target) <= HEADING_SLACK_EMU
@@ -1096,6 +1489,11 @@ def migrate_slide(slide, slide_index: int, prs) -> list[ContentChange]:
                               f"off the {body_top_target / 914400:.2f}in the frame states")
                       + f", seated on the {edge} margin"
                       + (" (Arabic reads right to left)" if rtl else ""))
+            if held and dx:
+                detail += (f"; {held} shape(s) running edge to edge, and what "
+                           f"sits on them, kept their own left and right edges "
+                           f"so the bleed survives; they moved down with the "
+                           f"rest")
             if remnants:
                 detail += (f"; {len(remnants)} unplaced header shape(s) removed "
                            f"and listed above")
@@ -1104,7 +1502,7 @@ def migrate_slide(slide, slide_index: int, prs) -> list[ContentChange]:
                            f"the depth of the page left in place rather than "
                            f"dragged off the canvas")
             changes.append(ContentChange(
-                slide_index, "content block moved", detail))
+                slide_index, "content block moved", detail, undo=back))
         # Where the master states nothing, the block is only kept INSIDE an
         # inferred frame, never seated on it - so it can end up short of the
         # line, and the report has to say why rather than leave a designer
@@ -1125,7 +1523,7 @@ def migrate_slide(slide, slide_index: int, prs) -> list[ContentChange]:
         if too_wide:
             changes.append(ContentChange(
                 slide_index, "wider than the margins",
-                f"the content block is {(cr - cl) / 914400:.2f}in wide against a "
+                f"the content block is {(ir - il) / 914400:.2f}in wide against a "
                 f"{(region[2] - region[0]) / 914400:.2f}in content area, so it "
                 f"cannot sit inside both margins; aligned to the {edge} margin "
                 f"and left for a designer (not scaled: narrowing a text box "
@@ -1135,8 +1533,8 @@ def migrate_slide(slide, slide_index: int, prs) -> list[ContentChange]:
             # Says WHERE it does not fit and by how much, because the answer
             # differs: past the bottom margin is a rework conversation, past the
             # slide edge is content that will not print at all.
-            over_margin = (cb + dy) - region[3]
-            over_canvas = (cb + dy) - prs.slide_height
+            over_margin = (low + dy) - region[3]
+            over_canvas = (low + dy) - prs.slide_height
             spill = []
             if over_margin > 0:
                 spill.append(f"{over_margin / 914400:.2f}in past the bottom "
@@ -1148,10 +1546,18 @@ def migrate_slide(slide, slide_index: int, prs) -> list[ContentChange]:
             held = (" The line the master states for the top of its body was "
                     "held, so the strip under the header is still clear."
                     if stated and dy > 0 else "")
+            # Measured, not characterised. "Taller or wider than the content
+            # region" reads like a nudge is missing; "7.08in of content against
+            # a 4.90in area" is a rework conversation, and it is the same fact
+            # (design lead, 23/08/2026, on a slide whose block was half again
+            # the height of the frame).
+            size = (f"the block is {(low - ct) / 914400:.2f}in tall and "
+                    f"{(ir - il) / 914400:.2f}in wide against a "
+                    f"{(region[3] - region[1]) / 914400:.2f}in by "
+                    f"{(region[2] - region[0]) / 914400:.2f}in content region")
             changes.append(ContentChange(
                 slide_index, "content does not fit",
-                f"the block is taller or wider than the master's content "
-                f"region{where}. Left for a designer (not scaled: shrinking a "
+                f"{size}{where}. Left for a designer (not scaled: shrinking a "
                 f"text box does not shrink its type).{held}",
                 severity="alert" if over_canvas > 0 else "info"))
 
@@ -1163,7 +1569,8 @@ def migrate_slide(slide, slide_index: int, prs) -> list[ContentChange]:
     filled = [ph for ph in (title_ph, sub_ph)
               if ph is not None and _text_of(ph)]
     if filled:
-        changes.extend(_resolve_collisions(slide_index, free, filled, prs))
+        changes.extend(_resolve_collisions(slide_index, free, filled, prs,
+                                           was_clear))
 
     # --- 3c. text-on-text left among the content -------------------------
     changes.extend(_report_text_overlaps(slide_index, free))
@@ -1180,7 +1587,8 @@ def migrate_slide(slide, slide_index: int, prs) -> list[ContentChange]:
             changes.append(ContentChange(
                 slide_index, "removed empty placeholder",
                 f"{ph_type} had nothing to hold; its prompt text would show "
-                f"in the editor"))
+                f"in the editor",
+                undo=_insert_undo(ph)))
             _delete(ph)
 
     # --- 5. headings outside the margin frame ----------------------------
@@ -1194,13 +1602,25 @@ def migrate_deck(deck_bytes: bytes) -> tuple[bytes, list[ContentChange]]:
     """Run the content migration over every slide of an already-restyled deck."""
     prs = Presentation(io.BytesIO(deck_bytes))
     changes: list[ContentChange] = []
+    # Read once for the deck: what recurs across slides is the only way to tell
+    # a footer from a source line that happens to sit low on one slide.
+    anchors = recurring_anchors(prs)
+    # And which header-band texts this deck treats as strays, before a single
+    # slide is touched: judged per slide, the same note came off some slides and
+    # stayed on others (stray_texts).
+    strays = stray_texts(prs)
     for idx, slide in enumerate(prs.slides):
         try:
-            changes.extend(migrate_slide(slide, idx, prs))
+            changes.extend(migrate_slide(slide, idx, prs, anchors, strays))
         except Exception as exc:
             changes.append(ContentChange(
                 idx, "migration skipped",
                 f"{type(exc).__name__}: {exc}; the slide is unchanged"))
+    # Stamped here rather than at each change site: the id has to survive a
+    # round trip through the review page's form, so it must be assigned once,
+    # after the order is final, and never re-derived from the change's own text.
+    for n, change in enumerate(changes):
+        change.change_id = f"c{n}"
     out = io.BytesIO()
     prs.save(out)
     return out.getvalue(), changes

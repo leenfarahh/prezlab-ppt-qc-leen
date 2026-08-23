@@ -364,9 +364,13 @@ def render_format_result(*, deck_name: str, profile_name: str, job_id: str,
 <b>{esc(profile_name)}</b>. Each slide was copied, given the master's layout,
 and the original deleted.</p>
 <div class="actions" style="gap:0.6rem">
-  <a class="btn primary" href="/format/{esc(job_id)}/download">Download the rebuilt deck</a>
+  <a class="btn primary" href="/format/{esc(job_id)}/review?view=master">Review before / after</a>
+  <a class="btn ghost" href="/format/{esc(job_id)}/download">Download the rebuilt deck</a>
   <a class="btn ghost" href="/format">Format another deck</a>
 </div>
+<p class="note">The review shows the master's layouts before and after, and the
+deck slide by slide, with an Undo on every change. Look before you download:
+undoing after the file has gone out means doing it twice.</p>
 {fallback_note}{failed_note}{_masters_note(masters, stragglers or [], plans)}{restored_note}
 <div class="kpis">{''.join(chips)}</div>
 {space_note}

@@ -38,7 +38,8 @@ from dataclasses import dataclass, field
 
 from pptx import Presentation
 
-from .unify import com_available
+from .unify import (automation_pids, com_available,
+                    com_failure_advice, force_quit)
 
 # Archetypes that can stand in for an unmatched slide, best first. A content
 # layout is the safest home for a slide whose own archetype has no counterpart:
@@ -214,13 +215,16 @@ def apply_master(deck_bytes: bytes, master_bytes: bytes,
             os.remove(out_path)  # SaveAs will not overwrite silently
             paths.append(out_path)
 
+            # Snapshotted before the instance exists, so the teardown knows
+            # which headless PowerPoint is ours to end (qc.unify.force_quit).
+            started = automation_pids()
             try:
                 app = _com_retry(
                     lambda: win32com.client.DispatchEx("PowerPoint.Application"))
                 app.DisplayAlerts = 1
             except Exception as exc:
                 return ApplyResult(None, plans,
-                                   fatal=f"PowerPoint automation unavailable: {exc}")
+                                   fatal=com_failure_advice(exc))
 
             pres = app.Presentations.Open(deck_path, 0, 0, 0)
             try:
@@ -301,11 +305,11 @@ def apply_master(deck_bytes: bytes, master_bytes: bytes,
                     pres.Close()
             except Exception:
                 pass
-            try:
-                if app is not None:
-                    app.Quit()
-            except Exception:
-                pass
+            # Quit, and make sure: an instance wedged mid-run survives Quit with
+            # no window, and every later automation attempt on the host fails
+            # against it (qc.unify.force_quit).
+            if app is not None:
+                force_quit(app, started)
             pythoncom.CoUninitialize()
             for p in paths:
                 try:

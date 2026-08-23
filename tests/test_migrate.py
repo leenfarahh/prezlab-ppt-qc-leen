@@ -576,10 +576,23 @@ def test_the_block_move_never_pushes_content_over_the_footer():
 # ------------------------------------------------- margins, not movements
 
 
-def _margin_deck(*, eyebrow_top, body_top):
+def _margin_deck(*, eyebrow_top, body_top, stub=False, header_rule=False,
+                 edge_stamps=False):
     """A client-shaped slide: eyebrow, heading, standfirst, then a content
     cluster. eyebrow_top and body_top vary independently so the body's final
-    position can be tested for independence from what sits above it."""
+    position can be tested for independence from what sits above it.
+
+    The three optional extras are the shapes that must NOT get to say where the
+    block starts, each taken from the deck that exposed it:
+
+    stub          a 0.0017in square in the top-left corner, what think-cell and
+                  every embedded OLE object leave behind
+    header_rule   a 3in by 0.02in hairline in the header band: no text, so the
+                  remnant sweep leaves it alone, and thin on one axis only, so
+                  it is not degenerate
+    edge_stamps   a mark near each side edge, so the block's BOUNDING BOX spans
+                  the page while no single shape does
+    """
     prs = Presentation()
     prs.slide_width, prs.slide_height = Emu(12192000), Emu(6858000)
     slide = prs.slides.add_slide(prs.slide_layouts[0])
@@ -606,6 +619,13 @@ def _margin_deck(*, eyebrow_top, body_top):
     for i in range(3):
         tb(0.6 + i * 4.1, body_top, 3.8, 1.9, f"Card {i + 1}", 12)
     tb(0.6, body_top + 2.1, 10.0, 0.8, "Bullets", 12)
+    if stub:
+        slide.shapes.add_textbox(Emu(1588), Emu(1588), Emu(1588), Emu(1588))
+    if header_rule:
+        tb(0.6, 0.30, 3.0, 0.02, "")
+    if edge_stamps:
+        tb(0.0, body_top, 1.0, 0.5, "")
+        tb(12.33, body_top, 1.0, 0.5, "")
     buf = io.BytesIO()
     prs.save(buf)
     return buf.getvalue()
@@ -668,6 +688,496 @@ def test_an_unplaced_header_line_is_swept_rather_than_parked_in_the_body():
     assert [c.removed_text for c in swept] == ["FUTURE WORK"]
     assert "FUTURE WORK" not in [s.text_frame.text for s in slide.shapes
                                  if s.has_text_frame]
+
+
+# ------------------------------------ what may NOT be the block's own edge
+
+
+def test_an_embedded_object_stub_is_not_the_top_of_the_body():
+    """think-cell parks a 0.0017in square at (0.002in, 0.002in) on every slide
+    it has ever touched, and PowerPoint leaves the same stub behind for any
+    embedded OLE object. Letting one be the block's top-left corner seated a
+    whole client deck on it: the real content, already sitting on the master's
+    body line, went 1.90in DOWN and 1.1in to 1.9in off the bottom of every page
+    (real deck, 23/08/2026 - 24 of its 26 slides)."""
+    plain = migrate_deck(_margin_deck(eyebrow_top=0.30, body_top=1.90))[0]
+    stubbed = migrate_deck(_margin_deck(eyebrow_top=0.30, body_top=1.90,
+                                        stub=True))[0]
+
+    assert _tops(stubbed, "Card") == _tops(plain, "Card")
+
+
+def test_a_stub_it_cannot_anchor_still_travels_with_the_block():
+    """Excluded from the MEASUREMENT, not from the move: a shape left behind
+    while its slide moves is a different defect, so the count of what shipped
+    has to match."""
+    source = _margin_deck(eyebrow_top=0.30, body_top=3.30, stub=True)
+    before = Presentation(io.BytesIO(source)).slides[0]
+    out, _changes = migrate_deck(source)
+    after = Presentation(io.BytesIO(out)).slides[0]
+
+    def stubs(slide):
+        return [s for s in slide.shapes
+                if s.width and s.height and s.width < 45720 and s.height < 45720]
+
+    assert len(stubs(after)) == len(stubs(before)) == 1
+    card_delta = (_tops(out, "Card")[0] - _tops(source, "Card")[0])
+    assert stubs(after)[0].top - stubs(before)[0].top == card_delta
+
+
+def test_a_hairline_in_the_header_band_is_not_the_top_of_the_body():
+    """A rule or corner mark drawn above the line where content begins carries
+    no text, so the remnant sweep leaves it alone - correctly, it is not
+    unplaced text - and it is thin on ONE axis only, so it is not degenerate
+    either. It still may not be the body's top edge: on the client deck a 0.02in
+    bar sitting at 0.37in pushed the real content 1.53in down and off the
+    page."""
+    plain = migrate_deck(_margin_deck(eyebrow_top=0.30, body_top=1.90))[0]
+    ruled = migrate_deck(_margin_deck(eyebrow_top=0.30, body_top=1.90,
+                                      header_rule=True))[0]
+
+    assert _tops(ruled, "Card") == _tops(plain, "Card")
+
+
+def test_the_whole_body_still_comes_down_when_it_all_sits_above_the_line():
+    """The exclusion above is conditional for a reason: a slide whose entire
+    body sits in the reserved strip has to be brought DOWN onto the line, and
+    dropping every anchor there would leave exactly those slides untouched."""
+    source = _margin_deck(eyebrow_top=0.30, body_top=0.90)
+    out, _changes = migrate_deck(source)
+
+    assert _tops(out, "Card")[0] > _tops(source, "Card")[0]
+
+
+def _stated_deck(shapes, *, title="The Heading", subtitle=None,
+                 title_in_placeholder=False):
+    """A slide on a GUIDED master, so the frame is one the master states and the
+    body-top line binds. `shapes` are (x, y, w, h, text) in inches.
+
+    `subtitle` fills the master's subtitle placeholder up front. That is not a
+    detail: a placeholder this pass finds EMPTY is filled from the header band,
+    so leftover header text is only ever swept on a slide whose placeholders
+    arrived full - which is the case on the client's decks and the one worth
+    testing."""
+    from tests.test_arabic_layout import _plant_guides
+
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Emu(12192000), Emu(6858000)
+    _plant_guides(prs.slide_masters[0])
+    slide = prs.slides.add_slide(prs.slide_layouts[0])
+    for ph in slide.placeholders:
+        ph.text_frame.clear()
+        kind = str(ph.placeholder_format.type)
+        box = _TITLE_BOX if kind.startswith(("TITLE", "CENTER_TITLE")) else (
+            _SUBTITLE_BOX if kind.startswith("SUBTITLE") else None)
+        if box:
+            ph.left, ph.top, ph.width, ph.height = (
+                Emu(int(v * IN)) for v in box)
+        if subtitle and kind.startswith("SUBTITLE"):
+            ph.text_frame.text = subtitle
+        if title_in_placeholder and kind.startswith(("TITLE", "CENTER_TITLE")):
+            ph.text_frame.text = title
+    if not title_in_placeholder:
+        shape = slide.shapes.add_textbox(Emu(int(0.6 * IN)), Emu(int(0.55 * IN)),
+                                         Emu(int(9 * IN)), Emu(int(0.6 * IN)))
+        shape.text_frame.paragraphs[0].add_run().text = title
+    for x, y, w, h, text in shapes:
+        box = slide.shapes.add_textbox(Emu(int(x * IN)), Emu(int(y * IN)),
+                                       Emu(int(w * IN)), Emu(int(h * IN)))
+        run = box.text_frame.paragraphs[0].add_run()
+        run.text = text
+        run.font.size = Pt(12)
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+def _top_of(deck_bytes, text):
+    slide = Presentation(io.BytesIO(deck_bytes)).slides[0]
+    return next(s.top for s in slide.shapes
+                if s.has_text_frame and s.text_frame.text == text)
+
+
+def _shape_with(deck_bytes, text):
+    slide = Presentation(io.BytesIO(deck_bytes)).slides[0]
+    return next(s for s in slide.shapes
+                if s.has_text_frame and s.text_frame.text == text)
+
+
+def _left_margin(deck_bytes):
+    """The frame's left edge as the DECK states it. Never a literal: PowerPoint
+    stores guides in eighths of a point, so a guide a designer set at 0.60in
+    reads back as 547688 EMU, and an inch-based expectation misses by 952."""
+    from qc.stylespec import dominant_master, infer_grid
+
+    prs = Presentation(io.BytesIO(deck_bytes))
+    return infer_grid(prs, dominant_master(prs))["margins_emu"]["left"]
+
+
+def test_a_too_tall_block_is_still_seated_on_the_line_and_the_cost_measured():
+    """The frame's top line binds on every slide, including the ones whose
+    content cannot fit under it: a header band quietly broken on the busy slides
+    costs the deck the line that makes its headers read as one, and an overflow
+    that is REPORTED does not (design lead, 23/08/2026, re-confirming 21/08).
+    What the report owes in exchange is the arithmetic."""
+    source = _stated_deck([(0.6, 0.30, 3.0, 3.8, "Contact details"),
+                           (4.5, 0.80, 3.0, 6.4, "A full-page column")])
+    out, changes = migrate_deck(source)
+
+    assert _top_of(out, "Contact details") == 1737360, "seated on the line"
+    misfit = [c for c in changes if c.action == "content does not fit"]
+    assert misfit and misfit[0].severity == "alert"
+    assert "past the slide edge" in misfit[0].detail
+    assert "in tall and" in misfit[0].detail, \
+        "the report has to measure the block, not just characterise it"
+
+
+def test_a_row_of_labels_beside_content_is_not_swept_as_unplaced_text():
+    """A table's column headings end wherever the designer put them, and the
+    header cutoff falls between them and the labels of the same row: on the
+    client's Gantt slide 'team members' and 'months of work' ended at 1.84in and
+    1.59in while the month numbers labelling the same row ended at 2.01in, so
+    the two words were deleted and the numbers kept (23/08/2026)."""
+    # the heading ends inside the header band; its row-mates cross out of it
+    source = _stated_deck([(0.9, 1.47, 1.8, 0.37, "Team members"),
+                           (4.3, 1.35, 0.5, 0.66, "01"),
+                           (5.0, 1.35, 0.5, 0.66, "02"),
+                           (0.9, 2.30, 12.0, 3.0, "The table")],
+                          subtitle="A standfirst")
+    out, changes = migrate_deck(source)
+    texts = [s.text_frame.text for s
+             in Presentation(io.BytesIO(out)).slides[0].shapes
+             if s.has_text_frame]
+
+    assert "Team members" in texts, "a column heading is content, not a remnant"
+    assert not [c for c in changes if c.action == "removed unplaced text"]
+
+
+def test_header_text_with_nothing_beside_it_is_still_swept():
+    """The sparing above is not a licence to keep everything: a stray note
+    alone in the header band has no row to belong to and still goes, with its
+    own XML kept so a designer can put it back."""
+    source = _stated_deck([(0.6, 0.05, 3.1, 0.28, "To be translated"),
+                           (0.9, 2.30, 12.0, 3.0, "The body")],
+                          subtitle="A standfirst")
+    _out, changes = migrate_deck(source)
+
+    swept = [c for c in changes if c.action == "removed unplaced text"]
+    assert [c.removed_text for c in swept] == ["To be translated"]
+    assert swept[0].undo, "and it has to be undoable"
+
+
+def test_a_full_bleed_band_does_not_veto_the_start_margin_for_the_slide():
+    """A 1.28in white footer band running edge to edge under an Arabic cover
+    title left that title sitting in the left half of the page: right-aligned
+    inside a box half the slide wide, which is not what anyone means by right
+    aligned (design lead, 23/08/2026). The band's exemption is its own, not the
+    slide's."""
+    source = _stated_deck([(0.5, 2.00, 6.0, 1.9, "Arabic-style title"),
+                           (0.0, 5.82, 13.33, 1.28, "")])
+    out, changes = migrate_deck(source)
+    slide = Presentation(io.BytesIO(out)).slides[0]
+    band = next(s for s in slide.shapes
+                if s.width and s.width > 12 * IN and not s.is_placeholder)
+
+    # the title is seated on the start margin, the band still bleeds
+    assert _shape_with(out, "Arabic-style title").left == _left_margin(source)
+    assert band.left == 0 and band.width == int(13.33 * IN)
+    moved = [c for c in changes if c.action == "content block moved"]
+    assert moved and "edge to edge" in moved[0].detail
+
+
+def test_what_sits_on_a_bleed_band_stays_on_it():
+    """A logo stamped on a full-width footer band belongs to the band, not to
+    the text three inches above it. Carrying it along took the client's mark
+    from the corner of its cover to the middle of the strip."""
+    source = _stated_deck([(6.0, 2.00, 6.0, 1.9, "The title"),
+                           (0.0, 5.82, 13.33, 1.28, ""),
+                           (0.5, 5.95, 3.4, 1.0, "LOGO")])
+    out, _changes = migrate_deck(source)
+
+    assert _shape_with(out, "LOGO").left == int(0.5 * IN), \
+        "the logo belongs to the band it sits on, not to the text above it"
+    assert _shape_with(out, "The title").left == _left_margin(source), \
+        "and the title is still seated on the margin"
+
+
+def test_a_flat_connector_travels_with_the_block_it_divides():
+    """A perfectly horizontal rule has a height of exactly zero, so it cannot be
+    measured - and it was therefore never moved. A deck of tables came back with
+    every divider stranded where it was while the rows it separates moved
+    beneath it (design lead, 23/08/2026)."""
+    source = _stated_deck([(0.9, 2.30, 6.0, 1.0, "Row one"),
+                           (0.9, 3.60, 6.0, 1.0, "Row two")])
+    prs = Presentation(io.BytesIO(source))
+    slide = prs.slides[0]
+    rule = slide.shapes.add_shape(1, Emu(int(0.9 * IN)), Emu(int(3.5 * IN)),
+                                  Emu(int(6.0 * IN)), Emu(0))
+    rule.name = "Divider"
+    buf = io.BytesIO()
+    prs.save(buf)
+    source = buf.getvalue()
+
+    out, changes = migrate_deck(source)
+
+    def rule_top(deck_bytes):
+        sl = Presentation(io.BytesIO(deck_bytes)).slides[0]
+        return next(s.top for s in sl.shapes if s.name == "Divider")
+
+    moved = _top_of(out, "Row one") - _top_of(source, "Row one")
+    assert moved != 0, "the fixture must have moved the block"
+    assert rule_top(out) - rule_top(source) == moved, \
+        "the divider has to travel with the rows it divides"
+    note = [c for c in changes if c.action == "content block moved"]
+    assert note and note[0].detail.startswith("3 shape(s)"), \
+        "and it has to be counted among what shifted"
+
+
+def test_a_graphic_is_reported_over_a_placeholder_rather_than_nudged_alone():
+    """Nudging graphics broke the arrangement it was meant to protect: a 0.02in
+    decorative bar was pushed 1.53in into the body on three slides, and two
+    full-width table rules were pushed 0.63in and 0.40in - different distances,
+    so they collapsed onto each other (design lead, 23/08/2026)."""
+    source = _stated_deck([(11.6, 0.37, 1.7, 0.02, ""),
+                           (0.9, 2.30, 12.0, 3.0, "The body")])
+    out, changes = migrate_deck(source)
+    slide = Presentation(io.BytesIO(out)).slides[0]
+    bar = next(s for s in slide.shapes
+               if s.width and abs(s.width - int(1.7 * IN)) < 1000)
+
+    assert not [c for c in changes
+                if c.action == "nudged clear of a placeholder"]
+    body_move = _top_of(out, "The body") - _top_of(source, "The body")
+    assert bar.top - int(0.37 * IN) == body_move, \
+        "the bar should have moved with the block and no further"
+
+
+def test_only_recurring_furniture_is_left_behind_in_the_bottom_strip():
+    """The strip alone parked 25 shapes on the client's deck of which none were
+    furniture: a table's last row at 6.61in, axis labels at 6.80in, a legend at
+    7.09in. Each stayed while the composition it belongs to moved. Low on the
+    page AND recurring across the deck is what makes something furniture."""
+    source = _stated_deck([(0.9, 2.30, 6.0, 1.0, "Body"),
+                           (0.9, 6.70, 3.0, 0.3, "Legend")])
+    out, _changes = migrate_deck(source)
+
+    moved = _top_of(out, "Body") - _top_of(source, "Body")
+    assert moved != 0
+    assert _top_of(out, "Legend") - _top_of(source, "Legend") == moved, \
+        "a legend on one slide is content, not page furniture"
+
+
+def test_nothing_is_seated_when_the_only_content_is_in_the_bottom_strip():
+    """The strip travels but never anchors. A slide whose only free content is
+    one footer bar at 7.17in had that bar seated on the body line, hoisting it
+    5.27in to the top of an otherwise empty page."""
+    source = _stated_deck([(0.4, 7.17, 12.7, 0.34, "A closing note")])
+    out, changes = migrate_deck(source)
+
+    assert _top_of(out, "A closing note") == _top_of(source, "A closing note")
+    assert not [c for c in changes if c.action == "content block moved"]
+
+
+def test_a_stray_is_swept_even_when_this_pass_placed_nothing():
+    """Whether this pass filled a placeholder is not the question. Gating the
+    sweep on it kept every stray on a slide PowerPoint had already matched, and
+    the strays then travelled INTO the body with the block - a working note
+    reading "To be translated" ended up inside the content area instead of out
+    of the deck (design lead, 23/08/2026: remove it, flag it, let me put it
+    back)."""
+    # both header placeholders arrive full, exactly as PowerPoint's matching
+    # leaves them, so this pass places nothing of its own
+    source = _stated_deck([(0.6, 0.05, 3.1, 0.28, "To be translated"),
+                           (0.9, 2.30, 12.0, 3.0, "The body")],
+                          subtitle="A standfirst", title_in_placeholder=True)
+    out, changes = migrate_deck(source)
+    texts = [s.text_frame.text for s
+             in Presentation(io.BytesIO(out)).slides[0].shapes
+             if s.has_text_frame]
+
+    assert "To be translated" not in texts, "a stray must leave the deck"
+    swept = [c for c in changes if c.action == "removed unplaced text"]
+    assert [c.removed_text for c in swept] == ["To be translated"]
+    assert swept[0].severity == "alert", "and it has to be flagged"
+    assert swept[0].undo, "and be undoable"
+    assert "where the body begins" in swept[0].detail, \
+        "the flag should say what test it failed"
+
+
+def test_a_stray_is_removed_rather_than_carried_into_the_body():
+    """The specific thing that was wrong: not that it survived, but WHERE it
+    survived. Travelling with the block put it inside the content area."""
+    source = _stated_deck([(0.6, 0.05, 3.1, 0.28, "To be translated"),
+                           (0.9, 3.30, 12.0, 2.0, "The body")],
+                          subtitle="A standfirst", title_in_placeholder=True)
+    out, _changes = migrate_deck(source)
+    slide = Presentation(io.BytesIO(out)).slides[0]
+
+    assert not [s for s in slide.shapes if s.has_text_frame
+                and s.text_frame.text == "To be translated"]
+    # the body still moved, so the sweep is not just "nothing happened"
+    assert _top_of(out, "The body") != _top_of(source, "The body")
+
+
+def _two_slide_deck(per_slide, *, subtitle="A standfirst"):
+    """One guided master, two slides, each given (x, y, w, h, text) shapes."""
+    from tests.test_arabic_layout import _plant_guides
+
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Emu(12192000), Emu(6858000)
+    _plant_guides(prs.slide_masters[0])
+    for shapes in per_slide:
+        slide = prs.slides.add_slide(prs.slide_layouts[0])
+        for ph in slide.placeholders:
+            ph.text_frame.clear()
+            kind = str(ph.placeholder_format.type)
+            box = _TITLE_BOX if kind.startswith(("TITLE", "CENTER_TITLE")) else (
+                _SUBTITLE_BOX if kind.startswith("SUBTITLE") else None)
+            if box:
+                ph.left, ph.top, ph.width, ph.height = (
+                    Emu(int(v * IN)) for v in box)
+            if kind.startswith(("TITLE", "CENTER_TITLE")):
+                ph.text_frame.text = "The Heading"
+            elif subtitle and kind.startswith("SUBTITLE"):
+                ph.text_frame.text = subtitle
+        for x, y, w, h, text in shapes:
+            b = slide.shapes.add_textbox(Emu(int(x * IN)), Emu(int(y * IN)),
+                                         Emu(int(w * IN)), Emu(int(h * IN)))
+            run = b.text_frame.paragraphs[0].add_run()
+            run.text = text
+            run.font.size = Pt(12)
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+def _texts(deck_bytes, idx):
+    slide = Presentation(io.BytesIO(deck_bytes)).slides[idx]
+    return [s.text_frame.text for s in slide.shapes if s.has_text_frame]
+
+
+def test_a_stray_is_judged_over_the_whole_deck_not_one_slide():
+    """"To be translated" sat alone at the top of most slides and, on the ones
+    where it happened to share a band with a numbered badge, looked exactly like
+    a row member. Judged per slide it came off five slides and stayed on seven,
+    which is the worst of both outcomes (design lead, 23/08/2026)."""
+    source = _two_slide_deck([
+        # slide 1: the note is alone up there
+        [(0.6, 0.05, 3.1, 0.28, "To be translated"),
+         (0.9, 2.30, 12.0, 3.0, "Body one")],
+        # slide 2: it happens to sit level with a badge, so per-slide it looks
+        # like one of a row
+        [(4.6, 0.05, 3.1, 0.28, "To be translated"),
+         (0.5, 0.07, 0.4, 0.27, "01"),
+         (0.9, 0.07, 6.6, 0.29, "A card heading"),
+         (0.9, 2.30, 12.0, 3.0, "Body two")],
+    ])
+    out, changes = migrate_deck(source)
+
+    assert "To be translated" not in _texts(out, 0)
+    assert "To be translated" not in _texts(out, 1), \
+        "it is the same note on both slides"
+    # and the badge and its heading, which really are a row, are untouched
+    assert "01" in _texts(out, 1) and "A card heading" in _texts(out, 1)
+    swept = {c.removed_text for c in changes if c.removed_text}
+    assert swept == {"To be translated"}
+
+
+def test_a_row_wholly_above_the_body_line_is_kept():
+    """A Gantt's eighteen month numbers all ended at 1.27in against a body
+    beginning at 1.90in, so asking each whether it lines up with the BODY
+    answered no eighteen times and the sweep took the lot. They line up with
+    each other, which is what a row is."""
+    labels = [(7.0 + i * 0.34, 0.96, 0.33, 0.31, f"{i + 1:02d}")
+              for i in range(8)]
+    source = _stated_deck(labels + [(0.9, 2.30, 12.0, 3.0, "The table")],
+                          subtitle="A standfirst", title_in_placeholder=True)
+    out, changes = migrate_deck(source)
+    kept = _texts(out, 0)
+
+    for i in range(8):
+        assert f"{i + 1:02d}" in kept, f"month label {i + 1:02d} was deleted"
+    assert not [c for c in changes if c.action == "removed unplaced text"]
+
+
+def test_a_stray_cannot_vouch_for_another_stray():
+    """Two working notes stamped side by side each make the other look like a
+    row. Once either is known to be a stray from somewhere else in the deck, it
+    stops vouching and the second is unmasked - which is why the set is iterated
+    rather than computed in one pass (design lead, 23/08/2026: three "not
+    comprehensive" notes survived on the client's deck until it was)."""
+    source = _two_slide_deck([
+        # slide 1 identifies the first note: nothing beside it
+        [(0.6, 0.05, 3.1, 0.28, "To be translated"),
+         (0.9, 2.30, 12.0, 3.0, "Body one")],
+        # slide 2 has both, side by side, vouching for each other
+        [(0.6, 0.05, 3.1, 0.28, "To be translated"),
+         (4.0, 0.08, 2.0, 0.26, "Not comprehensive"),
+         (0.9, 2.30, 12.0, 3.0, "Body two")],
+    ])
+    out, _changes = migrate_deck(source)
+
+    assert "To be translated" not in _texts(out, 1)
+    assert "Not comprehensive" not in _texts(out, 1), \
+        "with its voucher gone, the second note is a stray too"
+
+
+def test_a_collision_that_predates_the_pass_is_reported_not_nudged():
+    """This function's own words are that it clears collisions the pass CAUSES.
+    A shape already standing in the header band arrived that way, and clearing
+    it moves one member of a row on its own - a Gantt's month labels were pushed
+    0.93in clear of the table they label (design lead, 23/08/2026)."""
+    # the labels start inside the title placeholder's band (0.42-1.34)
+    labels = [(7.0 + i * 0.34, 0.96, 0.33, 0.31, f"{i + 1:02d}")
+              for i in range(6)]
+    source = _stated_deck(labels + [(0.9, 2.30, 12.0, 3.0, "The table")],
+                          subtitle="A standfirst", title_in_placeholder=True)
+    out, changes = migrate_deck(source)
+
+    assert not [c for c in changes
+                if c.action == "nudged clear of a placeholder"]
+    reported = [c for c in changes if c.action == "overlap needs a designer"]
+    assert reported and "before this pass moved anything" in reported[0].detail
+    # every label moved by the same amount as the table, so the row holds
+    moves = {_top_of(out, f"{i + 1:02d}") - _top_of(source, f"{i + 1:02d}")
+             for i in range(6)}
+    assert len(moves) == 1
+    assert moves == {_top_of(out, "The table") - _top_of(source, "The table")}
+
+
+def test_a_displaced_rival_is_still_swept():
+    """The gate above is not a licence to keep everything: where this pass DID
+    fill a placeholder from the header band, the text it beat still has nowhere
+    to go and still goes, with its XML kept."""
+    # the title placeholder is empty, so this pass fills it from the band and
+    # LEFTOVER is the text it beat
+    source = _stated_deck([(0.6, 1.45, 3.0, 0.28, "LEFTOVER"),
+                           (0.9, 2.30, 12.0, 3.0, "The body")],
+                          subtitle="A standfirst")
+    _out, changes = migrate_deck(source)
+
+    swept = [c for c in changes if c.action == "removed unplaced text"]
+    assert [c.removed_text for c in swept] == ["LEFTOVER"]
+    assert swept[0].undo, "and it stays undoable"
+
+
+def test_a_block_that_merely_spans_the_page_is_still_seated_on_the_margin():
+    """The full-bleed exemption is about a SHAPE running edge to edge, not about
+    a bounding box that happens to. Testing the union let a mark near each side
+    edge exempt every other shape on the slide from the start margin."""
+    def block_left(deck_bytes):
+        slide = Presentation(io.BytesIO(deck_bytes)).slides[0]
+        return min(s.left for s in slide.shapes
+                   if not s.is_placeholder and s.left is not None)
+
+    stamped = _margin_deck(eyebrow_top=0.30, body_top=3.30, edge_stamps=True)
+    out, _changes = migrate_deck(stamped)
+    seated = migrate_deck(_margin_deck(eyebrow_top=0.30, body_top=3.30))[0]
+
+    assert block_left(out) != block_left(stamped), \
+        "the block was left where it was instead of seated on the margin"
+    assert block_left(out) == block_left(seated), \
+        "it was seated somewhere other than the margin the plain block gets"
 
 
 # ------------------------------------------- largest is title, second is sub

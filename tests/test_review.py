@@ -1,0 +1,577 @@
+"""The review page for a format run, and taking one change back.
+
+Two things are being protected here and they are different. The PAGE must work
+on any machine: rendering needs desktop PowerPoint or LibreOffice, neither is
+guaranteed, and a designer who cannot see the pictures must still be able to
+read the change list and press Undo. The UNDO must be exact: it replays the
+state qc.migrate stored, so a shape comes back at the coordinates it held, not
+near them.
+"""
+
+import io
+
+from fastapi.testclient import TestClient
+from pptx import Presentation
+from pptx.util import Emu, Pt
+
+from qc import web
+from qc.migrate import ContentChange, migrate_deck
+from qc.render import layout_catalogue
+from qc.undo import apply_undo, expand
+
+IN = 914400
+_TITLE_BOX = (0.48, 0.42, 12.40, 0.92)
+_SUBTITLE_BOX = (0.48, 1.40, 12.40, 0.35)
+
+
+def _bytes(prs) -> bytes:
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+def _client(monkeypatch):
+    monkeypatch.setattr(web, "AUTH_REQUIRED", False)
+    web.app.state.auth_required = False
+    return TestClient(web.app)
+
+
+def _deck() -> bytes:
+    """A slide shaped like the decks this pass exists for: a header band the
+    master owns, an eyebrow with no slot to go to, and a content block sitting
+    below where the master says the body begins."""
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Emu(12192000), Emu(6858000)
+    slide = prs.slides.add_slide(prs.slide_layouts[0])
+    for ph in slide.placeholders:
+        ph.text_frame.clear()
+        kind = str(ph.placeholder_format.type)
+        box = _TITLE_BOX if kind.startswith(("TITLE", "CENTER_TITLE")) else (
+            _SUBTITLE_BOX if kind.startswith("SUBTITLE") else None)
+        if box:
+            ph.left, ph.top, ph.width, ph.height = (
+                Emu(int(v * IN)) for v in box)
+
+    def tb(x, y, w, h, text, size):
+        shape = slide.shapes.add_textbox(Emu(int(x * IN)), Emu(int(y * IN)),
+                                         Emu(int(w * IN)), Emu(int(h * IN)))
+        run = shape.text_frame.paragraphs[0].add_run()
+        run.text = text
+        run.font.size = Pt(size)
+
+    tb(0.6, 0.30, 3.0, 0.28, "FUTURE WORK", 11)
+    tb(0.6, 0.55, 9.0, 0.60, "Next: Personalized Daily Digests", 28)
+    tb(0.6, 1.25, 10.0, 0.40, "A second LLM integration.", 13)
+    for i in range(3):
+        tb(0.6 + i * 4.1, 3.30, 3.8, 1.9, f"Card {i + 1}", 12)
+    return _bytes(prs)
+
+
+def _offsets(deck_bytes):
+    """{text: (left, top)} for every shape carrying text, placeholders too."""
+    slide = Presentation(io.BytesIO(deck_bytes)).slides[0]
+    out = {}
+    for s in slide.shapes:
+        if s.has_text_frame and s.text_frame.text.strip():
+            out[s.text_frame.text.strip()] = (s.left, s.top)
+    return out
+
+
+def _job(monkeypatch, job_id="reviewjob"):
+    """A finished format job over _deck(), with the source kept as the page
+    keeps it."""
+    source = _deck()
+    deck, changes = migrate_deck(source)
+    web._format_jobs[job_id] = {
+        "deck": deck, "source": source, "filename": "d.pptx",
+        "profile": "prezlab_en", "plans": [], "errors": {}, "applied": 1,
+        "changes": changes, "restored": [], "undone": [], "undo_notes": {},
+    }
+    return job_id, source, changes
+
+
+# ------------------------------------------------------------- the undo itself
+
+
+def test_undoing_the_block_move_puts_every_shape_back_exactly():
+    """The whole point of storing state rather than a delta: the shapes land on
+    the coordinates they held, to the EMU, not near them."""
+    source = _deck()
+    deck, changes = migrate_deck(source)
+    move = next(c for c in changes if c.action == "content block moved")
+    assert move.undo, "the move must carry the coordinates it moved from"
+
+    before = _offsets(source)
+    after = _offsets(deck)
+    assert after["Card 1"] != before["Card 1"], "the fixture must have moved"
+
+    undone, outcomes = apply_undo(deck, [{"change_id": move.change_id,
+                                          "slide_index": move.slide_index,
+                                          "ops": move.undo}])
+    assert outcomes[0]["done"]
+    back = _offsets(undone)
+    for card in ("Card 1", "Card 2", "Card 3"):
+        assert back[card] == before[card]
+
+
+def test_undoing_a_removal_brings_the_text_back():
+    source = _deck()
+    deck, changes = migrate_deck(source)
+    swept = next(c for c in changes if c.action == "removed unplaced text")
+    assert "FUTURE WORK" not in _offsets(deck)
+
+    undone, outcomes = apply_undo(deck, [{"change_id": swept.change_id,
+                                          "slide_index": swept.slide_index,
+                                          "ops": swept.undo}])
+    assert outcomes[0]["done"]
+    assert "FUTURE WORK" in _offsets(undone)
+    assert _offsets(undone)["FUTURE WORK"] == _offsets(source)["FUTURE WORK"]
+
+
+def test_undoing_a_placeholder_fill_empties_it_and_returns_the_source():
+    """Both halves or neither: undoing the fill without returning the shape
+    loses the wording, and returning the shape without emptying the
+    placeholder prints it twice."""
+    source = _deck()
+    deck, changes = migrate_deck(source)
+    fill = next(c for c in changes if c.action == "title into placeholder")
+    heading = "Next: Personalized Daily Digests"
+
+    slide = Presentation(io.BytesIO(deck)).slides[0]
+    assert any(s.is_placeholder and s.text_frame.text.strip() == heading
+               for s in slide.shapes)
+
+    undone, outcomes = apply_undo(deck, [{"change_id": fill.change_id,
+                                          "slide_index": fill.slide_index,
+                                          "ops": fill.undo}])
+    assert outcomes[0]["done"]
+    slide = Presentation(io.BytesIO(undone)).slides[0]
+    holders = [s for s in slide.shapes
+               if s.has_text_frame and s.text_frame.text.strip() == heading]
+    assert len(holders) == 1, "the heading must exist exactly once"
+    assert not holders[0].is_placeholder, "it belongs back in its own box"
+
+
+def test_undoing_a_removal_also_takes_back_the_move_it_enabled():
+    """The pass swept a shape and THEN seated the block, so the block's position
+    is a consequence of the sweep. Putting the shape back on its own returned it
+    to its original coordinates while everything else stayed where the sweep let
+    it go, and the returned text landed on top of the content instead of beside
+    it (design lead, 23/08/2026, "the kept text should also go back to its place
+    instead of overlapping them")."""
+    source = _deck()
+    deck, changes = migrate_deck(source)
+    swept = next(c for c in changes if c.action == "removed unplaced text")
+    move = next(c for c in changes if c.action == "content block moved")
+
+    pulled = expand(changes, [swept.change_id])
+    assert move.change_id in [c.change_id for c in pulled], \
+        "the move has to come back with the removal that preceded it"
+
+    items = [{"change_id": c.change_id, "slide_index": c.slide_index,
+              "ops": c.undo} for c in pulled]
+    undone, _outcomes = apply_undo(deck, items)
+
+    before, after = _offsets(source), _offsets(undone)
+    for text in ("FUTURE WORK", "Card 1", "Card 2", "Card 3"):
+        assert after[text] == before[text], f"{text} is not back where it was"
+
+
+def test_undoing_a_later_change_leaves_the_earlier_ones_alone():
+    """Peeling back from the end, not resetting the slide: undoing the LAST
+    change must not undo the sweep that ran before it."""
+    source = _deck()
+    _deck_out, changes = migrate_deck(source)
+    move = next(c for c in changes if c.action == "content block moved")
+
+    pulled = [c.action for c in expand(changes, [move.change_id])]
+    assert "removed unplaced text" not in pulled
+    assert pulled == ["content block moved"]
+
+
+def test_a_change_on_another_slide_is_never_dragged_in():
+    """Slides are independent: what happened on one says nothing about the
+    other, and taking a whole deck back is what the original upload is for."""
+    changes = [
+        ContentChange(0, "removed unplaced text", "x", change_id="c0",
+                      undo=[{"op": "insert", "xml": "<x/>"}]),
+        ContentChange(1, "content block moved", "y", change_id="c1",
+                      undo=[{"op": "offset", "shape_id": "1",
+                             "left": 0, "top": 0}]),
+        ContentChange(0, "content block moved", "z", change_id="c2",
+                      undo=[{"op": "offset", "shape_id": "2",
+                             "left": 0, "top": 0}]),
+    ]
+    assert [c.change_id for c in expand(changes, ["c0"])] == ["c0", "c2"]
+
+
+def test_a_report_only_change_is_not_dragged_in_and_does_not_block():
+    """A row with nothing to undo is skipped rather than counted: it would
+    otherwise show up as a change that came back without changing anything."""
+    changes = [
+        ContentChange(0, "removed unplaced text", "x", change_id="c0",
+                      undo=[{"op": "insert", "xml": "<x/>"}]),
+        ContentChange(0, "content does not fit", "y", change_id="c1"),
+        ContentChange(0, "content block moved", "z", change_id="c2",
+                      undo=[{"op": "offset", "shape_id": "2",
+                             "left": 0, "top": 0}]),
+    ]
+    assert [c.change_id for c in expand(changes, ["c0"])] == ["c0", "c2"]
+
+
+def test_overlapping_changes_are_undone_last_first():
+    """The block move and the collision nudge both touch the same shape, the
+    nudge running on the position the move left it in. Replaying them front to
+    back puts the shape back and then straight forward again, so the undo
+    silently does nothing (real deck, 23/08/2026: 5 of 721 shapes)."""
+    shape_id = "77"
+    ops_move = [{"op": "offset", "shape_id": shape_id, "left": 0, "top": 0}]
+    ops_nudge = [{"op": "offset", "shape_id": shape_id,
+                  "left": 0, "top": 2 * IN}]
+
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Emu(12192000), Emu(6858000)
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    box = slide.shapes.add_textbox(Emu(0), Emu(4 * IN), Emu(IN), Emu(IN))
+    box._element.find(
+        "{http://schemas.openxmlformats.org/presentationml/2006/main}nvSpPr"
+    ).find(
+        "{http://schemas.openxmlformats.org/presentationml/2006/main}cNvPr"
+    ).set("id", shape_id)
+
+    out, outcomes = apply_undo(_bytes(prs), [
+        {"change_id": "move", "slide_index": 0, "ops": ops_move},
+        {"change_id": "nudge", "slide_index": 0, "ops": ops_nudge},
+    ])
+    assert [o["change_id"] for o in outcomes] == ["move", "nudge"], \
+        "outcomes must come back in the caller's order"
+    landed = Presentation(io.BytesIO(out)).slides[0].shapes[0].top
+    assert landed == 0, "the earliest change must be the last one replayed"
+
+
+def test_an_undo_that_finds_nothing_says_so_rather_than_claiming_success():
+    deck = _deck()
+    _out, outcomes = apply_undo(deck, [{"change_id": "c0", "slide_index": 0,
+                                        "ops": [{"op": "offset",
+                                                 "shape_id": "99999",
+                                                 "left": 0, "top": 0}]}])
+    assert outcomes[0]["done"] is False
+    assert "no longer" in outcomes[0]["detail"]
+
+
+def test_an_undo_for_a_slide_the_deck_no_longer_has_is_reported():
+    _out, outcomes = apply_undo(_deck(), [{"change_id": "c0",
+                                           "slide_index": 40, "ops": []}])
+    assert outcomes[0]["done"] is False
+
+
+def test_the_deck_still_opens_after_an_undo():
+    """Every operation writes into a shape tree whose child order the schema
+    fixes; getting it wrong is a repair prompt, not an exception."""
+    source = _deck()
+    deck, changes = migrate_deck(source)
+    items = [{"change_id": c.change_id, "slide_index": c.slide_index,
+              "ops": c.undo} for c in changes if c.undo]
+    out, _outcomes = apply_undo(deck, items)
+    slide = Presentation(io.BytesIO(out)).slides[0]
+    ids = [s.shape_id for s in slide.shapes]
+    assert len(ids) == len(set(ids)), "duplicate shape ids read as a damaged file"
+
+
+# -------------------------------------------------------------- the layouts
+
+
+def test_the_layout_catalogue_is_one_blank_slide_per_layout():
+    """How a layout gets photographed at all: PowerPoint exports slides, so
+    each layout needs an empty slide of its own to be seen on."""
+    prs = Presentation()
+    catalogue, entries, skipped = layout_catalogue(_bytes(prs))
+    assert skipped == 0
+    built = Presentation(io.BytesIO(catalogue))
+    assert len(built.slides) == len(entries) == len(prs.slide_layouts)
+    assert [s.slide_layout.name for s in built.slides] == \
+        [e["layout"] for e in entries]
+    # and none of the original deck's own slides are left to confuse the view
+    with_slides = Presentation()
+    with_slides.slides.add_slide(with_slides.slide_layouts[0])
+    catalogue, entries, _ = layout_catalogue(_bytes(with_slides))
+    assert len(Presentation(io.BytesIO(catalogue)).slides) == len(entries)
+
+
+# ------------------------------------------------------------------ the page
+
+
+# --------------------------------------------- surviving a dead renderer
+
+
+def test_a_render_failure_does_not_lose_the_layout_list(monkeypatch):
+    """Which layouts a deck arrived with and which it has now is read out of the
+    file by python-pptx and needs no PowerPoint. Letting an export failure take
+    the whole answer down made the page say "No layouts to show" about a master
+    carrying twelve of them (design lead, 23/08/2026)."""
+    from qc import render
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("Presentations.Open : Failed.")
+
+    monkeypatch.setattr(render, "export_decks_png", boom)
+    out = render.layout_previews(_deck(), _deck())
+
+    assert out["before"] and out["after"], "the entries must survive"
+    assert out["images"] == {}
+    assert "Failed" in out["error"]
+
+
+def test_a_render_failure_does_not_lose_the_slide_list(monkeypatch):
+    from qc import render
+
+    monkeypatch.setattr(render, "export_decks_png",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no")))
+    out = render.slide_previews(_deck(), _deck(), [0])
+
+    assert out["indices"] == [0]
+    assert out["images"] == {}
+    assert out["error"]
+
+
+def test_every_picture_the_page_asks_for_is_actually_served(monkeypatch):
+    """The deck view caches per page ("review_deck_0"), and a route that looked
+    for the bucket by its literal name found nothing: the page rendered eighteen
+    pictures and served none of them."""
+    import re
+
+    from qc import render
+
+    fake = b"\x89PNG\r\n\x1a\nfake"
+    monkeypatch.setattr(render, "export_decks_png",
+                        lambda decks, idx, width=None: {
+                            f"{name}:{i}": fake for name in decks for i in idx})
+    client = _client(monkeypatch)
+    job_id, _source, _changes = _job(monkeypatch)
+    try:
+        for view in ("master", "deck"):
+            page = client.get(f"/format/{job_id}/review?view={view}")
+            asked = re.findall(rf"/review-img/{job_id}/([A-Za-z0-9_]+)\.png",
+                               page.text)
+            assert asked, f"the {view} view should ask for pictures"
+            for key in asked:
+                got = client.get(f"/review-img/{job_id}/{key}.png")
+                assert got.status_code == 200, f"{view}: {key} was not served"
+                assert got.content == fake
+    finally:
+        web._format_jobs.pop(job_id, None)
+
+
+def test_the_master_view_lists_layouts_with_no_renderer(monkeypatch):
+    monkeypatch.setattr("qc.render.RENDERER", "none")
+    client = _client(monkeypatch)
+    job_id, _source, _changes = _job(monkeypatch)
+    try:
+        r = client.get(f"/format/{job_id}/review?view=master")
+        assert "No layouts to show" not in r.text
+        assert "Title Slide" in r.text, "the layout names come from the file"
+        assert "read from the deck itself" in r.text
+    finally:
+        web._format_jobs.pop(job_id, None)
+
+
+# ------------------------------------------- not leaking a PowerPoint
+
+
+def test_a_wedged_instance_is_terminated_rather_than_left_behind(monkeypatch):
+    """Quit cannot close an instance sitting on a repair prompt or halfway
+    through a failed Open. The call returns, the exception is swallowed, and a
+    windowless POWERPNT.EXE survives; every later attempt on the host then fails
+    against it and leaks another (three in one afternoon, 23/08/2026)."""
+    from qc import unify
+
+    killed = []
+    monkeypatch.setattr(unify, "automation_pids", lambda: {1, 2, 99})
+    monkeypatch.setattr(unify, "_terminate", lambda pid, ms: killed.append(pid))
+    monkeypatch.setattr(unify.os, "name", "nt")
+
+    class Wedged:
+        def Quit(self):
+            raise OSError("wedged")
+
+    unify.force_quit(Wedged(), started={1, 2})
+    assert killed == [99], "only the instance that appeared since is ours to end"
+
+
+def test_a_powerpoint_the_designer_opened_is_never_touched(monkeypatch):
+    """The snapshot is what makes the kill safe. Anything already running when
+    the run started is somebody else's, and it may hold unsaved work."""
+    from qc import unify
+
+    killed = []
+    monkeypatch.setattr(unify, "automation_pids", lambda: {7})
+    monkeypatch.setattr(unify, "_terminate", lambda pid, ms: killed.append(pid))
+    monkeypatch.setattr(unify.os, "name", "nt")
+
+    unify.force_quit(type("A", (), {"Quit": lambda self: None})(), started={7})
+    assert killed == []
+
+
+def test_force_quit_without_a_snapshot_only_asks_nicely(monkeypatch):
+    """No snapshot means no way to tell our instance from anyone else's, so it
+    must not guess."""
+    from qc import unify
+
+    killed = []
+    monkeypatch.setattr(unify, "automation_pids", lambda: {1, 2, 3})
+    monkeypatch.setattr(unify, "_terminate", lambda pid, ms: killed.append(pid))
+    quit_called = []
+    unify.force_quit(
+        type("A", (), {"Quit": lambda self: quit_called.append(True)})())
+
+    assert quit_called == [True]
+    assert killed == []
+
+
+def test_the_review_page_works_without_a_renderer(monkeypatch):
+    """Rendering needs PowerPoint or LibreOffice on the host. The change list
+    and the Undo buttons must not."""
+    monkeypatch.setattr("qc.render.RENDERER", "none")
+    client = _client(monkeypatch)
+    job_id, _source, _changes = _job(monkeypatch)
+    try:
+        r = client.get(f"/format/{job_id}/review?view=deck")
+        assert r.status_code == 200
+        assert "pictures are missing" in r.text
+        assert "content block moved" in r.text
+        assert 'name="change_ids"' in r.text
+    finally:
+        web._format_jobs.pop(job_id, None)
+
+
+def test_both_views_are_reachable_and_named(monkeypatch):
+    monkeypatch.setattr("qc.render.RENDERER", "none")
+    client = _client(monkeypatch)
+    job_id, _source, _changes = _job(monkeypatch)
+    try:
+        master = client.get(f"/format/{job_id}/review?view=master")
+        deck = client.get(f"/format/{job_id}/review?view=deck")
+        assert "Layouts the deck arrived with" in master.text
+        assert "Layouts the deck has now" in master.text
+        assert "Slide 1" in deck.text
+    finally:
+        web._format_jobs.pop(job_id, None)
+
+
+def test_a_report_only_row_offers_no_undo_and_says_why(monkeypatch):
+    monkeypatch.setattr("qc.render.RENDERER", "none")
+    client = _client(monkeypatch)
+    job_id = "reportonly"
+    web._format_jobs[job_id] = {
+        "deck": _deck(), "source": _deck(), "filename": "d.pptx",
+        "profile": "prezlab_en", "plans": [], "errors": {}, "applied": 1,
+        "changes": [ContentChange(0, "heading past the margin", "runs wide",
+                                  severity="alert", change_id="c0")],
+        "restored": [], "undone": [], "undo_notes": {},
+    }
+    try:
+        r = client.get(f"/format/{job_id}/review?view=deck")
+        assert "whether a heading may break the margin" in r.text
+        assert 'value="c0"' not in r.text
+    finally:
+        web._format_jobs.pop(job_id, None)
+
+
+def test_undo_from_the_page_changes_the_downloaded_deck(monkeypatch):
+    monkeypatch.setattr("qc.render.RENDERER", "none")
+    client = _client(monkeypatch)
+    job_id, source, changes = _job(monkeypatch)
+    move = next(c for c in changes if c.action == "content block moved")
+    try:
+        r = client.post(f"/format/{job_id}/undo",
+                        data={"change_ids": [move.change_id]})
+        assert r.status_code == 200
+        assert "undone" in r.text
+        out = client.get(f"/format/{job_id}/download").content
+        assert _offsets(out)["Card 1"] == _offsets(source)["Card 1"]
+    finally:
+        web._format_jobs.pop(job_id, None)
+
+
+def test_resubmitting_an_undo_does_not_apply_it_twice(monkeypatch):
+    """A refresh or a back button resends the POST. Replaying an insert would
+    put a second copy of the returned shape on the slide."""
+    monkeypatch.setattr("qc.render.RENDERER", "none")
+    client = _client(monkeypatch)
+    job_id, _source, changes = _job(monkeypatch)
+    swept = next(c for c in changes if c.action == "removed unplaced text")
+    try:
+        client.post(f"/format/{job_id}/undo",
+                    data={"change_ids": [swept.change_id]})
+        client.post(f"/format/{job_id}/undo",
+                    data={"change_ids": [swept.change_id]})
+        slide = Presentation(io.BytesIO(
+            client.get(f"/format/{job_id}/download").content)).slides[0]
+        copies = [s for s in slide.shapes if s.has_text_frame
+                  and s.text_frame.text.strip() == "FUTURE WORK"]
+        assert len(copies) == 1
+    finally:
+        web._format_jobs.pop(job_id, None)
+
+
+def test_undoing_nothing_leaves_the_deck_alone(monkeypatch):
+    monkeypatch.setattr("qc.render.RENDERER", "none")
+    client = _client(monkeypatch)
+    job_id, _source, _changes = _job(monkeypatch)
+    before = web._format_jobs[job_id]["deck"]
+    try:
+        r = client.post(f"/format/{job_id}/undo", data={})
+        assert r.status_code == 200
+        assert web._format_jobs[job_id]["deck"] == before
+    finally:
+        web._format_jobs.pop(job_id, None)
+
+
+def test_the_deck_view_pages_rather_than_stopping(monkeypatch):
+    """A review that ends at slide 20 of a 26-slide deck and says nothing reads
+    as six slides the tool declined to show (design lead, 23/08/2026). The deck
+    always has all of them; only the review is paginated."""
+    monkeypatch.setattr("qc.render.RENDERER", "none")
+    client = _client(monkeypatch)
+    job_id = "pagedjob"
+    changes = [ContentChange(i, "content block moved", f"slide {i+1}",
+                             change_id=f"c{i}",
+                             undo=[{"op": "offset", "shape_id": "1",
+                                    "left": 0, "top": 0}])
+               for i in range(26)]
+    web._format_jobs[job_id] = {
+        "deck": _deck(), "source": _deck(), "filename": "d.pptx",
+        "profile": "prezlab_en", "errors": {}, "applied": 26,
+        "plans": [type("P", (), {"slide_index": i, "source_layout": "a",
+                                 "source_type": None, "target_layout": "b",
+                                 "match_rule": "name", "note": ""})()
+                  for i in range(26)],
+        "changes": changes, "restored": [], "undone": [], "undo_notes": {},
+    }
+    try:
+        first = client.get(f"/format/{job_id}/review?view=deck")
+        assert "Slides 1&ndash;20 of 26 with changes" in first.text
+        assert "page 1 of 2" in first.text
+        assert "Next" in first.text
+        assert "The deck has all 26 slides" in first.text
+
+        second = client.get(f"/format/{job_id}/review?view=deck&page=1")
+        assert "Slides 21&ndash;26 of 26" in second.text
+        assert "Slide 26" in second.text, "the last slide must be reachable"
+    finally:
+        web._format_jobs.pop(job_id, None)
+
+
+def test_review_and_undo_on_an_unknown_job_are_clean_404s(monkeypatch):
+    client = _client(monkeypatch)
+    assert client.get("/format/deadbeef/review").status_code == 404
+    assert client.post("/format/deadbeef/undo", data={}).status_code == 404
+    assert client.get("/review-img/deadbeef/layout_before_0.png").status_code == 404
+
+
+def test_the_result_page_points_at_the_review(monkeypatch):
+    from qc.ui_format import render_format_result
+
+    html = render_format_result(deck_name="d.pptx", profile_name="P",
+                                job_id="j1", plans=[], errors={}, applied=1)
+    assert "/format/j1/review" in html

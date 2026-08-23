@@ -27,6 +27,7 @@ visually different masters "identical".
 import hashlib
 import io
 import os
+import subprocess
 import tempfile
 import zipfile
 from dataclasses import dataclass, field
@@ -41,7 +42,13 @@ REL_THEME = f"{R}/theme"
 
 
 def com_available() -> bool:
-    """Desktop PowerPoint reachable for COM automation on this host."""
+    """Desktop PowerPoint reachable for COM automation on this host.
+
+    A registry check, and deliberately no more: starting PowerPoint to find out
+    would make every page load launch Office. It answers "is PowerPoint
+    installed", NOT "will automation work right now" - a machine can pass this
+    and still refuse the dispatch (see com_failure_advice), which is why the
+    pages that need it also handle the later failure."""
     if os.name != "nt":
         return False
     try:
@@ -51,6 +58,119 @@ def com_available() -> bool:
         return True
     except OSError:
         return False
+
+
+# COM failures restated as something a designer can do. The raw tuple - what
+# the format page used to print, verbatim: "(-2147417856, 'System call
+# failed.', None, None)" - names the HRESULT and nothing else, so the person
+# reading it has no next step (design lead, 23/08/2026).
+_COM_ADVICE = {
+    # 0x80010100 RPC_E_SYS_CALL_FAILED. Seen after a run was interrupted: the
+    # headless instance PowerPoint was driving stays alive, and every later
+    # dispatch fails against it. Not retryable in-process, which is why it is
+    # not in _TRANSIENT_HRESULTS - the leftover has to go first.
+    -2147417856: (
+        "PowerPoint automation is in a bad state on this machine, which "
+        "usually means a leftover instance from a run that was interrupted. It "
+        "was started with /AUTOMATION and has no window, so closing PowerPoint "
+        "normally does not touch it: end POWERPNT.EXE in Task Manager, then try "
+        "again."),
+    # 0x80040154 REGDB_E_CLASSNOTREG
+    -2147221164: (
+        "Windows has no PowerPoint registered for automation. Applying a "
+        "master runs PowerPoint's own placeholder matching, so it needs "
+        "desktop PowerPoint installed on this machine."),
+    # 0x80080005 CO_E_SERVER_EXEC_FAILURE
+    -2146959355: (
+        "PowerPoint would not start. This is usually an update or repair "
+        "prompt waiting to be answered: open PowerPoint by hand once, clear "
+        "whatever it asks for, then try again."),
+}
+
+
+# Every headless PowerPoint, and ONLY the headless ones. COM launches PowerPoint
+# with /AUTOMATION -Embedding; a person opening a deck never does, so filtering on
+# it is what makes a forced teardown safe. Matching the image name alone could
+# kill a designer's open presentation with unsaved work in it, which would be far
+# worse than the leak this exists to stop.
+#
+# PowerPoint's Application object offers no route to its own process id - unlike
+# Word and Excel it has no HWND member ("Member not found", checked 23/08/2026) -
+# so the pid has to come from the OS.
+_PS_AUTOMATION_PIDS = (
+    "Get-CimInstance Win32_Process -Filter \"Name='POWERPNT.EXE'\" | "
+    "Where-Object { $_.CommandLine -like '*/AUTOMATION*' } | "
+    "ForEach-Object { $_.ProcessId }")
+
+
+def automation_pids() -> set:
+    """PIDs of the headless PowerPoint instances running right now."""
+    if os.name != "nt":
+        return set()
+    try:
+        done = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             _PS_AUTOMATION_PIDS],
+            capture_output=True, text=True, timeout=30)
+    except Exception:
+        return set()
+    return {int(line) for line in done.stdout.split() if line.strip().isdigit()}
+
+
+def _terminate(pid: int, grace_ms: int) -> None:
+    """Give the process `grace_ms` to exit on its own, then end it."""
+    import ctypes
+
+    PROCESS_TERMINATE, SYNCHRONIZE, WAIT_OBJECT_0 = 0x0001, 0x00100000, 0
+    handle = ctypes.windll.kernel32.OpenProcess(
+        PROCESS_TERMINATE | SYNCHRONIZE, False, pid)
+    if not handle:
+        return  # already gone, which is the whole point
+    try:
+        if ctypes.windll.kernel32.WaitForSingleObject(
+                handle, grace_ms) != WAIT_OBJECT_0:
+            ctypes.windll.kernel32.TerminateProcess(handle, 1)
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+
+def force_quit(app, started: set | None = None, grace_ms: int = 5000) -> None:
+    """Quit PowerPoint, and make sure it actually went.
+
+    Quit() cannot close an instance that is WEDGED - one sitting on a repair
+    prompt, or halfway through a failed Presentations.Open. The call returns, the
+    exception is swallowed, and a windowless POWERPNT.EXE survives. Every later
+    automation attempt on the host then fails against it with -2147417856 System
+    call failed and leaks another one, so a single bad render makes the machine
+    unusable until somebody finds them in Task Manager (three in one afternoon,
+    23/08/2026, each from a failed render on the review page).
+
+    `started` is automation_pids() taken BEFORE the instance was created; the
+    kill is limited to headless instances that appeared since. Without it this
+    only asks Quit nicely, which is the old behaviour and the reason for the
+    leak - so callers driving PowerPoint should always pass it.
+
+    Quit is asked first and given `grace_ms` to land, because a clean exit
+    flushes PowerPoint's own state; the kill is only for when it does not."""
+    try:
+        app.Quit()
+    except Exception:
+        pass
+    if started is None or os.name != "nt":
+        return
+    for pid in automation_pids() - started:
+        _terminate(pid, grace_ms)
+
+
+def com_failure_advice(exc) -> str:
+    """One sentence a designer can act on, with the raw error kept for a bug
+    report. Unknown HRESULTs fall through to the error itself rather than to a
+    guess: a wrong instruction wastes more time than no instruction."""
+    args = getattr(exc, "args", ())
+    advice = _COM_ADVICE.get(args[0] if args else None)
+    if not advice:
+        return f"PowerPoint automation failed: {exc}"
+    return f"{advice} (The error itself: {exc}.)"
 
 
 # ---------------------------------------------------------------- package IO
@@ -358,6 +478,7 @@ def com_unify(deck_bytes: bytes, assignments: dict[int, str]) -> tuple[bytes | N
         try:
             with open(path, "wb") as f:
                 f.write(deck_bytes)
+            started = automation_pids()
             try:
                 app = win32com.client.DispatchEx("PowerPoint.Application")
                 app.DisplayAlerts = 1  # ppAlertsNone
@@ -404,11 +525,16 @@ def com_unify(deck_bytes: bytes, assignments: dict[int, str]) -> tuple[bytes | N
                 return f.read(), errors
         finally:
             if app is not None:
+                # The Presentations.Count guard is why this cannot just call
+                # Quit: another deck open in the SAME instance would be closed
+                # under someone's feet. When this instance is ours alone, it goes
+                # for certain (force_quit) rather than as far as Quit manages.
                 try:
-                    if app.Presentations.Count == 0:
-                        app.Quit()
+                    idle = app.Presentations.Count == 0
                 except Exception:
-                    pass
+                    idle = True  # unreachable: wedged, and force_quit's business
+                if idle:
+                    force_quit(app, started)
             app = None
             gc.collect()
             try:

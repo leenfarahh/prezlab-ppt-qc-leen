@@ -158,6 +158,29 @@ def test_apply_refuses_clearly_without_powerpoint(monkeypatch):
     assert result.applied == 0
 
 
+def test_a_refused_dispatch_says_what_to_do_about_it():
+    """The failure the format page actually showed a designer: PowerPoint is
+    installed, so com_available() passes, and the dispatch fails anyway because
+    an interrupted run left a headless instance behind. Printing the HRESULT
+    tuple gave them nothing to do (design lead, 23/08/2026)."""
+    from qc.unify import com_failure_advice
+
+    sys_call_failed = Exception(-2147417856, "System call failed.", None, None)
+    advice = com_failure_advice(sys_call_failed)
+    assert "POWERPNT.EXE" in advice, "it has to name the process to end"
+    assert "no window" in advice, "closing PowerPoint normally will not do it"
+    assert "-2147417856" in advice, "the raw error stays, for a bug report"
+
+
+def test_an_unrecognised_com_error_is_reported_rather_than_guessed_at():
+    """A wrong instruction wastes more time than no instruction."""
+    from qc.unify import com_failure_advice
+
+    advice = com_failure_advice(Exception(-999999, "Something else", None, None))
+    assert "Something else" in advice
+    assert "Task Manager" not in advice
+
+
 @needs_powerpoint
 def test_slide_count_never_changes_and_content_survives():
     """The copy/apply/delete ordering exists so the deck is never doubled;

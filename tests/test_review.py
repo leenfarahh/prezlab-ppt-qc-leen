@@ -428,6 +428,71 @@ def test_force_quit_without_a_snapshot_only_asks_nicely(monkeypatch):
     assert killed == []
 
 
+def test_a_leftover_from_an_earlier_run_is_cleared_before_the_next_one(
+        monkeypatch):
+    """The hole the teardown snapshot cannot cover.
+
+    An instance that was alive BEFORE a run is in `started`, so it can never be
+    in the difference force_quit kills - and DispatchEx does not start a second
+    PowerPoint, it attaches to whatever /AUTOMATION instance is already there
+    (two DispatchEx calls, one pid, measured 24/08/2026). So a leftover is not
+    something the next run works around: it inherits it, wedges, and leaves the
+    leftover behind for the run after that. A real host spent a day answering
+    "PowerPoint would not start" to one instance orphaned at 10:05.
+    """
+    from qc import unify
+
+    alive = {45572}
+    listings = []
+    monkeypatch.setattr(unify.os, "name", "nt")
+    monkeypatch.setattr(unify, "automation_pids",
+                        lambda: listings.append(1) or set(alive))
+    monkeypatch.setattr(unify, "_terminate",
+                        lambda pid, ms: alive.discard(pid))
+
+    # It hands back what SURVIVED, which is the snapshot force_quit wants: an
+    # empty one here, so the instance this run goes on to create IS in that
+    # difference and cannot become the next leftover.
+    assert unify.sweep_automation() == set()
+    assert alive == set(), "the leftover survived the sweep"
+    assert len(listings) == 2, "a sweep that killed something has to re-check"
+
+
+def test_the_sweep_reports_what_would_not_die(monkeypatch):
+    """A leftover that refuses to close has to come back as still alive: the run
+    attaches to it either way, and the teardown must not then mistake it for the
+    instance it created and try to kill it twice."""
+    from qc import unify
+
+    monkeypatch.setattr(unify.os, "name", "nt")
+    monkeypatch.setattr(unify, "automation_pids", lambda: {7})
+    monkeypatch.setattr(unify, "_terminate", lambda pid, ms: None)  # immortal
+
+    assert unify.sweep_automation() == {7}
+
+
+def test_the_sweep_is_a_no_op_off_windows(monkeypatch):
+    from qc import unify
+
+    monkeypatch.setattr(unify.os, "name", "posix")
+    monkeypatch.setattr(unify, "automation_pids",
+                        lambda: (_ for _ in ()).throw(AssertionError("asked")))
+    assert unify.sweep_automation() == set()
+
+
+def test_the_server_execution_advice_names_the_leftover_first():
+    """The message said "an update or repair prompt waiting to be answered" and
+    nothing else, and sent a designer looking for a prompt that was not there
+    while a leftover instance was the actual cause (24/08/2026)."""
+    from qc.unify import com_failure_advice
+
+    advice = com_failure_advice(Exception(-2146959355, "Server execution failed",
+                                          None, None))
+    assert "POWERPNT.EXE" in advice and "no window" in advice
+    assert "repair" in advice, "the other cause must still be named"
+    assert "Server execution failed" in advice, "the raw error is the bug report"
+
+
 def test_the_review_page_works_without_a_renderer(monkeypatch):
     """Rendering needs PowerPoint or LibreOffice on the host. The change list
     and the Undo buttons must not."""
@@ -575,3 +640,37 @@ def test_the_result_page_points_at_the_review(monkeypatch):
     html = render_format_result(deck_name="d.pptx", profile_name="P",
                                 job_id="j1", plans=[], errors={}, applied=1)
     assert "/format/j1/review" in html
+
+
+def test_a_clean_host_costs_one_process_listing_not_two(monkeypatch):
+    """Each listing is a WMI or PowerShell round trip that reads every
+    process's command line: 300-500ms. Four of them per render was 2s of a
+    7.7s wait spent asking Windows the same question (measured 24/08/2026)."""
+    from qc import unify
+
+    calls, killed = [], []
+    monkeypatch.setattr(unify.os, "name", "nt")
+    monkeypatch.setattr(unify, "automation_pids",
+                        lambda: calls.append(1) or set())
+    monkeypatch.setattr(unify, "_terminate",
+                        lambda pid, ms: killed.append(pid))
+
+    assert unify.sweep_automation() == set()
+    assert killed == [], "nothing was running, so nothing was there to end"
+    assert len(calls) == 1, f"asked {len(calls)} times with nothing to sweep"
+
+
+def test_the_process_listing_prefers_wmi_but_survives_without_it(monkeypatch):
+    """PowerShell costs ~510ms a call because starting PowerShell does;
+    in-process WMI answers the same question in ~330ms. Either way the answer
+    has to be the same, and a host where WMI is unreachable still needs one."""
+    from qc import unify
+
+    monkeypatch.setattr(unify.os, "name", "nt")
+    monkeypatch.setattr(unify, "_automation_pids_wmi", lambda: {11, 22})
+    assert unify.automation_pids() == {11, 22}
+
+    monkeypatch.setattr(unify, "_automation_pids_wmi", lambda: None)
+    fake = type("R", (), {"stdout": "33\n44\n"})()
+    monkeypatch.setattr(unify.subprocess, "run", lambda *a, **k: fake)
+    assert unify.automation_pids() == {33, 44}, "the fallback did not run"

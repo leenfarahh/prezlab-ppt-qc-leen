@@ -940,8 +940,9 @@ def _audit_job(client, deck_bytes, name="design.pptx"):
     r = client.post("/audit", files={"deck": (name, deck_bytes, "application/octet-stream")},
                     data={"profile": "prezlab_en"})
     assert r.status_code == 200, r.text[:400]
-    assert "/design/" in r.text, "the audit report must link to the design page"
-    return r.text.split("/design/", 1)[1].split('"', 1)[0].split("/", 1)[0]
+    # the upload lands on the design page itself now, so the id is on the url
+    from tests.conftest import job_id_of
+    return job_id_of(r)
 
 
 def _navy_deck():
@@ -1165,7 +1166,7 @@ def test_the_audit_s_own_findings_for_the_slide_are_listed(monkeypatch):
     html = client.get(f"/design/{job}?n=1").text
     assert "Also on this slide" in html
     assert 'class="auditrow"' in html
-    assert "fixed by ticking them on the audit report" in html
+    assert "fixable here for the same reason" in html
 
 
 def test_a_finding_spanning_slides_goes_to_the_deck_view(monkeypatch):
@@ -1284,3 +1285,446 @@ def test_a_render_failure_does_not_stop_the_deck_view(monkeypatch):
     assert deck.status_code == 200
     assert "spelled differently" in deck.text
     assert "No render" not in deck.text, "the deck view has no slide to render"
+
+
+# ---------------------------------------- the audit's own fixes, on this page
+#
+# The rows under "Also on this slide" were read-only for one release. A designer
+# looking at slide 7 and reading "Calibri is not in the allowed set" was being
+# told to go to another page and find the same row (design lead, 24/08/2026), so
+# the tick is here too - and it is THE SAME tick, applied by the same engine
+# under the same rules. What these tests protect is the sameness, not the box:
+# two pages offering one record in two different states is the failure worth
+# catching.
+
+
+def _record_ids_on(html) -> list:
+    import re
+    return re.findall(r'name="record_ids" value="([0-9a-f]+)"', html)
+
+
+def test_the_audits_own_findings_are_tickable_on_the_slide(monkeypatch):
+    from qc.fixer import is_fixable
+
+    client = _client(monkeypatch)
+    job = _audit_job(client, _four_slide_deck())
+    html = client.get(f"/design/{job}?n=1").text
+    ids = _record_ids_on(html)
+    assert ids, "no audit finding on slide 2 offered a fix"
+    assert f'action="/design/{job}/fix"' in html
+    # and the tick agrees with the engine, row for row
+    fixable = {r["record_id"] for r in web._jobs[job]["manifest"]["records"]
+               if r["slide_index"] == 1 and is_fixable(r)}
+    assert set(ids) == fixable
+
+
+def test_ticking_an_audit_fix_here_changes_the_deck_and_reaudits(monkeypatch):
+    client = _client(monkeypatch)
+    job = _audit_job(client, _four_slide_deck())
+    ids = _record_ids_on(client.get(f"/design/{job}?n=1").text)
+    before_deck = web._jobs[job]["deck"]
+    before_total = web._jobs[job]["manifest"]["summary"]["total"]
+
+    r = client.post(f"/design/{job}/fix", data={"record_ids": ids, "n": 1})
+    assert r.status_code == 200
+    assert web._jobs[job]["deck"] != before_deck
+    assert f"Applied {len(ids)} fix" in r.text
+    # verify-after-write, the same promise the report makes
+    assert web._jobs[job]["manifest"]["summary"]["total"] < before_total
+    assert "<b>Slide 2</b>" in r.text, "the answer came back on another slide"
+
+
+def test_a_fix_ticked_here_is_downloadable_like_any_other(monkeypatch):
+    client = _client(monkeypatch)
+    job = _audit_job(client, _four_slide_deck())
+    ids = _record_ids_on(client.get(f"/design/{job}?n=1").text)
+    client.post(f"/design/{job}/fix", data={"record_ids": ids, "n": 1})
+    assert web._jobs[job]["cleaned"] == web._jobs[job]["deck"]
+    assert client.get(f"/download/{job}").status_code == 200
+
+
+def test_ticking_nothing_leaves_the_deck_alone(monkeypatch):
+    client = _client(monkeypatch)
+    job = _audit_job(client, _four_slide_deck())
+    before = web._jobs[job]["deck"]
+    r = client.post(f"/design/{job}/fix", data={"n": 1})
+    assert r.status_code == 200
+    assert "No fix was ticked" in r.text
+    assert web._jobs[job]["deck"] == before
+
+
+def test_a_row_with_no_automatic_fix_says_so_rather_than_showing_nothing(
+        monkeypatch):
+    """"No box here" and "nothing wrong here" look identical otherwise."""
+    client = _client(monkeypatch)
+    job = _audit_job(client, _four_slide_deck())
+    assert "no automatic fix" in client.get(f"/design/{job}?n=1").text
+
+
+def test_the_stale_render_is_dropped_when_a_fix_is_ticked_here(monkeypatch):
+    """A cached picture beside a row marked fixed is a picture of the deck as
+    it stood before the fix."""
+    client = _client(monkeypatch)
+    job = _audit_job(client, _four_slide_deck())
+    ids = _record_ids_on(client.get(f"/design/{job}?n=1").text)
+    web._jobs[job]["design_shots"] = {1: b"stale"}
+    client.post(f"/design/{job}/fix", data={"record_ids": ids, "n": 1})
+    assert not web._jobs[job]["design_shots"]
+
+
+# ------------------------------------------------------ let the tool decide
+#
+# Not the pre-selected remedy this page refuses to have. A default is the tool
+# answering a question nobody asked; this is one deliberate action by the person
+# who chose to take it, and every decision it makes carries the same Undo as a
+# hand-picked one. These tests protect that distinction: that it is asked for,
+# that it is reversible, and that it declines the calls the checks have already
+# said are not the tool's to make.
+
+
+def test_the_page_offers_to_decide_the_slide_or_the_deck(monkeypatch):
+    client = _client(monkeypatch)
+    job = _audit_job(client, _four_slide_deck())
+    html = client.get(f"/design/{job}?n=1").text
+    assert "Let the tool decide" in html
+    assert f'action="/design/{job}/auto"' in html
+    assert 'name="scope" value="slide"' in html
+    assert 'name="scope" value="deck"' in html
+    # the deck view has no one slide to decide, so it offers only the deck
+    deck = client.get(f"/design/{job}?view=deck").text
+    assert 'name="scope" value="deck"' in deck
+    assert 'name="scope" value="slide"' not in deck
+
+
+def test_the_count_on_the_button_is_the_count_that_happens(monkeypatch):
+    """A button that says 9 and does 14 is the end of a designer trusting this
+    page, so the button and the route read the same function."""
+    import re
+
+    client = _client(monkeypatch)
+    job = _audit_job(client, _four_slide_deck())
+    html = client.get(f"/design/{job}?n=1").text
+    promised = int(re.search(
+        r'value="deck"[^>]*>Decide the whole deck \((\d+)\)', html).group(1))
+    plan = web._auto_plan(web._jobs[job], 1)["deck"]
+    assert promised == plan["fixes"] + plan["picks"]
+
+    client.post(f"/design/{job}/auto", data={"scope": "deck", "n": 1})
+    performed = (len([a for a in web._jobs[job]["design_applied"] if a.done])
+                 + len(web._jobs[job]["applied_records"]))
+    assert performed == promised
+
+
+def test_deciding_the_deck_applies_both_passes_and_leaves_an_undo(monkeypatch):
+    client = _client(monkeypatch)
+    job = _audit_job(client, _four_slide_deck())
+    before = web._jobs[job]["deck"]
+
+    r = client.post(f"/design/{job}/auto", data={"scope": "deck", "n": 0})
+    assert r.status_code == 200
+    assert web._jobs[job]["deck"] != before
+    assert "audit fix" in r.text and "Decided the whole deck" in r.text
+    assert web._jobs[job]["applied_records"], "no audit fix was applied"
+    assert web._jobs[job]["design_applied"], "no design decision was made"
+    assert "Undo" in r.text
+
+
+def test_what_the_tool_decided_can_be_taken_back_one_at_a_time(monkeypatch):
+    client = _client(monkeypatch)
+    job = _audit_job(client, _four_slide_deck())
+    client.post(f"/design/{job}/auto", data={"scope": "deck", "n": 0})
+    decided = [a for a in web._jobs[job]["design_applied"] if a.undo]
+    assert decided, "nothing was decided, so there is nothing to undo"
+
+    r = client.post(f"/design/{job}/undo",
+                    data={"finding_ids": decided[0].finding_id, "n": 0})
+    assert r.status_code == 200
+    assert decided[0].finding_id not in {
+        a.finding_id for a in web._jobs[job]["design_applied"]}
+
+
+def test_deciding_one_slide_leaves_the_others_alone(monkeypatch):
+    client = _client(monkeypatch)
+    job = _audit_job(client, _four_slide_deck())
+    client.post(f"/design/{job}/auto", data={"scope": "slide", "n": 1})
+    touched = {s for a in web._jobs[job]["design_applied"] for s in a.slides}
+    assert touched <= {1}, f"a slide-scoped decision touched {sorted(touched)}"
+    assert all(r["slide_index"] == 1
+               for r in web._jobs[job]["applied_records"])
+
+
+def test_the_tool_declines_the_calls_that_are_not_its_own():
+    """A page number, a source line and a stranded eyebrow are identical from
+    the file. qc.design says so; handing the decisions over has to say the same
+    thing rather than quietly guessing."""
+    from qc.design import DesignFinding, Remedy, auto_choice, auto_skip_reason
+
+    frame = DesignFinding(
+        finding_id="f", kind="frame", headline="h", detail="d",
+        severity="info", slides=[0],
+        options=[Remedy("inside", "Move it inside", "", op="offset_many"),
+                 Remedy("leave", "Leave it", "")])
+    assert auto_choice(frame) is None
+    assert "question about the master" in auto_skip_reason(frame)
+
+    contrast = DesignFinding(
+        finding_id="c", kind="contrast", headline="h", detail="d",
+        severity="error", slides=[0],
+        options=[Remedy("ink", "Recolor the text", "", op="set_color"),
+                 Remedy("leave", "Leave it", "")])
+    assert auto_choice(contrast).remedy_id == "ink"
+    assert auto_skip_reason(contrast) is None
+
+    nothing = DesignFinding(
+        finding_id="e", kind="fit", headline="h", detail="d", severity="info",
+        slides=[0], options=[Remedy("leave", "Leave it", "")])
+    assert auto_choice(nothing) is None
+    assert auto_skip_reason(nothing)
+
+
+def _arabic_deck():
+    """An Arabic run carrying a complex-script font the bilingual profile does
+    not allow: fixable, and never fixed without being asked."""
+    from pptx.oxml.ns import qn
+
+    prs = _deck()
+    box = prs.slides[0].shapes.add_textbox(Emu(IN), Emu(IN), Emu(3 * IN),
+                                           Emu(IN // 2))
+    box.text_frame.text = "دراسة الجدوى"
+    rpr = box.text_frame.paragraphs[0].runs[0]._r.get_or_add_rPr()
+    rpr.append(rpr.makeelement(qn("a:cs"), {"typeface": "Akhbar MT"}))
+    return _bytes(prs)
+
+
+def _bilingual_job(client, deck_bytes):
+    r = client.post("/audit",
+                    files={"deck": ("ar.pptx", deck_bytes,
+                                    "application/octet-stream")},
+                    data={"profile": "prezlab_bilingual"})
+    assert r.status_code == 200, r.text[:400]
+    from tests.conftest import job_id_of
+    return job_id_of(r)
+
+
+# ------------------------------------------- the wait, and what fills it
+#
+# Re-auditing the deck and re-rendering the slide takes seconds - PowerPoint
+# startup alone is most of it - and for that whole time the page used to sit
+# there showing the boxes for the very problems being fixed, with no sign the
+# click had registered (design lead, 24/08/2026).
+
+
+def test_a_box_can_be_tied_to_the_card_that_would_fix_it(monkeypatch):
+    """The seam the instant feedback needs: no data-finding on the boxes and
+    picking a remedy cannot take its box off the picture."""
+    import re
+
+    client = _client(monkeypatch, render=True)
+    job = _audit_job(client, _four_slide_deck())
+    web._jobs[job]["design_shots"] = {i: b"png" for i in range(4)}
+    html = client.get(f"/design/{job}?n=1").text
+
+    boxes = set(re.findall(r'class="hit [^"]*"[^>]*data-finding="([0-9a-f]+)"',
+                           html))
+    assert boxes, "no highlight box names the finding it belongs to"
+    every = set(re.findall(r'data-finding="([0-9a-f]+)"', html))
+    assert boxes <= every, "a box points at a finding with no card on the page"
+
+
+def test_answering_a_card_settles_its_box_without_a_round_trip(monkeypatch):
+    """Client-side and free: the box goes when the answer is picked, not when
+    the server comes back. Both halves have to be shipped for that to work."""
+    client = _client(monkeypatch)
+    job = _audit_job(client, _four_slide_deck())
+    html = client.get(f"/design/{job}?n=1").text
+    assert "classList.toggle('settled'" in html
+    assert ".dframe .hit.settled" in html, "nothing styles a settled box"
+    assert ".dcard.answered" in html, "nothing marks the card as answered"
+
+
+def test_every_form_on_the_page_says_something_is_happening(monkeypatch):
+    """Four forms, four waits, and a page that goes quiet on any of them reads
+    as a page that did not take the click."""
+    client = _client(monkeypatch)
+    job = _audit_job(client, _four_slide_deck())
+    html = client.get(f"/design/{job}?n=1").text
+    for form in ("/auto", "/fix", "/undo"):
+        assert f'form[action$="{form}"]' in html, f"{form} submits in silence"
+    assert "getElementById('dform')" in html
+    assert html.count("showBusy(") >= 4
+
+
+# --------------------------------------------- one sticky bar, one whole slide
+#
+# .actionbar is sticky at top:0 for the report, and the slide view has three of
+# them: the tabs, the pager above the split, the pager below it. All three
+# pinned to the same band, painting over each other and over the top of the
+# sticky render - so scrolling down ate the top strip of the slide (design lead,
+# 24/08/2026).
+
+
+def _bar_classes(html) -> list:
+    import re
+    return re.findall(r'<div class="(actionbar[^"]*)"', html)
+
+
+def test_only_the_pager_stays_pinned_on_the_slide_view(monkeypatch):
+    client = _client(monkeypatch)
+    job = _audit_job(client, _four_slide_deck())
+    bars = _bar_classes(client.get(f"/design/{job}?n=1").text)
+    assert len(bars) == 3, f"expected tabs, pager, closing pager; got {bars}"
+    tabs, pager, foot = bars
+    assert "dtabs" in tabs, "the tabs bar is still pinned over the pager"
+    assert "dbar" in pager and "dfoot" not in pager
+    assert "dfoot" in foot, "two pinned copies of the pager is two answers to " \
+                            "'where am I'"
+
+
+def test_the_deck_view_keeps_its_one_sticky_bar(monkeypatch):
+    """Nothing to unpin it for: there is no pager on that view, so unpinning
+    the tabs would leave the page with nothing fixed at all."""
+    client = _client(monkeypatch)
+    job = _audit_job(client, _four_slide_deck())
+    bars = _bar_classes(client.get(f"/design/{job}?view=deck").text)
+    assert bars == ["actionbar no-print"], bars
+
+
+def test_the_render_is_parked_below_the_pager_not_under_it(monkeypatch):
+    client = _client(monkeypatch)
+    job = _audit_job(client, _four_slide_deck())
+    html = client.get(f"/design/{job}?n=1").text
+    # the offset is the bar's MEASURED height, not a guess: the bar wraps on a
+    # narrow window and a hard-coded number cuts the top off again
+    assert "top:calc(var(--dbar-h" in html
+    assert "max-height:calc(100vh - var(--dbar-h" in html, \
+        "a render taller than the window must scroll, not be clipped"
+    assert "ResizeObserver" in html, "nothing re-measures the bar when it wraps"
+
+
+def test_the_slide_is_not_pinned_when_it_stacks_above_its_findings(monkeypatch):
+    """One column under 1100px: the slide sits above the cards rather than
+    beside them, and a pinned slide would cover them."""
+    client = _client(monkeypatch)
+    job = _audit_job(client, _four_slide_deck())
+    html = client.get(f"/design/{job}?n=1").text
+    assert ".dshot { position:static; max-height:none; overflow:visible }" in html
+
+
+# ------------------------------------------------- the colour, not the hex
+#
+# "#464646" is not a colour to the person reading it, it is six characters they
+# have to imagine. The evidence row already shows what is on the slide now; the
+# row PROPOSING the change was the only one on the card with no colour on it
+# (design lead, 24/08/2026).
+
+
+def test_a_colour_remedy_shows_the_colour_it_would_produce(monkeypatch):
+    client = _client(monkeypatch)
+    job = _audit_job(client, _navy_deck())
+    html = client.get(f"/design/{job}?n=0").text
+    assert 'class="rchips"' in html, "no swatch beside a palette remedy"
+    # the swap, both ends of it: what is on the slide and what it becomes
+    assert "background:#204F7A" in html and "background:#1F4E79" in html
+
+
+def test_a_contrast_remedy_shows_the_pair_rather_than_one_swatch(monkeypatch):
+    """"Is this readable" is never a question about one colour. The remedy moves
+    the text or the ground and leaves the other where it is, so the preview is
+    the two of them together with letters in it."""
+    client = _client(monkeypatch)
+    job = _audit_job(client, _four_slide_deck())
+    html = client.get(f"/design/{job}?n=1").text
+    assert 'class="rprev"' in html
+    # recolouring the text keeps the measured ground behind it
+    assert "background:#888888;color:#000000" in html
+
+
+def test_the_leave_it_option_has_no_swatch(monkeypatch):
+    """It changes nothing, so there is nothing to preview - and the blank is
+    what tells the eye which row is the do-nothing one."""
+    import re
+
+    client = _client(monkeypatch)
+    job = _audit_job(client, _navy_deck())
+    html = client.get(f"/design/{job}?n=0").text
+    leave = re.search(r'<label class="radio-card">(?:(?!</label>).)*?'
+                      r'value="leave">(.*?)</label>', html, re.S)
+    assert leave, "no leave-it option on the page"
+    assert "rchips" not in leave.group(1) and "rprev" not in leave.group(1)
+
+
+def test_the_preview_is_hidden_from_a_screen_reader():
+    """The label beside it already carries the palette name and the hex, so a
+    reader gets the answer in words rather than an unlabelled box read as
+    nothing."""
+    from qc.design import DesignFinding, Remedy
+    from qc.ui_design import _remedy_preview
+
+    finding = DesignFinding(
+        finding_id="p", kind="palette", headline="h", detail="d",
+        severity="warning", slides=[0], options=[],
+        evidence={"hex": "1E2761"})
+    swap = Remedy("snap", "Replace with accent4 (#464646)", "",
+                  op="set_color", params={"hex": "464646"})
+    out = _remedy_preview(finding, swap)
+    assert 'aria-hidden="true"' in out
+    assert "background:#1E2761" in out and "background:#464646" in out
+
+
+def test_a_theme_remedy_previews_what_it_resolves_to_today():
+    """It carries a slot, not a hex, and its note promises "same colour on
+    screen today" - so the colour to show is the anchor it matched."""
+    from qc.design import DesignFinding, Remedy
+    from qc.ui_design import _remedy_preview
+
+    finding = DesignFinding(
+        finding_id="p", kind="palette", headline="h", detail="d",
+        severity="warning", slides=[0], options=[],
+        evidence={"hex": "203965", "anchor": "1F3864"})
+    theme = Remedy("theme", "Point them at the theme's accent1 instead", "",
+                   op="set_theme_color", params={"slot": "accent1"})
+    out = _remedy_preview(finding, theme)
+    assert "background:#1F3864" in out
+
+
+def test_a_remedy_with_no_colour_previews_nothing():
+    """A move, a resize or a z-order change has no colour to show, and inventing
+    one would be the page claiming to know something it does not."""
+    from qc.design import DesignFinding, Remedy
+    from qc.ui_design import _remedy_preview
+
+    finding = DesignFinding(
+        finding_id="o", kind="overlap", headline="h", detail="d",
+        severity="error", slides=[0], options=[], evidence={})
+    move = Remedy("move_y", "Move it 0.80in down", "", op="offset",
+                  params={"dx": 0, "dy": 731520})
+    assert _remedy_preview(finding, move) == ""
+    assert _remedy_preview(finding, Remedy("leave", "Leave it", "")) == ""
+    # and a hex that is not a hex is not smuggled into a style attribute
+    bad = Remedy("snap", "x", "", op="set_color",
+                 params={"hex": "red;}</style><script>"})
+    assert _remedy_preview(finding, bad) == ""
+
+
+def test_a_fix_that_asks_for_approval_is_not_taken_by_the_auto_pass(monkeypatch):
+    """Arabic shaping changes with the font, so the tick IS the approval
+    (qc.fixer.needs_explicit_tick). "Decide the whole deck" is not the same
+    sentence as approving that, and must not be read as one."""
+    from qc.fixer import needs_explicit_tick
+
+    client = _client(monkeypatch)
+    job = _bilingual_job(client, _arabic_deck())
+    held = [r for r in web._jobs[job]["manifest"]["records"]
+            if needs_explicit_tick(r)]
+    assert held, "the fixture stopped producing an Arabic font substitution"
+
+    r = client.post(f"/design/{job}/auto", data={"scope": "deck", "n": 0})
+    assert "explicit approval" in r.text
+    assert not web._jobs[job].get("applied_records"), \
+        "an Arabic font substitution was applied without being asked for"
+
+    # ...and it is applied when the designer says so in as many words
+    client.post(f"/design/{job}/auto",
+                data={"scope": "deck", "n": 0, "include_holds": "1"})
+    assert web._jobs[job]["applied_records"], \
+        "saying yes to the held fixes did not release them"

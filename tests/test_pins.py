@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from qc.render import audit_rects, pin_numbers
 from qc.web import app
+from tests.conftest import job_id_of
 
 client = TestClient(app)
 
@@ -40,7 +41,7 @@ def test_rect_pins_agree_with_list_pins(fixtures_dir):
                                     "application/octet-stream")},
                     data={"profile": "prezlab_en"})
     assert r.status_code == 200
-    job_id = r.text.split("/manifest/", 1)[1].split('"', 1)[0]
+    job_id = job_id_of(r)
     records = client.get(f"/manifest/{job_id}").json()["records"]
 
     pins = pin_numbers(records)
@@ -55,10 +56,11 @@ def test_rect_pins_agree_with_list_pins(fixtures_dir):
                     f"slide {slide_idx}: list badge and box number diverge"
 
     # report rows carry the same numbers as data-pin attributes
+    report = client.get(f"/audit/{job_id}").text
     for m in re.finditer(r'data-record="([0-9a-f]+)"[^>]*data-pin="(\d+)"',
-                         r.text):
+                         report):
         assert pins[m.group(1)] == int(m.group(2))
-    assert 'class="pinno' in r.text
+    assert 'class="pinno' in report
 
 
 def test_whole_slide_findings_marked(fixtures_dir):
@@ -70,4 +72,4 @@ def test_whole_slide_findings_marked(fixtures_dir):
     assert r.status_code == 200
     # layout outliers are slide-level (shape_id "-"): whole-slide marker,
     # never a numbered pin
-    assert 'pinno whole' in r.text
+    assert 'pinno whole' in client.get(f"/audit/{job_id_of(r)}").text

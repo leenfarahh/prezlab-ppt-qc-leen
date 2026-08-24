@@ -129,16 +129,21 @@ def _export_com_once(decks: dict[str, bytes], slide_indices: list[int],
     import pythoncom
     import win32com.client
 
-    from .unify import automation_pids
+    from .unify import sweep_automation
 
     out: dict[str, bytes] = {}
     with _RENDER_LOCK:
         pythoncom.CoInitialize()
         tmp_dir = Path(tempfile.mkdtemp(prefix="qc-render-"))
         app = None
-        # Taken before the instance exists, so the teardown knows which headless
-        # PowerPoint is ours to end (qc.unify.force_quit).
-        started = automation_pids()
+        # Clear leftovers from an interrupted run FIRST. DispatchEx does not
+        # start a second PowerPoint - it attaches to whatever /AUTOMATION
+        # instance is already running - so a wedged leftover is not something
+        # this run can work around, and a snapshot taken after the dispatch
+        # could never see it. What the sweep hands back is what survived, which
+        # IS the teardown's snapshot, so this is one process listing rather than
+        # two (qc.unify.sweep_automation, qc.unify.force_quit).
+        started = sweep_automation()
         try:
             try:
                 app = win32com.client.DispatchEx("PowerPoint.Application")

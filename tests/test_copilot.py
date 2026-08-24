@@ -9,6 +9,7 @@ from pptx.util import Emu
 
 import qc.copilot as copilot
 from qc.web import app
+from tests.conftest import job_id_of
 
 client = TestClient(app)
 IN = 914400
@@ -98,7 +99,7 @@ def test_copilot_route_merges_records(fixtures_dir, monkeypatch):
                     files={"deck": ("mixed_layouts.pptx", deck,
                                     "application/octet-stream")},
                     data={"profile": "prezlab_en"})
-    job_id = r.text.split("/manifest/", 1)[1].split('"', 1)[0]
+    job_id = job_id_of(r)
     before_total = client.get(f"/manifest/{job_id}").json()["summary"]["total"]
 
     import qc.web as web
@@ -130,7 +131,7 @@ def test_copilot_route_without_key(fixtures_dir, monkeypatch):
                     files={"deck": ("mixed_layouts.pptx", deck,
                                     "application/octet-stream")},
                     data={"profile": "prezlab_en"})
-    job_id = r.text.split("/manifest/", 1)[1].split('"', 1)[0]
+    job_id = job_id_of(r)
     monkeypatch.setattr("qc.assist.api_configured", lambda: False)
     r = client.post(f"/copilot/{job_id}")
     assert r.status_code == 200

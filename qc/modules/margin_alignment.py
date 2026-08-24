@@ -77,7 +77,13 @@ ANCHOR_H_RATIO = 1.25
 _ANCHOR_LABEL = {"t": "top", "ctr": "middle", "b": "bottom",
                  "just": "top", "dist": "top"}
 OVERLAP_MIN_RATIO = 0.4          # of either shape's area: substantial cover
-MAX_PAIRWISE_SHAPES = 80         # overlap check stays O(n^2)-sane
+# The text-overlap check stays O(n^2)-sane. 80 was set before the pass was
+# profiled and it cut the answer rather than the cost: this list is already
+# filtered to text-bearing shapes, so 80 of them is a genuinely crowded slide -
+# exactly where collisions live - and the pairs are cheap now that the frame
+# marker read is memoized. Raised with the design pass's own cap (250), and it
+# reports what it dropped instead of going quiet (measured 24/08/2026).
+MAX_PAIRWISE_SHAPES = 250
 
 # Panel rows (ground truth, 20/07/2026: 49% of a designer's geometry work
 # was moving panels as blocks onto shared row lines; the tool's per-shape
@@ -155,7 +161,24 @@ def _body_band(profile, prs):
     the profile would have been projected from, and the source the migration
     pass already reads its frame from (qc.migrate._margin_frame). Nothing is
     inferred: no guides, no band, and no slide is measured against a line the
-    client never drew."""
+    client never drew.
+
+    The ceiling can also come from a PRESENTATION SPACE rectangle drawn around
+    the body. infer_grid already works out which of the two things such a
+    rectangle is - a frame around the whole page has a top margin, a frame
+    around the body has a line where content begins - and sets body_top_emu
+    only in the second case (space_states == "body"). This used to insist the
+    source be "guides", so a master that states the body's top as a rectangle
+    rather than a guide pair got no ceiling at all, and every slide on it passed
+    however far below the line its content began (design lead, 24/08/2026).
+
+    A rectangle gives a ceiling and no floor, and that asymmetry is fine because
+    the two directions need different evidence: content that has crept UP needs
+    the floor to tell an eyebrow in the header from body content in the strip
+    (_band_intrusion requires both), while content sitting BELOW the line needs
+    only the line (_band_shortfall). Note what is NOT read here - the safe-zone
+    top margin. That is where the PAGE begins, not where the body does; using it
+    as a ceiling fires on every normal slide in the deck."""
     band = profile.get("geometry.body_band_emu") or {}
     if band.get("body_top"):
         return (band.get("subtitle_floor"), band["body_top"])
@@ -165,9 +188,134 @@ def _body_band(profile, prs):
         grid = infer_grid(prs, dominant_master(prs)) or {}
     except Exception:
         return (None, None)
-    if grid.get("source") != "guides":
+    if grid.get("source") not in ("guides", "presentation_space"):
         return (None, None)
     return (grid.get("subtitle_floor_emu"), grid.get("body_top_emu"))
+
+
+def _space_box(profile, prs):
+    """(left, top, right, bottom) of the presentation space in slide EMU, or
+    None when nobody states one.
+
+    The frame reaches this stage the same way the band does: the profile first,
+    because it is the client's stated rule and outlives the master file it came
+    from, then the deck's OWN master. A profile projected from a master carries
+    the space as its safe-zone margins (qc.stylespec.infer_grid), which is why
+    that key is read here rather than a second one being invented - two places
+    to state one rectangle is two places for them to disagree.
+
+    Until now the frame only reached the design pass's outside-the-frame check.
+    The audit knew the margins but not that they were a designer's stated
+    rectangle, so it had nothing to align TO and fell back to aligning shapes to
+    each other (design lead, 24/08/2026)."""
+    slide_w, slide_h = prs.slide_width, prs.slide_height
+    margins = profile.get("geometry.safe_zone_margins_emu") or {}
+    if all(margins.get(side) is not None
+           for side in ("left", "top", "right", "bottom")):
+        return (margins["left"], margins["top"],
+                slide_w - margins["right"], slide_h - margins["bottom"])
+    try:
+        from qc.stylespec import dominant_master, read_presentation_space
+
+        space = read_presentation_space(prs, dominant_master(prs))
+    except Exception:
+        return None
+    if not space or space.get("problem") or not space.get("box_emu"):
+        return None
+    return tuple(space["box_emu"])
+
+
+# Past this far inside the frame, an element is INDENTED rather than misaligned,
+# and the tool says nothing. The two failure modes sit at opposite ends of the
+# scale, which is why this is a band and not a floor: a stray of a hundredth of
+# an inch is a nudge nobody meant, and a quarter inch is a designer's indent - a
+# sub-bullet, an inset aside, a hanging quote. A rule with only a lower bound
+# reports the deliberate ones too, which is how a check earns its way into being
+# ignored. The lower bound is the client's own stated alignment tolerance, so
+# "off the line" means what the profile says it means.
+SPACE_EDGE_MAX_EMU = 228600      # 0.25in
+
+
+def _space_edge_stacks(s_idx, body, measurable, space, rtl, edge_tol):
+    """Stacked elements not starting on the frame's leading edge.
+
+    "All stacked elements should start at the left/right boundary of the space,
+    not just the first element" (design lead, 24/08/2026). The complaint names
+    the symptom precisely: with a column of blocks whose first sits on the frame
+    and whose rest are indented a few millimetres, _edge_misaligned takes the
+    MAJORITY as the line - so the one element that was right gets pulled off the
+    frame to join the ones that were wrong.
+
+    The frame only counts as live on a slide where something actually uses it, so
+    a stack is judged only when one of its own members sits on the edge. That
+    keeps a deliberately inset column - a card's contents, an indented aside -
+    out of it: nothing in such a column touches the frame, so nothing in it is
+    asked to.
+
+    Leading edge, not left edge: an RTL slide's stacks run from the right, and
+    holding Arabic content to a left margin would be the tool imposing a reading
+    direction the deck does not have."""
+    if space is None or len(measurable) < 2:
+        return []
+    left, _top, right, _bottom = space
+    records = []
+    for stack in _x_columns(measurable):
+        if len(stack) < 2:
+            continue          # one element is not a stack
+        def _off(it):
+            return (right - (it["l"] + it["w"])) if rtl else (it["l"] - left)
+
+        offs = [_off(it) for it in stack]
+        if not any(abs(o) <= edge_tol for o in offs):
+            continue          # nothing in this stack uses the frame
+        strays = [(it, o) for it, o in zip(stack, offs)
+                  if edge_tol < o <= SPACE_EDGE_MAX_EMU]
+        if not strays:
+            continue
+        # ONE record for the stack, not one per stray. "Not just the first
+        # element" is a single decision about a column, and three tick boxes
+        # that all snap to the same edge would be three fixes claiming each
+        # other's shapes - the fix engine's one-move-per-shape guard then
+        # applies the first and defers the rest, so a designer ticking all
+        # three would watch two of them do nothing.
+        #
+        # locator "edge:<l|r>:<strays>:<stack>". The side is stated rather than
+        # inferred: the fixer has to know whether it is aligning left edges to
+        # the frame or right edges to it, and working that out from the
+        # coordinates would be a second guess at the slide's reading direction
+        # that could disagree with the one made here. The fixer moves the
+        # strays; _guide_beats_median needs the whole stack, because the shape
+        # the cluster median wants to move is the one this rule leaves alone -
+        # the member already sitting on the frame, out-voted by its indented
+        # siblings.
+        stray_ids = ",".join(str(it["shape"].shape_id) for it, _o in strays)
+        stack_ids = ",".join(str(it["shape"].shape_id) for it in stack)
+        worst, off = max(strays, key=lambda pair: pair[1])
+        # RTL snaps each shape's RIGHT edge to the frame, so shapes of different
+        # widths get different lefts; that is the fixer's business, and the
+        # record states the frame edge itself.
+        target = right if rtl else left
+        on_line = len(stack) - len(strays)
+        records.append(make_record(
+            slide_index=s_idx, shape_id=worst["shape"].shape_id,
+            shape_path=None, module=MODULE,
+            issue_type="margin_alignment.space_edge_misaligned",
+            severity="error" if on_line >= len(strays) else "warning",
+            action="flagged", confidence="high",
+            locator=f"edge:{'r' if rtl else 'l'}:{stray_ids}:{stack_ids}",
+            property="spPr.xfrm.off.x",
+            old_value=worst["l"], new_value=target,
+            profile_rule_id="geometry.safe_zone_margins_emu",
+            arabic_flag=any(it["arabic"] for it, _o in strays),
+            message=_geo_msg(
+                f"{len(strays)} element(s) stacked here sit up to "
+                f"{off / 36000:.1f}mm inside the presentation space's "
+                f"{'right' if rtl else 'left'} edge while {on_line} stacked "
+                f"with them sit on it; the fix snaps them all out to the "
+                f"frame, so the column starts on one line",
+                any(it["arabic"] for it, _o in strays)),
+        ))
+    return records
 
 
 def _clusters(items, key_index: int, span: int):
@@ -360,6 +508,7 @@ def detect(ctx):
 
     anchors = recurring_anchors(ctx.prs)
     band_floor, band_ceiling = _body_band(profile, ctx.prs)
+    space = _space_box(profile, ctx.prs)
 
     records = []
     for s_idx, slide in enumerate(ctx.prs.slides):
@@ -386,6 +535,9 @@ def detect(ctx):
             is_head = str(shape.shape_id) in head_ids
             surface.append({
                 "shape": shape, "t": top, "h": height, "arabic": arabic,
+                # left/width too: the band rules group content into side-by-side
+                # columns, and a column is a horizontal span (_x_columns)
+                "l": left, "w": width,
                 "head": is_head, "bleed": full_bleed,
                 "ph": bool(getattr(shape, "is_placeholder", False)),
                 "rot": bool(getattr(shape, "rotation", 0)),
@@ -554,8 +706,66 @@ def detect(ctx):
                                          slide_is_rtl(slide)))
         records.extend(_band_intrusion(s_idx, surface, band_floor,
                                        band_ceiling, slide_h))
+        # Content sitting BELOW the line needs only the line. A master that
+        # states its body's top as a presentation-space rectangle rather than a
+        # guide pair gives a ceiling and no floor, and that is enough here
+        # (see _body_band) - which is what makes "adjacent elements start at the
+        # top of the space" hold on those masters.
+        if band_ceiling and not band_floor:
+            body, measurable = _body_members(surface, slide_h)
+            records.extend(_band_shortfall(s_idx, body, measurable,
+                                           band_ceiling, slide_h))
+        body, measurable = _body_members(surface, slide_h)
+        records.extend(_space_edge_stacks(s_idx, body, measurable, space,
+                                          slide_is_rtl(slide), edge_tol))
 
-    return records
+    return _guide_beats_median(records)
+
+
+def _guide_beats_median(records: list) -> list:
+    """Drop top-edge cluster fixes for shapes a body-guide fix already claims.
+
+    The two rules genuinely disagree, and one of them is right. On the slide
+    that prompted the guide rule, _edge_misaligned proposed pulling the photo
+    DOWN 0.25in onto the cards' line (they are the majority, so they set the
+    median) while the guide rule proposes lifting both UP onto the line the
+    master states. Left in, a designer ticking both gets the photo moved twice
+    from two targets computed off the same starting position, and the second
+    move lands somewhere neither rule asked for.
+
+    The guide wins because it is stated rather than inferred: a median is the
+    tool reading intent off where things happen to sit, and a guide is the
+    designer having said where they go. Only the TOP axis is affected - a
+    left-edge cluster and a body guide are answers to different questions."""
+    claimed_y, claimed_x = set(), set()
+    for r in records:
+        if r.issue_type == "margin_alignment.body_below_band":
+            loc = r.locator or ""
+            if loc.startswith("band:"):
+                claimed_y.update(loc.split(":", 2)[2].split(","))
+        elif r.issue_type == "margin_alignment.space_edge_misaligned":
+            # The frame's leading edge, same argument on the other axis - and the
+            # claim covers the WHOLE stack, because the shape the median fix
+            # wants to move is precisely the one this rule leaves alone: the
+            # member already sitting on the frame, which the majority of
+            # indented siblings out-votes.
+            loc = r.locator or ""
+            if loc.startswith("edge:"):
+                claimed_x.update(loc.split(":", 3)[3].split(","))
+            else:
+                claimed_x.add(str(r.shape_id))
+    if not (claimed_y or claimed_x):
+        return records
+
+    def _superseded(r) -> bool:
+        if r.issue_type != "margin_alignment.edge_misaligned":
+            return False
+        prop = r.property or ""
+        sid = str(r.shape_id)
+        return ((prop.endswith(".y") and sid in claimed_y)
+                or (prop.endswith(".x") and sid in claimed_x))
+
+    return [r for r in records if not _superseded(r)]
 
 
 def _heading_past_ceiling(top, height, floor, ceiling) -> list:
@@ -578,6 +788,44 @@ def _heading_past_ceiling(top, height, floor, ceiling) -> list:
         return []
     over = (top + height) - ceiling
     return [("body ceiling", over)] if over > 0 else []
+
+
+def _body_members(surface, slide_h, floor=None, ceiling=None):
+    """(body, measurable) - what counts as this slide's body content, and which
+    of it can be measured.
+
+    ONE definition, shared by every rule that holds the body to a stated line.
+    Three rules ask the question now (the band intrusion, the shortfall under
+    the ceiling, the frame's leading edge) and they have to agree: a shape one
+    of them calls furniture and another calls body would be moved by one and
+    left by the other.
+
+    Out by construction: headings (this tool never repositions a title),
+    placeholders (their geometry is master_slide's business, measured against the
+    layout rather than a guide), full-bleed and page-deep elements
+    (qc.util.full_height_panel), and the bottom furniture strip.
+
+    HEADER-ZONE shapes are out too, but only when a band is stated - a box that
+    starts above the subtitle floor and stops inside the strip is descender
+    slack, and counting it as body made its top, up in the header, the line the
+    whole block was measured from (a 36mm move asked for on the client's own
+    sample deck). Without a floor there is no header zone to define, so the
+    exclusion cannot apply.
+
+    Rotated shapes cannot be MEASURED - their stored box is not their rendered
+    one - but they stay in `body` because they travel with a translation, which
+    does not care which way a shape faces."""
+    def _header_zone(it) -> bool:
+        return (floor is not None and ceiling is not None
+                and it["t"] < floor
+                and it["t"] + it["h"] <= ceiling + BAND_SLACK_EMU)
+
+    body = [it for it in surface
+            if not it["head"] and not it["ph"] and not it["bleed"]
+            and not _header_zone(it)
+            and not full_height_panel(it["t"], it["h"], slide_h)
+            and it["t"] < FURNITURE_STRIP * slide_h]
+    return body, [it for it in body if not it["rot"]]
 
 
 def _band_intrusion(s_idx, surface, floor, ceiling, slide_h):
@@ -620,19 +868,10 @@ def _band_intrusion(s_idx, surface, floor, ceiling, slide_h):
     if not floor or not ceiling or ceiling <= floor:
         return []
 
-    def _header_zone(it) -> bool:
-        return (it["t"] < floor
-                and it["t"] + it["h"] <= ceiling + BAND_SLACK_EMU)
-
-    body = [it for it in surface
-            if not it["head"] and not it["ph"] and not it["bleed"]
-            and not _header_zone(it)
-            and not full_height_panel(it["t"], it["h"], slide_h)
-            and it["t"] < FURNITURE_STRIP * slide_h]
-    intruders = [it for it in body
-                 if not it["rot"] and it["t"] < ceiling - BAND_SLACK_EMU]
+    body, measurable = _body_members(surface, slide_h, floor, ceiling)
+    intruders = [it for it in measurable if it["t"] < ceiling - BAND_SLACK_EMU]
     if not intruders:
-        return []
+        return _band_shortfall(s_idx, body, measurable, ceiling, slide_h)
     dy = ceiling - min(it["t"] for it in intruders)
     lowest = max(it["t"] + it["h"] for it in body)
     # A block that cannot come down without leaving the canvas is reported and
@@ -668,6 +907,123 @@ def _band_intrusion(s_idx, surface, floor, ceiling, slide_h):
         arabic_flag=arabic,
         message=_geo_msg(msg, arabic),
     )]
+
+
+# How far below the body guide a column has to start before the gap is a mistake
+# rather than a composition. 6mm is about the smallest a designer reads as "not
+# on the line" when the column beside it does sit on the line.
+BAND_SHORTFALL_EMU = 216000        # 6mm
+# A slide needs more than one column for this to mean anything: with a single
+# column there is no line to be off, only a composition that begins where it
+# begins.
+BAND_MIN_COLUMNS = 2
+
+
+def _x_columns(items):
+    """Body content grouped into side-by-side columns by horizontal overlap.
+
+    Columns are what the body guide is about. A second ROW legitimately starts
+    lower than the first and shares its column's horizontal span, so grouping on
+    x and judging only each column's TOPMOST shape is what separates "this
+    column missed the line" from "this is the next row down"."""
+    ordered = sorted(items, key=lambda it: it["l"])
+    columns: list[list] = []
+    edge = None
+    for it in ordered:
+        if columns and edge is not None and it["l"] <= edge:
+            columns[-1].append(it)
+            edge = max(edge, it["l"] + it["w"])
+        else:
+            columns.append([it])
+            edge = it["l"] + it["w"]
+    return columns
+
+
+def _band_shortfall(s_idx, body, measurable, ceiling, slide_h):
+    """Body columns starting BELOW the guide the master says the body starts on.
+
+    The mirror of the intrusion above, and the half that was missing. The strip
+    rule was written for content that had crept UP into the header's clear band,
+    so it only ever asked shapes to come DOWN; a column that began well below
+    the guide was silently clean (design lead, 24/08/2026: "the picture on the
+    left and the elements on the right should both be aligned to the top of the
+    presentation space but only the picture was aligned").
+
+    Silence there is what produced the reported result, because the cluster
+    rule is still running: with a photo at 2.30in and a row of cards at 2.55in,
+    _edge_misaligned aligns the photo TO THE CARDS - they are the majority line -
+    and the slide then passes with its whole body below where the master says the
+    body begins. Aligned to each other, and to nothing the master states.
+
+    PER COLUMN, not per block and not per shape. Per block preserves the very
+    stagger being complained about: lifting photo-and-cards together by the
+    photo's shortfall puts the photo on the guide and leaves the cards below it,
+    which is exactly the screenshot. Per shape would flatten a deliberate
+    stagger inside a column into a row. Per column is the designer's own
+    unit - "these two columns both start at the top" - and it is the one the
+    guide is drawn for.
+
+    A column that already sits on the guide is the strongest evidence the guide
+    is live on this slide, so the columns that missed it are reported as errors;
+    with every column low it is a warning, because a body that begins low all
+    the way across may be the composition.
+    """
+    if len(measurable) < 2:
+        return []
+    columns = _x_columns(measurable)
+    if len(columns) < BAND_MIN_COLUMNS:
+        return []
+    tops = [min(it["t"] for it in col) for col in columns]
+    anchored = any(abs(t - ceiling) <= BAND_SLACK_EMU for t in tops)
+
+    # Columns that start on the SAME low line are one decision, not one each: a
+    # row of three cards side by side is three columns geometrically and one
+    # problem to a designer, and three tick boxes that all move by 0.65in is the
+    # per-occurrence noise this module exists to avoid.
+    groups: dict[int, list] = {}
+    for col, top in zip(columns, tops):
+        short = top - ceiling
+        if short < BAND_SHORTFALL_EMU:
+            continue
+        groups.setdefault(short // BAND_SLACK_EMU, []).extend(col)
+
+    records = []
+    for members in groups.values():
+        top = min(it["t"] for it in members)
+        short = top - ceiling
+        highest = min(members, key=lambda it: it["t"])
+        # Everything in the group travels, so the arrangement inside it survives
+        # the lift; _fix_body_band takes the delta and the member ids.
+        ids = ",".join(str(it["shape"].shape_id) for it in members)
+        arabic = any(it["arabic"] for it in members)
+        n_cols = sum(1 for col, t in zip(columns, tops)
+                     if t - ceiling >= BAND_SHORTFALL_EMU
+                     and (t - ceiling) // BAND_SLACK_EMU
+                     == short // BAND_SLACK_EMU)
+        what = f"{n_cols} columns" if n_cols > 1 else "this column"
+        records.append(make_record(
+            slide_index=s_idx, shape_id=highest["shape"].shape_id,
+            shape_path=None, module=MODULE,
+            issue_type="margin_alignment.body_below_band",
+            severity="error" if anchored else "warning",
+            action="flagged", confidence="high" if anchored else "medium",
+            locator=f"band:{-short}:{ids}",
+            property="spPr.xfrm.off.y",
+            old_value=top, new_value=ceiling,
+            profile_rule_id="geometry.body_band_emu",
+            arabic_flag=arabic,
+            message=_geo_msg(
+                f"{what} start{'' if n_cols > 1 else 's'} "
+                f"{short / 36000:.1f}mm below the guide the master says the "
+                f"body starts on ({ceiling / 914400:.2f}in)"
+                + (", while another column on this slide sits on it"
+                   if anchored else
+                   ", and so does every other column on this slide")
+                + f"; the fix lifts {len(members)} element(s) onto the guide "
+                  f"together, so the arrangement inside them does not change",
+                arabic),
+        ))
+    return records
 
 
 def _heading_past_margin(s_idx, shape, breached, arabic):
@@ -1326,8 +1682,21 @@ def _text_overlap(s_idx, placed, scope=""):
     texty = [item for item in placed
              if getattr(item[0], "has_text_frame", False)
              and item[0].text_frame.text.strip()]
-    if len(texty) > MAX_PAIRWISE_SHAPES:
+    capped = max(0, len(texty) - MAX_PAIRWISE_SHAPES)
+    if capped:
         texty = texty[:MAX_PAIRWISE_SHAPES]
+        records.append(make_record(
+            slide_index=s_idx, shape_id="-", shape_path=None, module=MODULE,
+            issue_type="margin_alignment.overlap_check_capped",
+            severity="info", action="flagged", confidence="high",
+            property=None, old_value=len(texty) + capped,
+            new_value=MAX_PAIRWISE_SHAPES,
+            profile_rule_id=None, arabic_flag=False,
+            message=(f"{len(texty) + capped} text elements on this slide is "
+                     f"past the {MAX_PAIRWISE_SHAPES} this check compares pair "
+                     f"by pair, so {capped} were left out and the overlap list "
+                     f"for this slide is incomplete{where}"),
+        ))
 
     # Grid siblings: >= 4 same-size text shapes (photo labels, logo captions)
     # sit tightly and their padded boxes brush each other by design; a pair of

@@ -55,6 +55,10 @@ ISSUE_LABELS = {
     "header_footer.text_mismatch": "Footer text wrong",
     "header_footer.missing": "Header/footer missing",
     "preflight.unmodifiable_content": "Preserved as-is",
+    "margin_alignment.body_band_intrusion": "Body in the header's clear strip",
+    "margin_alignment.body_below_band": "Body starts below its guide",
+    "margin_alignment.overlap_check_capped": "Slide too crowded to check fully",
+    "margin_alignment.space_edge_misaligned": "Off the presentation space edge",
 }
 
 
@@ -399,7 +403,7 @@ def _shell(title: str, body: str) -> str:
 <body>{demo_strip}<div class="wrap">
 <div class="brandrow"><span class="wordmark">prezlab:</span>
 <span class="kicker">Pre-delivery QC</span>
-<span style="flex:1"></span><span class="note"><a href="/master">Read a master</a> &middot; <a href="/format">Apply a master</a> &middot; <a href="/profiles">Profiles</a> &middot; <a href="/team">Team</a> &middot; <a href="/stats">Stats</a></span><span id="who" class="note"></span></div>
+<span style="flex:1"></span><span class="note"><a href="/">Run an audit</a> &middot; <a href="/master">Read a master</a> &middot; <a href="/format">Apply a master</a> &middot; <a href="/profiles">Profiles</a> &middot; <a href="/team">Team</a> &middot; <a href="/stats">Stats</a></span><span id="who" class="note"></span></div>
 {body}
 </div>
 <div class="busy" id="busy" hidden role="status" aria-live="polite">
@@ -1104,6 +1108,18 @@ refresh();
   <span class="note">Sends slide <b>images</b> to the Anthropic API
    (unlike the assistant above). Use only on decks approved for cloud
    processing. Suggestions arrive tickable, never pre-selected.</span>
+ </div>
+ <div class="copilotrow">
+  <form method="post" action="/components/{esc(job_id)}"
+    onsubmit="showBusy('Working out what the components are',
+     'Claude names the things on each slide and which line they belong on; the geometry is measured here. A full deck takes a minute or two.')">
+   <button class="btn ghost" type="submit">Component review</button>
+  </form>
+  <span class="note">Answers the two questions geometry cannot: which
+   shapes are <b>one thing</b> (a card with its icon and label), and which
+   line they were meant to share &mdash; the master's frame, or another
+   component. Claude never supplies a coordinate; every target is measured
+   here. Slide <b>images</b> are sent, as above.</span>
  </div>
 </div>"""
     fix_note = ("""<p class="note no-print">Confident fixes (errors and

@@ -64,8 +64,18 @@ def test_near_miss_fill_warns_with_replacement(make_prs, en_profile, tmp_path):
     assert r.profile_rule_id == "color_palette.named_colors"
 
 
-def test_ambiguity_band_fill_warns_without_replacement(make_prs, en_profile, tmp_path):
-    """deltaE in (5, 10]: warning, medium confidence, no suggested new_value."""
+def test_ambiguity_band_fill_names_the_target_but_asks_first(make_prs,
+                                                            en_profile,
+                                                            tmp_path):
+    """deltaE in (5, 10]: warning, medium confidence, and the nearest palette
+    colour NAMED as the target.
+
+    It used to carry none, so the row read "no automatic fix" for a colour the
+    tool could name and reach (design lead, 24/08/2026). What changes past the
+    auto-replace band is not whether a fix exists but who decides: the swap is
+    visible, so it is never pre-ticked."""
+    from qc.fixer import is_fixable, tick_reason
+
     de = ciede2000(_hx("305E90"), NAVY)
     assert 5.0 < de <= 10.0
     prs = make_prs()
@@ -73,11 +83,14 @@ def test_ambiguity_band_fill_warns_without_replacement(make_prs, en_profile, tmp
     ctx = save_and_ctx(prs, tmp_path, en_profile)
     recs = detect(ctx)
     assert len(recs) == 1
-    assert recs[0].issue_type == "color_palette.off_palette_rgb"
-    assert recs[0].severity == "warning"
-    assert recs[0].confidence == "medium"
-    assert recs[0].new_value is None
-    assert recs[0].old_value == "305E90"
+    rec = recs[0]
+    assert rec.issue_type == "color_palette.off_palette_rgb"
+    assert rec.severity == "warning"
+    assert rec.confidence == "medium"
+    assert rec.new_value is not None, "the nearest palette colour is the target"
+    assert rec.old_value == "305E90"
+    assert is_fixable(rec.to_dict())
+    assert "visible change" in tick_reason(rec.to_dict())
 
 
 def test_wild_color_is_error(make_prs, en_profile, tmp_path):
@@ -87,9 +100,12 @@ def test_wild_color_is_error(make_prs, en_profile, tmp_path):
     recs = detect(ctx)
     assert len(recs) == 1
     assert recs[0].issue_type == "color_palette.off_palette_rgb"
+    # Severity and confidence answer different questions here: the tool is
+    # CERTAIN this colour is not in the palette (error) and only guessing that
+    # the nearest one is what was meant (medium). Confidence is about the fix.
     assert recs[0].severity == "error"
-    assert recs[0].confidence == "high"
-    assert recs[0].new_value is None
+    assert recs[0].confidence == "medium"
+    assert recs[0].new_value is not None
     assert "no near palette match" in recs[0].message
 
 

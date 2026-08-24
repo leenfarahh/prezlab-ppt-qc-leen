@@ -3,6 +3,7 @@
 from fastapi.testclient import TestClient
 
 from qc.web import app
+from tests.conftest import job_id_of
 
 client = TestClient(app)
 
@@ -18,6 +19,33 @@ def test_health():
     assert client.get("/health").json() == {"status": "ok"}
 
 
+def test_an_upload_lands_on_the_slides_not_on_the_occurrence_list(fixtures_dir):
+    """The report is a list of occurrences with no picture, and a designer's
+    first question is "what is wrong with THIS slide" (design lead,
+    24/08/2026). It is still there - Design QC links back to it, and the
+    exports, triage and comments live on it - it is just not the doorway.
+
+    A 303 rather than a rendered page, so refreshing does not re-upload the
+    deck and re-run the audit."""
+    deck = (fixtures_dir / "clean.pptx").read_bytes()
+    r = client.post("/audit", follow_redirects=False,
+                    files={"deck": ("clean.pptx", deck, "application/octet-stream")},
+                    data={"profile": "prezlab_en"})
+    assert r.status_code == 303
+    assert r.headers["location"].startswith("/design/")
+
+    job = r.headers["location"].rsplit("/", 1)[1]
+    assert "Design QC" in client.get(f"/design/{job}").text
+    back = client.get(f"/audit/{job}")
+    assert back.status_code == 200 and "clean.pptx" in back.text
+
+
+def test_every_page_offers_the_way_back_to_a_new_audit():
+    """Landing on Design QC makes the header the only route back to the upload
+    form, so it has to be in the header."""
+    assert '<a href="/">Run an audit</a>' in client.get("/").text
+
+
 def test_audit_bilingual_fixture_end_to_end(fixtures_dir):
     deck = (fixtures_dir / "bilingual_ar.pptx").read_bytes()
     r = client.post(
@@ -27,13 +55,14 @@ def test_audit_bilingual_fixture_end_to_end(fixtures_dir):
         data={"profile": "prezlab_bilingual"},
     )
     assert r.status_code == 200
-    assert "bilingual_ar.pptx" in r.text
-    assert "font.cs_typeface_missing" in r.text  # the Arabic guard is visible
-    assert ">AR<" in r.text                      # Arabic badge rendered
+    # the upload lands on Design QC; the occurrence list is the report's job
+    report = client.get(f"/audit/{job_id_of(r)}").text
+    assert "bilingual_ar.pptx" in report
+    assert "font.cs_typeface_missing" in report  # the Arabic guard is visible
+    assert ">AR<" in report                      # Arabic badge rendered
 
     # manifest link present and serves the JSON
-    marker = '/manifest/'
-    job_id = r.text.split(marker, 1)[1].split('"', 1)[0]
+    job_id = job_id_of(r)
     m = client.get(f"/manifest/{job_id}")
     assert m.status_code == 200
     body = m.json()
@@ -97,7 +126,7 @@ def _audit_and_get_job(fixtures_dir, deck_name="mixed_layouts.pptx", profile="pr
                     files={"deck": (deck_name, deck, "application/octet-stream")},
                     data={"profile": profile})
     assert r.status_code == 200
-    job_id = r.text.split("/manifest/", 1)[1].split('"', 1)[0]
+    job_id = job_id_of(r)
     return job_id, client.get(f"/manifest/{job_id}").json()
 
 
@@ -239,8 +268,9 @@ def test_module_subset_respected(fixtures_dir):
                     files={"deck": ("mixed_layouts.pptx", deck, "application/octet-stream")},
                     data={"profile": "prezlab_en", "modules": ["master_slide"]})
     assert r.status_code == 200
-    assert "master_slide.layout_outlier" in r.text
-    assert "font.family_out_of_set" not in r.text
+    report = client.get(f"/audit/{job_id_of(r)}").text
+    assert "master_slide.layout_outlier" in report
+    assert "font.family_out_of_set" not in report
 
 
 def test_self_consistency_audit(fixtures_dir):
@@ -250,7 +280,7 @@ def test_self_consistency_audit(fixtures_dir):
                     files={"deck": ("mixed_layouts.pptx", deck, "application/octet-stream")},
                     data={"profile": "__self__"})
     assert r.status_code == 200
-    job_id = r.text.split("/manifest/", 1)[1].split('"', 1)[0]
+    job_id = job_id_of(r)
     m = client.get(f"/manifest/{job_id}").json()
     # profile is the self-derived one, not a saved file
     assert m["profile_id"] == "self"
@@ -278,7 +308,7 @@ def test_downloads_survive_arabic_filenames(fixtures_dir):
                     files={"deck": ("عينة من العرض.pptx", deck,
                                     "application/octet-stream")},
                     data={"profile": "prezlab_en"})
-    job_id = r.text.split("/manifest/", 1)[1].split('"', 1)[0]
+    job_id = job_id_of(r)
     r = client.get(f"/report/{job_id}.csv")
     assert r.status_code == 200
     assert "filename*=UTF-8''" in r.headers["content-disposition"]

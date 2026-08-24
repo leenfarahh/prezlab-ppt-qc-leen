@@ -13,6 +13,7 @@ from pptx.util import Emu
 
 import qc.assist as assist
 from qc.web import app
+from tests.conftest import job_id_of
 
 client = TestClient(app)
 
@@ -155,7 +156,8 @@ def _audit_job(fixtures_dir, profile="prezlab_en"):
                                     "application/octet-stream")},
                     data={"profile": profile})
     assert r.status_code == 200
-    return r.text.split("/manifest/", 1)[1].split('"', 1)[0], r.text
+    job = job_id_of(r)
+    return job, client.get(f"/audit/{job}").text
 
 
 def test_assist_routes_end_to_end(fixtures_dir, profiles_dir, monkeypatch):

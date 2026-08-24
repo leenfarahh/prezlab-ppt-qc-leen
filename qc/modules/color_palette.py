@@ -29,15 +29,20 @@ def _build_palette(cfg: dict) -> dict[str, tuple[int, int, int]]:
 
 
 def _check_surface(*, parent_el, surface: str, master, cfg, palette,
-                   slide_index: int, shape, shape_path, arabic: bool) -> list:
-    """Audit one fill parent element (spPr or rPr). Returns 0 or 1 records."""
+                   slide_index: int, shape, shape_path, arabic: bool,
+                   locator: str | None = None) -> list:
+    """Audit one fill parent element (spPr or rPr). Returns 0 or 1 records.
+
+    `locator` addresses the run for text colors ("p0/r2"), and is what makes
+    them fixable: without it a record says "this shape's text is off-palette"
+    and the fixer has no way to find WHICH run to repaint."""
     solid = find(parent_el, "a:solidFill")
     if solid is None:
         # Gradient/pattern/picture/none: no single color exists, out of scope.
         return []
 
     common = dict(slide_index=slide_index, shape_id=shape.shape_id,
-                  shape_path=shape_path, module=MODULE,
+                  shape_path=shape_path, module=MODULE, locator=locator,
                   property=f"{surface}.solidFill", action="flagged",
                   arabic_flag=arabic)
 
@@ -84,23 +89,40 @@ def _check_surface(*, parent_el, surface: str, master, cfg, palette,
             message=f"Color #{resolved_hex} is off-palette; replace with "
                     f"'{nearest_name}' (#{nearest_hex}, deltaE {delta_e:.1f}).",
             **common)]
+    # Past the auto-replace band the nearest palette color is still NAMED as the
+    # target, where before these two tiers carried none and so could never be
+    # fixed - the row read "no automatic fix" for a colour the tool could name
+    # and reach (design lead, 24/08/2026). What changes past this line is not
+    # whether a fix exists but who decides: the swap is visible, so it is never
+    # pre-ticked and the tick is the designer's approval (qc.fixer
+    # _COLOR_TICK_IS_APPROVAL). Deciding between two candidates, rather than
+    # accepting one, is what the design page's palette card is for.
     if delta_e <= ambiguity:
         return [make_record(
             issue_type="color_palette.off_palette_rgb",
             severity="warning", confidence="medium",
-            old_value=resolved_hex,
+            old_value=resolved_hex, new_value=nearest_hex,
             profile_rule_id="color_palette.named_colors",
             message=f"Color #{resolved_hex} is off-palette; closest named color "
-                    f"'{nearest_name}' is ambiguous (deltaE {delta_e:.1f}), "
-                    f"manual review needed.",
+                    f"'{nearest_name}' (#{nearest_hex}) is ambiguous at deltaE "
+                    f"{delta_e:.1f}. The fix uses it; ticking it is your "
+                    f"approval of a visible change.",
             **common)]
+    # Severity error, confidence medium, and the two are answering different
+    # questions: the tool is CERTAIN this colour is not in the palette and only
+    # guessing that the nearest one is what was meant. Confidence is about the
+    # fix, so it drops here even though the finding is the strongest of the
+    # three - which is also what keeps this tier off the pre-ticked list.
     return [make_record(
         issue_type="color_palette.off_palette_rgb",
-        severity="error", confidence="high",
-        old_value=resolved_hex,
+        severity="error", confidence="medium",
+        old_value=resolved_hex, new_value=nearest_hex,
         profile_rule_id="color_palette.named_colors",
-        message=f"Color #{resolved_hex} has no near palette match "
-                f"(nearest '{nearest_name}', deltaE {delta_e:.1f}).",
+        message=f"Color #{resolved_hex} has no near palette match (nearest "
+                f"'{nearest_name}' #{nearest_hex}, deltaE {delta_e:.1f}) - far "
+                f"enough to be a different colour, not a variant of one. The "
+                f"fix replaces it; ticking it is your approval, and it may be "
+                f"deliberate.",
         **common)]
 
 
@@ -122,13 +144,14 @@ def detect(ctx) -> list:
                     palette=palette, slide_index=s_idx, shape=shape,
                     shape_path=shape_path, arabic=arabic))
             if getattr(shape, "has_text_frame", False):
-                for para in shape.text_frame.paragraphs:
-                    for run in para.runs:
+                for p_idx, para in enumerate(shape.text_frame.paragraphs):
+                    for r_idx, run in enumerate(para.runs):
                         rPr = find(run._r, "a:rPr")
                         if rPr is None:
                             continue
                         records.extend(_check_surface(
                             parent_el=rPr, surface="rPr", master=master,
                             cfg=cfg, palette=palette, slide_index=s_idx,
-                            shape=shape, shape_path=shape_path, arabic=arabic))
+                            shape=shape, shape_path=shape_path, arabic=arabic,
+                            locator=f"p{p_idx}/r{r_idx}"))
     return records

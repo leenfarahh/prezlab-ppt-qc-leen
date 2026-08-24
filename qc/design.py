@@ -41,10 +41,12 @@ Detection and proposal only: applying a choice, and taking it back, is qc.remedy
 import hashlib
 import io
 import json
+import math
 from dataclasses import dataclass, field
 
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.oxml.ns import qn
 
 from spike.color_resolver import (ciede2000, clr_map, color_scheme,
                                   resolve_color_element)
@@ -124,7 +126,15 @@ POS_BIN = EMU_IN // 10
 # line, and a marker drawn by hand is never exactly on it either.
 FRAME_SLACK = 72000
 
-MAX_PAIRWISE = 120  # overlap is O(n^2); a 300-shape slide is not worth minutes
+# Overlap is O(n^2), so a limit has to exist - but 120 was set before the pass
+# was profiled and it was cutting the answer off, not the cost. Measured on a
+# dense slide, 24/08/2026: at 200 shapes a cap of 120 reported 54 overlaps and a
+# cap of 250 reported 204, so three quarters of them were being hidden to save
+# 0.3s. Past ~250 the curve turns (300 shapes costs 4.5s), which is where the
+# limit belongs. When it does bite it now SAYS SO on the slide: a silent cut
+# reads as "nothing else here", which on the densest slides in a deck - the ones
+# most likely to have overlaps - is the worst place to be quietly wrong.
+MAX_PAIRWISE = 250
 
 
 # --- the finding ----------------------------------------------------------
@@ -560,13 +570,34 @@ def _label(shape, limit: int = 28) -> str:
     return shape.name or "a shape"
 
 
+# Is this shape one of the master's frame markers? A pure read of its name and
+# alt text - and the single most expensive question the pass asks, because the
+# pairwise loops ask it about the same shape over and over: 68,484 calls for
+# 1,300 shapes, 2.6s of an 8.1s scan (measured 24/08/2026 on a 26-slide deck).
+# space_marker() reaches it through a descendant XPath for p:cNvPr, so every
+# one of those calls walks a subtree.
+#
+# Memoized on the element rather than on the shape, because python-pptx builds a
+# NEW wrapper object each time .shapes is iterated - caching on the wrapper
+# would never hit. The stored element is compared by identity on read: ids are
+# recycled after a garbage collection, and a stale id answering for a different
+# shape would be a wrong answer rather than a slow one.
+_MARKER_MEMO: dict[int, tuple] = {}
+
+
 def _is_frame_marker(shape) -> bool:
     from .stylespec import space_marker
 
+    element = shape._element
+    hit = _MARKER_MEMO.get(id(element))
+    if hit is not None and hit[0] is element:
+        return hit[1]
     try:
-        return space_marker(shape) is not None
+        value = space_marker(shape) is not None
     except Exception:
-        return False
+        value = False
+    _MARKER_MEMO[id(element)] = (element, value)
+    return value
 
 
 # A text box is almost never full of text, and the difference matters here in a
@@ -584,9 +615,74 @@ def _is_frame_marker(shape) -> bool:
 # the font's metrics, which are not in the file - but "the top 1.2in of a 4.95in
 # box" is a far better answer than "all of it", and it errs toward the box: any
 # paragraph whose size will not resolve keeps the full height.
-CHAR_WIDTH_EM = 0.5      # average advance width as a share of the point size
-LINE_SPACING = 1.2       # single spacing, as PowerPoint renders it
+# Average advance width as a share of the point size, and the number the whole
+# estimate turns on: it decides how many characters fit on a line, and one
+# invented line adds a WHOLE line height to the answer.
+#
+# 0.5 was a guess. Calibrated 24/08/2026 by asking the fonts: 5,040 cases of
+# (string x face x size x box width) over the title and body strings from real
+# decks, in Arial, Calibri, Georgia, Trebuchet, Segoe UI, Verdana and Tahoma,
+# regular and bold, comparing the line count the FONT gives against the line
+# count this model gives.
+#
+#     em/char   invented wrap   missed wrap   exact
+#      0.44          0.5%          11.9%      87.7%
+#      0.46          1.1%           9.2%      89.7%
+#      0.48          1.6%           7.8%      90.5%
+#      0.50 (old)    4.0%           5.3%      90.8%
+#      0.52          5.8%           4.3%      89.9%
+#
+# 0.46 because the two errors do not cost the same. An INVENTED wrap adds a
+# whole line height and reports a title that fits as one that spills, which is
+# the finding a designer stops trusting the page over (design lead, 24/08/2026:
+# "but nothing is spilling out?"). A MISSED wrap loses one finding on a box the
+# designer is looking at anyway, on a card that says out loud it is an estimate.
+# Moving 0.50 -> 0.46 cuts invented wraps by nearly four times and costs about a
+# point of overall accuracy. Same direction the text-extent estimate below
+# already errs in.
+CHAR_WIDTH_EM = 0.46
+# Single spacing as PowerPoint renders it, used only when the paragraph does not
+# state its own (see _line_spacing_pt).
+LINE_SPACING = 1.2
 FRAME_INSET_EMU = 91440  # the default 0.05in left+right inset, doubled
+
+
+def _line_spacing_pt(para, size_pt: float) -> float:
+    """How tall ONE line of this paragraph is, in points.
+
+    Reads the paragraph's own a:lnSpc, which the estimate used to ignore
+    entirely - it assumed 1.2 for everything. Display titles are routinely set
+    at 85-90%, and a title measured at 1.2 when it renders at 0.9 is estimated a
+    third taller than it is, which is enough on its own to report a title that
+    fits as one that spills (design lead, 24/08/2026).
+
+    Two forms in the schema and both appear in real decks: a:spcPct val is
+    thousandths of a percent (90000 = 90%), a:spcPts val is hundredths of a
+    point (2400 = an exact 24pt line).
+
+    Only the paragraph's OWN setting is read, not one inherited from the layout
+    or master list styles. That leaves the inherited case on the 1.2 default,
+    which over-estimates exactly as before - the safe direction here, since this
+    number only ever grows the estimate, and a missed overflow beats an invented
+    one. Worth extending through spike.resolver's cascade when there is evidence
+    a client master sets it there.
+    """
+    pPr = para._p.find(qn("a:pPr"))
+    lnSpc = pPr.find(qn("a:lnSpc")) if pPr is not None else None
+    if lnSpc is not None:
+        pct = lnSpc.find(qn("a:spcPct"))
+        if pct is not None and pct.get("val"):
+            try:
+                return size_pt * (int(pct.get("val")) / 100000.0)
+            except ValueError:
+                pass
+        pts = lnSpc.find(qn("a:spcPts"))
+        if pts is not None and pts.get("val"):
+            try:
+                return int(pts.get("val")) / 100.0
+            except ValueError:
+                pass
+    return size_pt * LINE_SPACING
 
 
 def natural_text_height(shape, box, slide, prs):
@@ -630,9 +726,16 @@ def natural_text_height(shape, box, slide, prs):
         # overflow reaches is a worse guess than the box itself. Understating
         # means a missed overlap rather than an invented one, which is the
         # direction to be wrong in on a page that offers to move things.
-        per_line = max(1, int(width / (size * CHAR_WIDTH_EM * 12700)))
-        lines = 1 if not wraps else max(1, -(-len(para.text.strip()) // per_line))
-        total_pt += lines * size * LINE_SPACING
+        # Float, not int(). Truncating the capacity added a second downward bias
+        # on top of the character-width one: a line with room for 17.9
+        # characters became room for 17, so a 19-character title was declared to
+        # wrap and picked up a whole extra line height. The capacity is an
+        # estimate either way, and rounding it down is not caution - it is a
+        # thumb on the scale in the direction of inventing lines.
+        per_line = max(1.0, width / (size * CHAR_WIDTH_EM * 12700))
+        chars = len(para.text.strip())
+        lines = 1 if not wraps else max(1, math.ceil(chars / per_line))
+        total_pt += lines * _line_spacing_pt(para, size)
     return int(total_pt * 12700)
 
 
@@ -1229,6 +1332,27 @@ def _move_options(s_idx, shape, box, other_box, slide_w, slide_h) -> list[Remedy
     return out
 
 
+def _pairwise_capped(s_idx, dropped: int, compared: int) -> DesignFinding:
+    """The slide is too dense to compare every pair, and says so.
+
+    Not a defect and not fixable - it is the pass telling a designer how far it
+    got. A slide of 300 shapes silently checked to 120 of them looks exactly
+    like a slide with nothing wrong, and the slides that trip this are the
+    crowded ones where overlaps actually live."""
+    return DesignFinding(
+        finding_id=_finding_id("error", ["capped", s_idx, dropped]),
+        kind="error", severity="info",
+        headline=f"This slide is too crowded to check every pair",
+        detail=(f"{compared + dropped} elements is past the {MAX_PAIRWISE} this "
+                f"check compares pair by pair, so {dropped} of them were left "
+                f"out and the overlap list for this slide is incomplete. The "
+                f"ones carrying text were kept, because a pair with no text on "
+                f"either side could not be reported anyway. Everything else on "
+                f"this page - colour, contrast, fit, the frame - looked at the "
+                f"whole slide."),
+        slides=[s_idx], options=[], evidence={"places": dropped})
+
+
 def _overlap_findings(prs) -> list[DesignFinding]:
     findings = []
     slide_w, slide_h = prs.slide_width, prs.slide_height
@@ -1242,7 +1366,15 @@ def _overlap_findings(prs) -> list[DesignFinding]:
         stack = [p for p in stack
                  if not (p.shape.shape_type == MSO_SHAPE_TYPE.GROUP)]
         if len(stack) > MAX_PAIRWISE:
+            # WHICH shapes get dropped matters, and taking the first N in
+            # z-order was an arbitrary answer. This check only ever reports a
+            # pair where at least one side carries text, so text-bearing shapes
+            # are kept first: every pair dropped that way is a pair that could
+            # not have produced a finding anyway.
+            dropped = len(stack) - MAX_PAIRWISE
+            stack = sorted(stack, key=lambda p: not _text_of(p.shape))
             stack = stack[:MAX_PAIRWISE]
+            findings.append(_pairwise_capped(s_idx, dropped, len(stack)))
         extent = {p.z: (_text_extent(p.shape, p.box, slide, prs)
                         if _text_of(p.shape) else p.box) for p in stack}
 
@@ -1732,6 +1864,11 @@ def scan(deck_bytes: bytes, profile_cfg: dict | None = None) -> list[DesignFindi
     the order a designer would work in: the text nobody can read, then the
     colour that is wrong on forty shapes, then the badge in the corner.
     """
+    # The memo holds elements alive, so it is emptied per scan rather than
+    # growing for the life of the process. A concurrent scan clearing it can
+    # only cost the other one cache misses, never a wrong answer - the identity
+    # check in _is_frame_marker is what guarantees that.
+    _MARKER_MEMO.clear()
     prs = Presentation(io.BytesIO(deck_bytes))
     from .stylespec import dominant_master
 
@@ -1761,6 +1898,52 @@ def scan(deck_bytes: bytes, profile_cfg: dict | None = None) -> list[DesignFindi
     findings.sort(key=lambda f: (_ORDER.get(f.severity, 3), -f.places,
                                  f.finding_id))
     return findings
+
+
+# --- handing the decisions over ------------------------------------------
+#
+# A designer can ask the tool to answer every card itself (the design page's
+# "let the tool decide"). That is not a default creeping back in: a default is
+# the tool answering a question nobody asked, and this is one deliberate action,
+# taken once, whose every consequence is listed with an Undo beside it.
+#
+# What it must NOT do is pretend to know things this file has already said it
+# cannot know. Those kinds are named here rather than in the page, because the
+# reason lives with the check.
+
+UNDECIDABLE_KINDS = {
+    "frame": "a page number, a source line and a stranded eyebrow are "
+             "identical from the file; whether something belongs outside the "
+             "frame is a question about the master, not one the deck answers",
+    "error": "a check that could not run has nothing to propose",
+}
+
+
+def auto_choice(finding):
+    """The remedy the tool picks when a designer hands the decision over, or
+    None when this kind of finding is not the tool's to decide.
+
+    The FIRST option with something to perform, every time. Not a new ranking:
+    each check already puts its own recommendation first and says why in the
+    note the designer reads ("offered first because it changes the smallest
+    thing on the slide that can fix the problem"; "nothing moves and no size is
+    hard-coded, which is why it is first"). A second opinion computed here would
+    be free to disagree with the page, and then the tool would be recommending
+    one thing and doing another.
+    """
+    if finding.kind in UNDECIDABLE_KINDS:
+        return None
+    return next((o for o in (finding.options or ()) if o.op), None)
+
+
+def auto_skip_reason(finding) -> str | None:
+    """Why the tool left this one for the designer, in the words the page
+    shows, or None when it would decide it."""
+    if finding.kind in UNDECIDABLE_KINDS:
+        return UNDECIDABLE_KINDS[finding.kind]
+    if not next((o for o in (finding.options or ()) if o.op), None):
+        return "nothing here can be changed automatically"
+    return None
 
 
 def finding_shapes(finding) -> list[tuple]:
@@ -1845,4 +2028,5 @@ __all__ = ["DesignFinding", "Remedy", "scan", "summary", "palette_of",
            "contrast_ratio", "luminance", "hex_of", "parse_hex",
            "placed_shapes", "slide_ground", "shape_fill", "chroma",
            "hue_distance", "natural_text_height", "finding_shapes",
-           "slide_rects"]
+           "slide_rects", "auto_choice", "auto_skip_reason",
+           "UNDECIDABLE_KINDS"]

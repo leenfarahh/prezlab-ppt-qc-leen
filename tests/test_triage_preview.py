@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 import qc.triage as triage
 from qc.web import _jobs, app
+from tests.conftest import job_id_of
 
 client = TestClient(app)
 
@@ -28,7 +29,7 @@ def _audit_and_get_job(fixtures_dir, deck_name="mixed_layouts.pptx",
                     files={"deck": (deck_name, deck, "application/octet-stream")},
                     data={"profile": profile})
     assert r.status_code == 200
-    job_id = r.text.split("/manifest/", 1)[1].split('"', 1)[0]
+    job_id = job_id_of(r)
     return job_id, client.get(f"/manifest/{job_id}").json()
 
 

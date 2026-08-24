@@ -54,12 +54,25 @@ def _theme_element(master):
     return None
 
 
+# A master's theme fonts do not change while a deck is being read, and
+# resolve_run asks for them ONCE PER RUN - 3,432 times on a 26-slide deck, each
+# one walking the master part's relationships to find theme1.xml (0.4s of an
+# 8.1s design scan, measured 24/08/2026). Memoized on the master's part, with
+# the part compared by identity on read so a recycled id cannot answer for a
+# different master (the same rule as qc.design._MARKER_MEMO).
+_THEME_FONT_MEMO: dict[int, tuple] = {}
+
+
 def theme_fonts(master) -> dict:
     """{'+mj-lt': 'Playfair Display', '+mn-lt': 'Inter', '+mj-cs': ..., '+mn-cs': ...}
 
     East Asian faces (+mj-ea / +mn-ea) are read too. Prezlab decks do not use
     them, but the theme declares all three scripts and the extracted style
     spec reports what the theme actually says rather than a subset of it."""
+    part = getattr(master, "part", None)
+    hit = _THEME_FONT_MEMO.get(id(part)) if part is not None else None
+    if hit is not None and hit[0] is part:
+        return hit[1]
     theme = _theme_element(master)
     out = {}
     scheme = find(theme, ".//a:fontScheme")
@@ -71,6 +84,8 @@ def theme_fonts(master) -> dict:
             el = find(group, child)
             if el is not None and el.get("typeface"):
                 out[f"{prefix}-{suffix}"] = el.get("typeface")
+    if part is not None:
+        _THEME_FONT_MEMO[id(part)] = (part, out)
     return out
 
 

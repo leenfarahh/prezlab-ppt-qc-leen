@@ -378,3 +378,247 @@ def test_an_arabic_deck_still_gets_the_move(make_prs, bilingual_profile,
     result = apply_fixes(ctx.deck_path.read_bytes(), recs,
                          {recs[0]["record_id"]})
     assert result.applied == 1, [o.reason for o in result.outcomes]
+
+
+# ------------------------------- the other direction: a body that starts LOW
+#
+# The strip rule was written for content that had crept UP into the header's
+# clear band, so it only ever asked shapes to come DOWN. A column that began
+# well BELOW the guide was silently clean - and that silence is what produced
+# the reported result, because the cluster rule is still running: with a photo
+# at 2.30in and a row of cards at 2.55in, _edge_misaligned aligns the photo TO
+# THE CARDS (they are the majority, so they set the median) and the slide passes
+# with its whole body below the line the master states (design lead, 24/08/2026:
+# "the picture on the left and the elements on the right should both be aligned
+# to the top of the presentation space but only the picture was aligned").
+
+
+def _low_recs(ctx):
+    return [r.to_dict() for r in ma.detect(ctx)
+            if r.issue_type == "margin_alignment.body_below_band"]
+
+
+def _two_column_slide(prs, picture_top, cards_top):
+    """The reported shape: a picture down the left, a row of cards to the
+    right of it, each column starting on its own line."""
+    slide = prs.slides.add_slide(prs.slide_layouts[BLANK])
+    picture = _photo(slide, 0.6 * IN, picture_top, 3.2 * IN, 3.4 * IN)
+    cards = [_photo(slide, (4.3 + i * 2.7) * IN, cards_top, 2.4 * IN, 1.0 * IN)
+             for i in range(3)]
+    return slide, picture, cards
+
+
+def test_a_column_starting_below_the_guide_is_flagged(make_prs, en_profile,
+                                                      tmp_path):
+    """The reported case exactly: the picture is on the guide, the cards are
+    0.65in under it, and that used to be a clean slide."""
+    prs = make_prs()
+    _slide, _pic, cards = _two_column_slide(prs, CEILING,
+                                            CEILING + int(0.65 * IN))
+    ctx = save_and_ctx(prs, tmp_path, _band_profile(en_profile))
+
+    recs = _low_recs(ctx)
+    assert len(recs) == 1, f"expected one decision, got {len(recs)}"
+    rec = recs[0]
+    assert int(rec["new_value"]) == CEILING, "the target must be the guide"
+    assert rec["severity"] == "error", \
+        "a column sitting on the guide is evidence the guide is live here"
+    ids = set(rec["locator"].split(":", 2)[2].split(","))
+    assert ids == {str(c.shape_id) for c in cards}, \
+        "the lift must carry the low column and nothing that was on the line"
+
+
+def test_three_cards_on_one_low_line_are_one_decision(make_prs, en_profile,
+                                                      tmp_path):
+    """Three columns geometrically, one problem to a designer. Three tick boxes
+    that all move by the same 0.65in is the per-occurrence noise this module
+    exists to avoid."""
+    prs = make_prs()
+    _two_column_slide(prs, CEILING, CEILING + int(0.65 * IN))
+    ctx = save_and_ctx(prs, tmp_path, _band_profile(en_profile))
+    assert len(_low_recs(ctx)) == 1
+
+
+def test_the_guide_beats_the_cluster_median(make_prs, en_profile, tmp_path):
+    """Both columns low. _edge_misaligned wants the picture pulled DOWN onto
+    the cards' line; the guide rule wants both lifted UP onto the master's.
+    Ticking both would move the picture twice from two targets computed off the
+    same start, so the inferred median gives way to the stated guide."""
+    prs = make_prs()
+    _slide, pic, _cards = _two_column_slide(
+        prs, CEILING + int(0.40 * IN), CEILING + int(0.65 * IN))
+    ctx = save_and_ctx(prs, tmp_path, _band_profile(en_profile))
+    every = [r.to_dict() for r in ma.detect(ctx)]
+
+    tops = [r for r in every
+            if r["issue_type"] == "margin_alignment.edge_misaligned"
+            and (r["property"] or "").endswith(".y")
+            and str(r["shape_id"]) == str(pic.shape_id)]
+    assert not tops, "the median fix survived and now fights the guide fix"
+    low = [r for r in every
+           if r["issue_type"] == "margin_alignment.body_below_band"]
+    assert len(low) == 2, "each column starts on its own line, so each lifts"
+    assert all(int(r["new_value"]) == CEILING for r in low)
+
+
+def test_every_column_low_is_a_warning_not_an_error(make_prs, en_profile,
+                                                    tmp_path):
+    """With nothing on the guide, the guide being the intended line is
+    inference rather than evidence - a body that begins low all the way across
+    may be the composition."""
+    prs = make_prs()
+    _two_column_slide(prs, CEILING + int(0.40 * IN), CEILING + int(0.65 * IN))
+    ctx = save_and_ctx(prs, tmp_path, _band_profile(en_profile))
+    assert {r["severity"] for r in _low_recs(ctx)} == {"warning"}
+
+
+def test_a_second_row_is_not_a_column_that_missed_the_line(make_prs,
+                                                           en_profile,
+                                                           tmp_path):
+    """A row below the first shares its columns' horizontal span, so only each
+    column's TOPMOST shape is judged. Otherwise every two-row layout in the
+    deck becomes a finding."""
+    prs = make_prs()
+    slide = prs.slides.add_slide(prs.slide_layouts[BLANK])
+    for i in range(3):
+        left = (0.6 + i * 2.4) * IN
+        _photo(slide, left, CEILING, 2 * IN, 1.2 * IN)                  # on line
+        _photo(slide, left, CEILING + int(2.0 * IN), 2 * IN, 1.2 * IN)  # row two
+    ctx = save_and_ctx(prs, tmp_path, _band_profile(en_profile))
+    assert _low_recs(ctx) == []
+
+
+def test_a_single_column_is_a_composition_not_a_misalignment(make_prs,
+                                                             en_profile,
+                                                             tmp_path):
+    """With one column there is no line to be off, only content that begins
+    where it begins."""
+    prs = make_prs()
+    slide = prs.slides.add_slide(prs.slide_layouts[BLANK])
+    _photo(slide, 3.0 * IN, CEILING + int(1.2 * IN), 4 * IN, 2 * IN)
+    _photo(slide, 3.2 * IN, CEILING + int(3.4 * IN), 3 * IN, 1 * IN)
+    ctx = save_and_ctx(prs, tmp_path, _band_profile(en_profile))
+    assert _low_recs(ctx) == []
+
+
+def test_a_few_millimetres_low_is_not_a_finding(make_prs, en_profile,
+                                                tmp_path):
+    """6mm is about the smallest gap a designer reads as off the line; under
+    that, a rule that moves every element in a column must not fire."""
+    prs = make_prs()
+    _two_column_slide(prs, CEILING, CEILING + 4 * MM)
+    ctx = save_and_ctx(prs, tmp_path, _band_profile(en_profile))
+    assert _low_recs(ctx) == []
+
+
+def test_no_band_stated_means_no_low_finding(make_prs, en_profile, tmp_path):
+    prs = make_prs()
+    _two_column_slide(prs, CEILING, CEILING + int(0.65 * IN))
+    ctx = save_and_ctx(prs, tmp_path, _band_profile(en_profile, ceiling=None))
+    assert _low_recs(ctx) == []
+
+
+def test_the_lift_puts_the_column_on_the_guide_and_keeps_its_arrangement(
+        make_prs, en_profile, tmp_path):
+    prs = make_prs()
+    slide, _pic, cards = _two_column_slide(prs, CEILING,
+                                           CEILING + int(0.65 * IN))
+    # a caption under each card, to prove the column travels together
+    caps = [_text(slide, (4.4 + i * 2.7) * IN, CEILING + int(1.8 * IN),
+                  2.2 * IN, 0.6 * IN, f"Caption {i + 1}") for i in range(3)]
+    ctx = save_and_ctx(prs, tmp_path, _band_profile(en_profile))
+    recs = [r.to_dict() for r in ma.detect(ctx)]
+    low = [r for r in recs
+           if r["issue_type"] == "margin_alignment.body_below_band"]
+    assert low and is_fixable(low[0])
+
+    gaps_before = [caps[i].top - cards[i].top for i in range(3)]
+    out = apply_fixes(ctx.deck_path.read_bytes(), recs, {low[0]["record_id"]})
+    assert out.applied == 1, [o.reason for o in out.outcomes]
+    after = Presentation(io.BytesIO(out.cleaned_bytes)).slides[0]
+    by_id = {str(s.shape_id): s for s in after.shapes}
+    assert by_id[str(cards[0].shape_id)].top == CEILING, "not on the guide"
+    for i in range(3):
+        assert (by_id[str(caps[i].shape_id)].top
+                - by_id[str(cards[i].shape_id)].top) == gaps_before[i], \
+            "the arrangement inside the column changed"
+
+
+def test_the_lift_is_never_pre_ticked(make_prs, en_profile, tmp_path):
+    """It moves every element in a column. Whether the slide should shift is
+    the designer's call, so the tick is the approval."""
+    from qc.fixer import needs_explicit_tick, tick_reason
+
+    prs = make_prs()
+    _two_column_slide(prs, CEILING, CEILING + int(0.65 * IN))
+    ctx = save_and_ctx(prs, tmp_path, _band_profile(en_profile))
+    rec = _low_recs(ctx)[0]
+    assert needs_explicit_tick(rec)
+    assert "approval" in tick_reason(rec)
+
+
+def test_a_body_frame_states_the_ceiling_even_with_no_guides(tmp_path):
+    """The presentation space, carried to this stage.
+
+    infer_grid already works out which of two things a drawn rectangle is - a
+    frame around the page has a top margin, a frame around the BODY has a line
+    where content begins - and sets body_top_emu only in the second case. This
+    module used to insist the source be "guides", so a master stating the body's
+    top as a rectangle got no ceiling at all and every slide on it passed
+    however far below the line its content began (design lead, 24/08/2026).
+
+    A rectangle gives a ceiling and no floor, and the two directions need
+    different evidence: creeping UP needs the floor to tell an eyebrow in the
+    header from body content in the strip, sitting BELOW needs only the line."""
+    from pptx.util import Emu
+
+    from qc.profile import Profile
+    from qc.pspace import ensure_presentation_space
+    from tests.test_presentation_space import (_bytes,
+                                               _deck_with_marker_on_a_layout)
+
+    raw, _notes = ensure_presentation_space(
+        _bytes(_deck_with_marker_on_a_layout()))
+    prs = Presentation(io.BytesIO(raw))
+    profile = Profile({"id": "t", "config": {"geometry": {
+        # page margins only: no band stated anywhere in the profile
+        "safe_zone_margins_emu": {"left": int(0.5 * IN), "top": int(0.45 * IN),
+                                  "right": int(0.5 * IN),
+                                  "bottom": int(0.7 * IN)},
+        "alignment": {"edge_tolerance_emu": 9144,
+                      "intent_window_emu": 228600}}}})
+
+    floor, ceiling = ma._body_band(profile, prs)
+    assert floor is None, "a rectangle cannot state the subtitle floor"
+    assert ceiling == 2 * IN, "the rectangle's top IS where the body begins"
+
+    # and it is used: one column on that line, one below it
+    slide = prs.slides.add_slide(prs.slide_layouts[BLANK])
+
+    def box(x, y, w, h):
+        return slide.shapes.add_shape(1, Emu(int(x * IN)), Emu(int(y * IN)),
+                                      Emu(int(w * IN)), Emu(int(h * IN)))
+
+    box(0.6, 2.0, 3.0, 3.0)
+    for i in range(3):
+        box(4.0 + i * 2.7, 2.65, 2.4, 1.0)
+    ctx = save_and_ctx(prs, tmp_path, profile)
+    low = [r.to_dict() for r in ma.detect(ctx)
+           if r.issue_type == "margin_alignment.body_below_band"]
+    assert len(low) == 1
+    assert int(low[0]["new_value"]) == 2 * IN
+
+
+def test_the_page_top_margin_is_never_read_as_the_body_top(tmp_path,
+                                                           en_profile):
+    """The mistake this guards: the safe-zone top is where the PAGE begins, and
+    on these masters the body begins well below it with the header between. Used
+    as a ceiling it fires on every normal slide in the deck."""
+    prs = Presentation()
+    profile = _band_profile(en_profile, ceiling=None)
+    slide = prs.slides.add_slide(prs.slide_layouts[BLANK])
+    _photo(slide, 0.6 * IN, 2.4 * IN)          # well below any page margin
+    _photo(slide, 4.0 * IN, 2.4 * IN)
+    ctx = save_and_ctx(prs, tmp_path, profile)
+    assert _low_recs(ctx) == [], \
+        "the page margin was read as the line the body starts on"

@@ -17,9 +17,19 @@ _RULE_LABEL = {
                                           "declare the same OOXML archetype."),
     "fallback": ("fell back", "Neither the name nor the archetype matched. "
                               "Content may be orphaned; check these slides."),
+    "reviewed": ("placed by review",
+                 "Neither the name nor the archetype matched, so the slide and "
+                 "the master's layouts were looked at and this one was chosen "
+                 "for the shape of the content. Confirm it in the review "
+                 "below."),
+    "reviewed (uncertain)": (
+        "placed by review, unsure",
+        "Chosen by looking, but two layouts would have served about equally "
+        "well or the structure had no real counterpart. Open these first."),
     "none": ("no target", "The master defines no layout that could be used."),
 }
-_RULE_ORDER = ("name", "archetype", "fallback", "none")
+_RULE_ORDER = ("name", "archetype", "reviewed", "reviewed (uncertain)",
+               "fallback", "none")
 
 
 def _warn(message: str) -> str:
@@ -320,6 +330,18 @@ def render_format_result(*, deck_name: str, profile_name: str, job_id: str,
     if counts.get("failed"):
         chips.append(f'<span class="fchip"><b>{counts["failed"]}</b> failed</span>')
 
+    reviewed_note = ""
+    unsure = counts.get("reviewed (uncertain)", 0)
+    if counts.get("reviewed") or unsure:
+        reviewed_note = _warn(
+            f"{counts.get('reviewed', 0) + unsure} slide(s) had no layout "
+            f"matching by name or archetype and were placed by looking at the "
+            f"slide against the master's layouts, rather than falling back to "
+            f"a default. The choice is a judgment, not a fact the file states, "
+            f"so the before/after review below is where it gets confirmed"
+            + (f"; {unsure} of them are marked unsure and are the ones to open "
+               f"first." if unsure else "."))
+
     fallback_note = ""
     if counts.get("fallback"):
         fallback_note = _warn(
@@ -371,7 +393,7 @@ and the original deleted.</p>
 <p class="note">The review shows the master's layouts before and after, and the
 deck slide by slide, with an Undo on every change. Look before you download:
 undoing after the file has gone out means doing it twice.</p>
-{fallback_note}{failed_note}{_masters_note(masters, stragglers or [], plans)}{restored_note}
+{reviewed_note}{fallback_note}{failed_note}{_masters_note(masters, stragglers or [], plans)}{restored_note}
 <div class="kpis">{''.join(chips)}</div>
 {space_note}
 {_content_section(content_changes or [], job_id, restored or [], restore_error,

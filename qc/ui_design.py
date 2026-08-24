@@ -14,11 +14,16 @@ time; a single 26-slide scroll is a page you lose your place in. Previous and
 Next move one slide, the strip jumps anywhere, and the slide you were on
 survives applying a fix.
 
-BOTH SETS OF FINDINGS ARE HERE. The design pass owns colour, contrast, fit,
-overlap and the frame; qc.modules owns fonts, margins, alignment, page
-furniture. A designer looking at slide 7 wants slide 7's problems, not the ones
-that happen to belong to whichever pass found them - so the audit's own records
-for the slide are listed underneath, read-only, and say where their fixes live.
+BOTH SETS OF FINDINGS ARE HERE, AND BOTH ARE ACTIONABLE. The design pass owns
+colour, contrast, fit, overlap and the frame; qc.modules owns fonts, margins,
+alignment, page furniture. A designer looking at slide 7 wants slide 7's
+problems, not the ones that happen to belong to whichever pass found them - so
+the audit's own records for the slide are listed underneath WITH THEIR TICK
+BOXES. They were read-only for one release, on the argument that the report
+already had that control; the objection to that was the right one, because it is
+not two controls, it is one control put where the problem is visible (design
+lead, 24/08/2026). The engine underneath is still qc.fixer, ticked exactly as
+the report ticks it.
 
 Every card is a choice and none has a default. A pre-selected remedy is the tool
 deciding and asking for a rubber stamp, and the reason this page exists rather
@@ -27,9 +32,18 @@ make: recoloring the text and recoloring the panel are both correct fixes for
 grey-on-grey, and only the person looking at the slide knows which the slide
 wants. "Leave it" is on every card, is a real answer, and is recorded as one.
 
+AND A DESIGNER MAY HAND THE WHOLE THING OVER. "Let the tool decide" is not that
+default coming back in through the side door. A default is the tool answering a
+question nobody asked and hoping for a rubber stamp; this is one deliberate
+action, taken once, by the person who chose to take it, and every decision it
+makes lands in the same list as a hand-picked one with the same Undo beside it.
+It declines the calls the checks have already said are not the tool's
+(qc.design.UNDECIDABLE_KINDS) and says how many it left.
+
 Rendering only; route logic lives in qc/web.py.
 """
 
+import re
 from pathlib import Path
 
 from .ui import MODULE_LABELS, esc, _shell, issue_label
@@ -74,7 +88,32 @@ _STYLE = """
 .dsplit { display:grid; grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);
   gap:1.1rem; align-items:start }
 @media (max-width:1100px) { .dsplit { grid-template-columns:1fr } }
-.dshot { position:sticky; top:0.6rem }
+/* ONE sticky bar on this page, and the slide parked below it.
+   .actionbar is sticky at top:0 for the report, and this page has three of
+   them - the tabs, the pager above the split and the pager below it. All three
+   pinned to the same 3.4rem, so they painted over each other AND over the top
+   of the sticky slide, which is the strip of the render that went missing as
+   soon as you scrolled (design lead, 24/08/2026). The tabs and the closing
+   pager scroll away like ordinary content; the pager that carries Previous and
+   Next stays, because that is the one a designer reaches for mid-slide.
+   --dbar-h is its measured height (see _STICKY_JS); the fallback is only for
+   the instant before that runs, and for no-JS. */
+.dtabs, .dfoot { position:static }
+.dbar { z-index:12 }
+/* The pager pins its border box 0.4rem down (its own margin), so clearing
+   --dbar-h + 1rem leaves about 0.6rem of air between the bar and the render
+   instead of the overlap it had. */
+.dshot { position:sticky; top:calc(var(--dbar-h, 4.4rem) + 1rem);
+  /* A render taller than what is left of the window scrolls inside its own box
+     rather than running off the bottom of it. Scroll chaining is left alone:
+     when the slide does fit, this box never scrolls, and trapping the wheel
+     over the picture would be worse than the problem. */
+  max-height:calc(100vh - var(--dbar-h, 4.4rem) - 2rem); overflow:auto }
+@media (max-width:1100px) {
+  /* one column: the slide is above its findings, not beside them, so pinning
+     it would cover them */
+  .dshot { position:static; max-height:none; overflow:visible }
+}
 .dframe { position:relative; border:1px solid var(--line-soft); border-radius:10px;
   overflow:hidden; background:#fff }
 .dframe img { display:block; width:100%; height:auto }
@@ -91,6 +130,17 @@ _STYLE = """
 .dcard h3 { margin:0.25rem 0 0.3rem; font-size:1rem }
 .dcard fieldset { border:1px solid var(--line-soft); border-radius:10px;
   padding:0.4rem 0.85rem 0.7rem; margin:0.7rem 0 0 }
+/* what the option would produce, beside the option. The contrast chip carries
+   letters because a pair of swatches does not answer "can this be read". */
+.rprev { flex:0 0 auto; align-self:center; display:inline-flex;
+  align-items:center; justify-content:center; min-width:2.2rem; height:1.6rem;
+  padding:0 0.35rem; border-radius:4px; border:1px solid rgba(0,37,40,0.25);
+  font-size:0.82rem; font-weight:700; line-height:1 }
+.rchips { flex:0 0 auto; align-self:center; display:inline-flex;
+  align-items:center; gap:0.25rem }
+.rchips i { display:block; width:1.15rem; height:1.15rem; border-radius:3px;
+  border:1px solid rgba(0,37,40,0.25) }
+.rchips u { font-size:0.7rem; color:var(--slate); text-decoration:none }
 .dpin { display:inline-block; min-width:1.25rem; text-align:center;
   border-radius:4px; font-size:11px; font-weight:700; padding:1px 4px;
   background:var(--orange); color:var(--teal); margin-right:0.35rem }
@@ -111,8 +161,101 @@ _STYLE = """
 .done .grow { flex:1 }
 .auditrow { display:flex; gap:0.6rem; align-items:baseline; padding:0.4rem 0;
   border-top:1px solid var(--line-soft); font-size:0.86rem }
+.auditrow:has(input:checked) { background:var(--hover) }
+.auditrow .afix { flex:0 0 6.5rem; text-align:left }
+.auditrow .nofix { font-size:0.74rem; opacity:0.7 }
+.autocard { border-color:var(--teal) }
+.autohold { display:flex; gap:0.5rem; align-items:baseline; margin:0.6rem 0 0;
+  font-size:0.84rem; color:var(--slate-text) }
+/* answered on the card, settled on the render: the box for a finding that has
+   been decided comes off the picture at once, so the slide stops advertising
+   problems the designer has already dealt with. */
+.dcard.answered { border-color:var(--teal); background:var(--hover) }
+.dframe .hit { transition:opacity 0.18s ease, border-color 0.18s ease }
+.dframe .hit.settled { opacity:0.12 }
+@media (prefers-reduced-motion: reduce) { .dframe .hit { transition:none } }
 .hidden { display:none !important }
 </style>"""
+
+_APPLY_JS = """
+<script>
+/* Answering a card changes the picture, and the round trip is not instant.
+   Re-auditing the deck and re-rendering the slide takes seconds (PowerPoint
+   startup alone is most of it), and for that whole time the page used to sit
+   there showing the boxes for the very problems being fixed - so a designer
+   could not tell whether the click had registered (design lead, 24/08/2026).
+   Two things happen the moment a remedy is picked, both of them free:
+     - the box comes off the render, because that finding is being dealt with;
+     - the card says so.
+   "Leave it" takes the box off too. The finding is answered either way; what
+   differs is what happens to the deck, not whether it is still an open
+   question on this slide. */
+(function () {
+  const frame = document.querySelector('.dframe');
+  const box = id => frame && id
+    ? frame.querySelector('.hit[data-finding="' + id + '"]') : null;
+
+  function mark(card, on) {
+    const id = card.getAttribute('data-finding');
+    card.classList.toggle('answered', on);
+    const hit = box(id);
+    if (hit) hit.classList.toggle('settled', on);
+  }
+
+  document.querySelectorAll('.dcard[data-finding]').forEach(card => {
+    card.querySelectorAll('input[type="radio"]').forEach(radio => {
+      radio.addEventListener('change', () => mark(card, radio.checked));
+    });
+  });
+
+  /* the wait itself, said out loud */
+  const form = document.getElementById('dform');
+  if (form) form.addEventListener('submit', () => {
+    const n = form.querySelectorAll('input[type="radio"]:checked').length;
+    if (window.showBusy) showBusy(
+      'Applying ' + n + ' choice' + (n === 1 ? '' : 's'),
+      'Changing the deck, re-auditing it and re-rendering this slide. The '
+      + 'boxes that have gone are the ones being dealt with.');
+  });
+  document.querySelectorAll('form[action$="/auto"]').forEach(f =>
+    f.addEventListener('submit', ev => {
+      const scope = (ev.submitter && ev.submitter.value) === 'deck'
+        ? 'the whole deck' : 'this slide';
+      if (window.showBusy) showBusy('Deciding ' + scope,
+        'Applying the audit fixes first, then answering each design card. '
+        + 'Everything it decides gets an Undo.');
+    }));
+  document.querySelectorAll('form[action$="/fix"]').forEach(f =>
+    f.addEventListener('submit', () => {
+      const n = f.querySelectorAll('input[name="record_ids"]:checked').length;
+      if (window.showBusy) showBusy(
+        'Applying ' + n + (n === 1 ? ' fix' : ' fixes'),
+        'Then re-auditing the deck to check what the fix actually did.');
+    }));
+  document.querySelectorAll('form[action$="/undo"]').forEach(f =>
+    f.addEventListener('submit', () => {
+      if (window.showBusy) showBusy('Putting it back',
+        'Replaying the state stored before the change, then re-rendering.');
+    }));
+})();
+</script>"""
+
+_STICKY_JS = """
+<script>
+/* How far down the sticky slide has to start: the pager's real height, not a
+   guess at it. The bar wraps on a narrow window and grows a line, and a
+   hard-coded offset then cuts the top off the render again - which is the bug
+   this is here for. Measured on load and on every resize of the bar itself. */
+(function () {
+  const bar = document.querySelector('.actionbar.dbar');
+  if (!bar) return;
+  const set = () => document.documentElement.style.setProperty(
+    '--dbar-h', bar.getBoundingClientRect().height.toFixed(1) + 'px');
+  set();
+  if (window.ResizeObserver) new ResizeObserver(set).observe(bar);
+  window.addEventListener('resize', set);
+})();
+</script>"""
 
 _FILTER_JS = """
 <script>
@@ -211,12 +354,69 @@ def _evidence(finding) -> str:
     return f'<div class="ev">{"".join(bits)}</div>'
 
 
+_HEX6 = re.compile(r"^[0-9A-Fa-f]{6}$")
+
+
+def _remedy_preview(finding, option) -> str:
+    """What the slide gets if this option is picked, shown as the colour rather
+    than spelled as a hex.
+
+    "#464646" is not a colour to the person reading it, it is six characters
+    they have to imagine, and this whole page exists because the decision is
+    made by LOOKING. The evidence row above the options already shows what is
+    there now; without this, the row proposing the change was the only one on
+    the card with no colour on it (design lead, 24/08/2026).
+
+    A contrast remedy shows the PAIR, not a swatch. "Is this readable" is never
+    a question about one colour: the remedy moves either the text or the ground
+    and leaves the other where it is, so the honest preview is the two of them
+    together with letters in it. A palette remedy shows the swap, old beside
+    new, because what is being judged there is how far the colour travels.
+    """
+    params = option.params or {}
+    ev = finding.evidence or {}
+    new = params.get("hex")
+    if option.op == "set_theme_color":
+        # A theme reference has no hex of its own; what it resolves to today is
+        # the anchor the finding matched, and "same colour on screen today" is
+        # exactly what the note promises.
+        new = ev.get("anchor")
+    if not new or not _HEX6.match(str(new)):
+        return ""
+    new = str(new)
+
+    if finding.kind == "contrast":
+        ground, text = ev.get("ground", "FFFFFF"), ev.get("text", "000000")
+        if option.remedy_id == "ground":
+            ground = new
+        else:
+            text = new
+        if not (_HEX6.match(str(ground)) and _HEX6.match(str(text))):
+            return ""
+        return (f'<span class="rprev" aria-hidden="true" '
+                f'style="background:#{esc(ground)};color:#{esc(text)}">Aa</span>')
+
+    was = str(ev.get("hex") or "")
+    if _HEX6.match(was) and was.upper() != new.upper():
+        return (f'<span class="rchips" aria-hidden="true">'
+                f'<i style="background:#{esc(was)}"></i><u>&rarr;</u>'
+                f'<i style="background:#{esc(new)}"></i></span>')
+    return (f'<span class="rchips" aria-hidden="true">'
+            f'<i style="background:#{esc(new)}"></i></span>')
+
+
 def _options(finding) -> str:
+    """The ways out, each with the colour it would produce.
+
+    The preview is aria-hidden: the label beside it already carries the palette
+    name and the hex, so a screen reader gets the answer in words and does not
+    also get an unlabelled box read out as nothing."""
     if not finding.options:
         return ""
     rows = "".join(
         f'<label class="radio-card"><input type="radio" '
         f'name="pick_{esc(finding.finding_id)}" value="{esc(o.remedy_id)}">'
+        f'{_remedy_preview(finding, o)}'
         f'<span><b>{esc(o.label)}</b><small>{esc(o.note)}</small></span></label>'
         for o in finding.options)
     return f'<fieldset><legend>Pick one</legend>{rows}</fieldset>'
@@ -229,7 +429,8 @@ def _finding_card(finding, pin: int | None = None, scope: str = "") -> str:
              if pin else "")
     return f"""
 <div class="card dcard" data-sev="{esc(finding.severity)}"
-     data-kind="{esc(finding.kind)}">
+     data-kind="{esc(finding.kind)}"
+     data-finding="{esc(finding.finding_id)}">
   <div class="difflabels">{_sev_pill(finding.severity)}
     <span class="note">{esc(_KIND_LABEL.get(finding.kind, finding.kind))}
     &middot; {esc(scope or _slides_note(finding.slides))}{spread}</span></div>
@@ -240,34 +441,182 @@ def _finding_card(finding, pin: int | None = None, scope: str = "") -> str:
 </div>"""
 
 
-def _audit_rows(records: list) -> str:
-    """The audit's own findings for this slide, read-only.
+def _audit_rows(job_id: str, records: list, current: int = 0,
+                can_fix: bool = False, promoted: set | None = None) -> str:
+    """The audit's own findings for this slide, each with its fix beside it.
 
-    Read-only and saying so. Their fixes are ticked on the audit report, which
-    applies them as a batch and re-audits; duplicating that control here would
-    give a designer two buttons for one action with different consequences."""
+    The SAME tick as the audit report, on purpose and in every detail: the same
+    qc.fixer.is_fixable decides whether a row gets one, the same
+    qc.fixer.tick_reason decides whether it may be pre-ticked, and the same
+    engine applies it. Two pages showing one record in two different states is
+    the failure this shares its code to avoid.
+
+    Rows with no tick say why in the last column, because "no box here" and
+    "nothing wrong here" look identical otherwise."""
+    from .fixer import is_fixable, tick_reason
+
     if not records:
         return ""
-    rows = []
+    promoted = promoted or set()
+    rows, fixable, preticked = [], 0, 0
     for r in sorted(records, key=lambda r: r["severity"]):
         module = MODULE_LABELS.get(r["module"], r["module"])
+        if r["action"] == "changed":
+            fix_cell = '<span class="pill changed">fixed</span>'
+        elif not can_fix:
+            # The deck is gone from memory, not the fix. Saying "no automatic
+            # fix" here would be a lie the banner above then contradicts.
+            fix_cell = '<span class="note nofix">deck not in memory</span>'
+        elif is_fixable(r):
+            fixable += 1
+            # Pre-ticked = the tool is confident it is wrong AND has a safe fix:
+            # deterministic changes, triage-promoted types, and errors (by
+            # taxonomy, error means confidently wrong). Arabic font
+            # substitutions and whole-slide moves are never pre-selected - the
+            # tick is the designer's approval, and tick_reason says so.
+            hold = tick_reason(r)
+            pre = (hold is None
+                   and (r["confidence"] == "deterministic"
+                        or r["issue_type"] in promoted
+                        or r["severity"] == "error"))
+            preticked += 1 if pre else 0
+            why = (hold if hold
+                   else "deterministic fix" if r["confidence"] == "deterministic"
+                   else "confidently wrong (error) with a safe fix"
+                   if r["severity"] == "error"
+                   else "validated by designer triage" if pre
+                   else "suggestion: ticking it is your approval")
+            fix_cell = (f'<input type="checkbox" name="record_ids" '
+                        f'value="{esc(r["record_id"])}"'
+                        f'{" checked" if pre else ""} title="{esc(why)}" '
+                        f'aria-label="Apply this fix">')
+        elif r["arabic_flag"]:
+            fix_cell = '<span class="note nofix">Arabic, by hand</span>'
+        else:
+            fix_cell = '<span class="note nofix">no automatic fix</span>'
         rows.append(
-            f'<div class="auditrow" data-sev="{esc(r["severity"])}" '
-            f'data-kind="{esc(r["module"])}">{_sev_pill(r["severity"])}'
+            f'<label class="auditrow" data-sev="{esc(r["severity"])}" '
+            f'data-kind="{esc(r["module"])}">'
+            f'<span class="afix">{fix_cell}</span>{_sev_pill(r["severity"])}'
             f'<span class="grow" style="flex:1"><b>{esc(issue_label(r["issue_type"]))}</b>'
             f'<div class="note">{esc(r["message"])}</div></span>'
             f'<span class="note" style="white-space:nowrap">{esc(module)}</span>'
-            f'</div>')
-    return f"""
+            f'</label>')
+
+    if fixable:
+        foot = (f'<div class="actions"><button class="btn primary" '
+                f'type="submit">Apply the ticked fixes</button>'
+                f'<span class="note" style="margin-left:0.7rem">'
+                f'{fixable} of these can be fixed here, {preticked} ticked for '
+                f'you. The deck is re-audited afterwards and you come back to '
+                f'this slide.</span></div>')
+    elif not can_fix:
+        foot = ('<p class="note">Nothing can be applied from here while the deck '
+                'is out of memory. Re-upload it and the ticks come back.</p>')
+    else:
+        foot = ('<p class="note">None of these has an automatic fix: they are '
+                'either Arabic content, which is never re-typed without a '
+                'designer, or checks that flag without computing a target.</p>')
+
+    body = f"""
 <div class="card">
   <div class="tag">From the audit</div>
   <h3 style="margin:0.2rem 0 0.1rem">Also on this slide</h3>
   <p class="note">Fonts, margins, alignment and page furniture, found by the
-  audit's own checks. Listed here so one slide's problems are in one place;
-  these are fixed by ticking them on the audit report, which applies them
-  together and re-audits.</p>
+  audit's own checks. Listed here so one slide's problems are in one place, and
+  fixable here for the same reason: the tick is the audit report's own, applied
+  by the same engine, so a row ticked here and a row ticked there do the same
+  thing.</p>
   {''.join(rows)}
+  {foot}
 </div>"""
+    if not fixable:
+        return body
+    # `n` carries the slide back, so applying a fix ticked on slide 7 answers on
+    # slide 7 rather than on slide 1.
+    return (f'<form method="post" action="/design/{esc(job_id)}/fix">'
+            f'<input type="hidden" name="n" value="{int(current)}">'
+            f'{body}</form>')
+
+
+def _auto_card(job_id: str, current: int, view: str, plan: dict,
+               can_fix: bool = True) -> str:
+    """Hand the decisions to the tool, in one deliberate action.
+
+    Every number on it comes from the same function the route uses to select the
+    work (qc.web._auto_targets), so the count on the button is the count that
+    happens - a button that says 9 and does 14 is the end of a designer trusting
+    this page.
+
+    Two scopes and no third. "This slide" is the designer who has looked at the
+    slide and agrees with what the tool is proposing there; "the whole deck" is
+    the designer who wants a first pass to correct rather than a blank one to
+    build. A middle option (this section, these five slides) would be a fourth
+    way of saying the same thing and a fourth thing to explain.
+    """
+    if not plan or not can_fix:
+        return ""
+    slide, deck = plan.get("slide") or {}, plan.get("deck") or {}
+    here = deck if view == "deck" else slide
+    total_deck = deck.get("fixes", 0) + deck.get("picks", 0)
+    total_slide = slide.get("fixes", 0) + slide.get("picks", 0)
+    if not (total_deck or deck.get("held") or deck.get("left")):
+        return ""
+
+    def button(key, label, n, primary):
+        cls = "primary" if primary else "ghost"
+        dis = " disabled" if not n else ""
+        return (f'<button class="btn {cls}" type="submit" name="scope" '
+                f'value="{key}"{dis}>{label} ({n})</button>')
+
+    buttons = ""
+    if view != "deck":
+        buttons += button("slide", f"Decide slide {current + 1}",
+                          total_slide, True)
+    buttons += button("deck", "Decide the whole deck", total_deck,
+                      view == "deck")
+
+    held = here.get("held", 0)
+    hold_box = ""
+    if held:
+        hold_box = (
+            f'<label class="autohold"><input type="checkbox" '
+            f'name="include_holds" value="1"> Include the {held} fix'
+            f'{"es" if held != 1 else ""} that ask for your explicit approval '
+            f'&mdash; Arabic font substitution, which changes how the script '
+            f'shapes, and moves that shift every element on a slide together. '
+            f'Left out unless you say so.</label>')
+
+    left = here.get("left", 0)
+    left_note = ""
+    if left:
+        # The reasons come from the checks themselves (qc.design.auto_skip_reason)
+        # rather than being restated here, so a check that changes its mind about
+        # what it can answer does not leave this paragraph lying.
+        why = here.get("reasons") or []
+        left_note = (f'<p class="note">{left} finding'
+                     f'{"s" if left != 1 else ""} here will be left for you '
+                     f'either way'
+                     + (": " + esc("; and ".join(why)) if why else "") + '.</p>')
+
+    return f"""
+<form method="post" action="/design/{esc(job_id)}/auto" class="card autocard">
+<input type="hidden" name="n" value="{int(current)}">
+  <div class="tag">Hand it over</div>
+  <h3 style="margin:0.2rem 0 0.1rem">Let the tool decide</h3>
+  <p class="note">Applies the audit's own fixes, then takes the first option on
+  each design card &mdash; the one each check already puts first as its
+  recommendation, and explains in the note beside it. The audit fixes go first
+  so the design calls are made about the deck as they leave it, not about the
+  deck as it stands now.</p>
+  <p class="note">Nothing here is one-way. Every decision it makes is listed
+  under &ldquo;what you have decided&rdquo; with an Undo beside it, exactly as
+  if you had picked it yourself, so this is a first pass you correct rather than
+  a result you have to accept.</p>
+  {left_note}
+  {hold_box}
+  <div class="actions">{buttons}</div>
+</form>"""
 
 
 def _filters(counts: dict, kinds: list) -> str:
@@ -315,7 +664,11 @@ def _strip(job_id: str, current: int, per_slide: dict, total: int) -> str:
     return f'<div class="strip no-print">{"".join(bits)}</div>'
 
 
-def _pager(job_id: str, current: int, total: int, counted: int) -> str:
+def _pager(job_id: str, current: int, total: int, counted: int,
+           sticky: bool = True) -> str:
+    """Where you are and how to move. The one above the split stays put while
+    the slide is read; the one below it is the end of the list and scrolls away
+    (two pinned copies of the same bar is two answers to "where am I")."""
     def link(target, label, on):
         if not on:
             return f'<span class="btn ghost" aria-disabled="true">{label}</span>'
@@ -325,7 +678,8 @@ def _pager(job_id: str, current: int, total: int, counted: int) -> str:
     where = (f'<span class="note"><b>Slide {current + 1}</b> of {total}'
              + (f" &middot; {counted} to decide here" if counted else
                 " &middot; nothing to decide here") + '</span>')
-    return (f'<div class="actionbar no-print">{where}<span class="grow"></span>'
+    return (f'<div class="actionbar no-print {"dbar" if sticky else "dfoot"}">'
+            f'{where}<span class="grow"></span>'
             f'{link(current - 1, "&larr; Previous", current > 0)}'
             f'{link(current + 1, "Next &rarr;", current + 1 < total)}</div>')
 
@@ -336,9 +690,13 @@ def _shot(job_id: str, index: int, rects: list, error: str | None) -> str:
                 f'<p class="note">No render: {esc(error)} Everything on the '
                 f'right is read from the deck itself, not from the picture.</p>'
                 f'</div>')
+    # data-finding ties a box to its card, so picking a remedy can take the box
+    # off the picture the moment it is picked rather than after the round trip.
     boxes = "".join(
         f'<div class="hit {esc(r["severity"])}" data-sev="{esc(r["severity"])}" '
-        f'data-kind="{esc(r["kind"])}" title="{esc(r["label"])}" '
+        f'data-kind="{esc(r["kind"])}" '
+        f'data-finding="{esc(r.get("finding_id") or "")}" '
+        f'title="{esc(r["label"])}" '
         f'style="left:{r["x"] * 100:.2f}%;top:{r["y"] * 100:.2f}%;'
         f'width:{r["w"] * 100:.2f}%;height:{r["h"] * 100:.2f}%">'
         + (f'<b>{r["pin"]}</b>' if r.get("pin") else "") + '</div>'
@@ -355,7 +713,11 @@ def _tabs(job_id: str, view: str, deck_n: int, current: int) -> str:
         on = " primary" if view == key else " ghost"
         return f'<a class="btn{on}" href="{href}">{label}</a>'
 
-    return (f'<div class="actionbar no-print">'
+    # Unpinned on the slide view, where the pager below it is the bar that
+    # stays; the deck view has no pager, so there it keeps .actionbar's own
+    # stickiness rather than losing the only fixed thing on the page.
+    cls = "actionbar no-print" + ("" if view == "deck" else " dtabs")
+    return (f'<div class="{cls}">'
             + tab("slide", "Slide by slide", f"/design/{esc(job_id)}?n={current}")
             + tab("deck", f"Deck-wide{f' ({deck_n})' if deck_n else ''}",
                   f"/design/{esc(job_id)}?view=deck")
@@ -441,12 +803,15 @@ def render_design(*, deck_name: str, profile_name: str, job_id: str,
                   rects: list | None = None, per_slide: dict | None = None,
                   banner: str = "", error: str | None = None,
                   render_error: str | None = None,
-                  has_deck: bool = True) -> str:
+                  has_deck: bool = True, can_fix: bool = False,
+                  promoted: set | None = None,
+                  auto: dict | None = None) -> str:
     findings = findings or []
     deck_findings = deck_findings or []
     applied = applied or []
     audit_records = audit_records or []
     rects = rects or []
+    auto = auto or {}
 
     head = f"""
 <span class="kicker">Design QC &middot; {esc(profile_name)}</span>
@@ -467,7 +832,8 @@ def render_design(*, deck_name: str, profile_name: str, job_id: str,
     tabs = _tabs(job_id, view, len(deck_findings), current)
 
     if view == "deck":
-        body = _applied_block(job_id, applied)
+        body = (_auto_card(job_id, current, "deck", auto, can_fix)
+                + _applied_block(job_id, applied))
         if deck_findings:
             inner = ('<p class="sub">Decisions that are not about one slide. A '
                      'color spelled two ways across forty shapes is one '
@@ -490,7 +856,7 @@ def render_design(*, deck_name: str, profile_name: str, job_id: str,
                      '<h2>Nothing deck-wide</h2><p>Every open decision belongs '
                      'to a single slide. Use the slide view.</p></div>')
         return _shell(f"Design QC: {deck_name}",
-                      head + tabs + notes + body + _STYLE)
+                      head + tabs + notes + body + _STYLE + _APPLY_JS)
 
     # ---- slide view
     counts = {"error": 0, "warning": 0, "info": 0}
@@ -525,16 +891,19 @@ def render_design(*, deck_name: str, profile_name: str, job_id: str,
                  'nothing overflowing its box, nothing hidden.</p></div>')
 
     right = (_filters(counts, sorted(kinds.items(), key=lambda kv: -kv[1]))
+             + _auto_card(job_id, current, "slide", auto, can_fix)
              + _apply_form(job_id, current, cards, bool(findings))
              + _applied_block(job_id, applied, current)
-             + _audit_rows(audit_records))
+             + _audit_rows(job_id, audit_records, current, can_fix, promoted))
 
     body = (_pager(job_id, current, total_slides, len(findings))
             + _strip(job_id, current, per_slide or {}, total_slides)
             + f'<div class="dsplit"><div class="dshot">'
             + _shot(job_id, current, rects, render_error)
             + f'</div><div class="dlist">{right}</div></div>'
-            + _pager(job_id, current, total_slides, len(findings)))
+            + _pager(job_id, current, total_slides, len(findings),
+                     sticky=False))
 
     return _shell(f"Design QC: {deck_name} slide {current + 1}",
-                  head + tabs + notes + body + _STYLE + _FILTER_JS)
+                  head + tabs + notes + body + _STYLE + _STICKY_JS + _APPLY_JS
+                  + _FILTER_JS)

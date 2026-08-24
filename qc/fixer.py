@@ -45,7 +45,11 @@ FIXABLE_ISSUES = ("font.family_out_of_set", "master_slide.placeholder_geometry_o
                   "margin_alignment.content_overflow",
                   "font.cs_typeface_missing",
                   "margin_alignment.recurring_off_position",
-                  "margin_alignment.body_band_intrusion")
+                  "margin_alignment.body_band_intrusion",
+                  "margin_alignment.body_below_band",
+                  "color_palette.off_palette_rgb",
+                  "margin_alignment.space_edge_misaligned",
+                  "margin_alignment.component_edge_misaligned")
 
 # Deliberately absent from the list above, and to stay absent:
 # margin_alignment.heading_past_margin. A title or standfirst running past a
@@ -65,7 +69,10 @@ _POSITIONAL_ISSUES = {"margin_alignment.edge_misaligned",
                       "margin_alignment.cluster_rhythm",
                       "margin_alignment.content_overflow",
                       "margin_alignment.recurring_off_position",
-                      "margin_alignment.body_band_intrusion"}
+                      "margin_alignment.body_band_intrusion",
+                      "margin_alignment.body_below_band",
+                      "margin_alignment.space_edge_misaligned",
+                      "margin_alignment.component_edge_misaligned"}
 
 # Heuristic detections are still tickable (a designer's tick IS per-change
 # validation) but carry lower confidence than the default floor.
@@ -77,12 +84,29 @@ _MIN_CONFIDENCE = {
     # deterministic = clone-master repoint (visual no-op); medium = PowerPoint
     # re-applies the layout via COM behind designer approval
     "master_slide.foreign_master": ("deterministic", "high", "medium"),
+    # medium = every column on the slide starts below the guide, so the guide
+    # being the intended line is inference rather than evidence. Still tickable:
+    # this move is never pre-selected either way (_BLOCK_MOVE_IS_APPROVAL).
+    "margin_alignment.body_below_band": ("deterministic", "high", "medium"),
+    # medium = the nearest palette colour is ambiguous (deltaE 5-10). Tickable,
+    # because a designer's tick IS the per-change validation, and never
+    # pre-ticked (_COLOR_TICK_IS_APPROVAL).
+    "color_palette.off_palette_rgb": ("deterministic", "high", "medium"),
+    # medium by construction: a component review is a judgment Claude made
+    # about the design, re-verified against the geometry but never promoted
+    # to deterministic. Tickable, never pre-ticked.
+    "margin_alignment.component_edge_misaligned": ("high", "medium"),
 }
 
 
-# Geometry-only fixes are script-neutral: moving or resizing a shape never
-# opens its text, so a misaligned card is fixable in Arabic exactly as in
-# English. Everything that edits runs or text keeps the Arabic guard
+# Recolouring is script-neutral: a fill or a run colour changes no glyph and no
+# shaping, so an Arabic deck's palette is as fixable as an English one. The
+# Arabic guard is there for text that gets re-typed or re-fonted.
+_ARABIC_SAFE_RECOLOR = {"color_palette.off_palette_rgb"}
+
+# Geometry-only fixes are script-neutral for the same reason: moving or resizing
+# a shape never opens its text, so a misaligned card is fixable in Arabic exactly
+# as in English. Everything that edits runs or text keeps the Arabic guard
 # (guard relaxation approved 12/08/2026 after an 89-slide Arabic deck came
 # back 72% blocked with 120 computed geometry targets refused).
 _ARABIC_SAFE_GEOMETRY = {
@@ -93,6 +117,9 @@ _ARABIC_SAFE_GEOMETRY = {
     "margin_alignment.content_overflow",
     "margin_alignment.recurring_off_position",
     "margin_alignment.body_band_intrusion",
+    "margin_alignment.body_below_band",
+    "margin_alignment.space_edge_misaligned",
+    "margin_alignment.component_edge_misaligned",
     "shape_size.size_mismatch",
     "master_slide.placeholder_geometry_off",
 }
@@ -113,15 +140,40 @@ _ARABIC_TICK_IS_APPROVAL = {
 # 20/08/2026).
 _BLOCK_MOVE_IS_APPROVAL = {
     "margin_alignment.body_band_intrusion",
+    "margin_alignment.body_below_band",
 }
+
+
+# A colour swap the eye can see. Inside the auto-replace band (deltaE <= 5) a
+# palette snap is invisible on screen and pre-ticking it is safe; past that the
+# colour visibly changes, and whether this deck's off-palette colour is a
+# mistake or a decision is not the tool's call - brand and client colours sit
+# off-palette on purpose. Fixable either way; pre-ticked only when invisible
+# (design lead, 24/08/2026).
+_COLOR_TICK_IS_APPROVAL = {"color_palette.off_palette_rgb"}
+
+
+# Anything a language model judged. The geometry is re-verified by code before
+# the record exists, so the NUMBERS are the tool's; what came from Claude is the
+# claim that these shapes are one component and that this line is the intended
+# one. That is a design judgment, and a design judgment is the designer's to
+# confirm - so it is offered, never pre-selected, whatever its confidence.
+_MODEL_JUDGED = {"margin_alignment.component_edge_misaligned"}
 
 
 def tick_reason(record: dict) -> str | None:
     """Why this fix is never pre-selected, in the words the UI shows, or None
     when it may be pre-ticked on the usual evidence."""
+    if record["issue_type"] in _MODEL_JUDGED:
+        return ("Claude grouped these shapes and chose the line; the geometry "
+                "was checked but the judgment is yours to confirm")
     if record["issue_type"] in _BLOCK_MOVE_IS_APPROVAL:
         return ("moves every element on the slide down together: ticking it "
                 "is your approval")
+    if (record["issue_type"] in _COLOR_TICK_IS_APPROVAL
+            and record["confidence"] != "high"):
+        return ("the nearest palette colour is a visible change, not a snap: "
+                "ticking it is your approval")
     if record["arabic_flag"] \
             and record["issue_type"] in _ARABIC_TICK_IS_APPROVAL:
         return "Arabic font substitution: ticking it is your explicit approval"
@@ -145,6 +197,7 @@ def is_fixable(record: dict) -> bool:
         return False
     if record["arabic_flag"] \
             and record["issue_type"] not in _ARABIC_SAFE_GEOMETRY \
+            and record["issue_type"] not in _ARABIC_SAFE_RECOLOR \
             and record["issue_type"] not in _ARABIC_TICK_IS_APPROVAL:
         return False
     if record["action"] != "flagged":
@@ -518,6 +571,11 @@ def _planned_movers(slide, rec) -> set:
         ids = loc.split(":", 2)[2].split(",")
         sats = _collection_riders(slide, ids, "y")
         return set(ids) | {str(s.shape_id) for s in sats}
+    elif loc.startswith("edge:"):
+        # every stray in the stack moves, each with its own contents
+        ids = loc.split(":", 3)[2].split(",")
+        sats = _collection_riders(slide, ids, "x")
+        return set(ids) | {str(s.shape_id) for s in sats}
     moved = set(base)
     # The axis must match the one the FIXER will use, or the guard checks a
     # different set of shapes than the one that moves.
@@ -526,7 +584,11 @@ def _planned_movers(slide, rec) -> set:
     if rec["issue_type"] in ("margin_alignment.edge_misaligned",
                              "margin_alignment.uneven_spacing",
                              "margin_alignment.panel_row_misaligned",
-                             "margin_alignment.recurring_off_position"):
+                             "margin_alignment.recurring_off_position",
+                             # a frame snap carries its contents like any other
+                             # edge fix; without it here the claim guard cannot
+                             # see them and two stacked members each move twice
+                             "margin_alignment.space_edge_misaligned"):
         by_id = {str(sh.shape_id): sh
                  for sh, _p in iter_shapes_deep(slide.shapes)}
         for bid in base:
@@ -607,6 +669,52 @@ def _fix_font_family(shape, record) -> str | None:
         _set_cs_typeface(run, record["new_value"])
     else:
         run.font.name = record["new_value"]
+    return None
+
+
+def _fix_off_palette_color(shape, record) -> str | None:
+    """Repaint one off-palette surface with the nearest palette colour.
+
+    Two surfaces, one record shape: `property` says which. "spPr.solidFill" is
+    the shape's own fill; "rPr.solidFill" is one run's text colour, addressed by
+    the record's locator - a shape-wide repaint would take a deliberate accent
+    word with it.
+
+    python-pptx does the writing. Setting a solid fill means removing whatever
+    fill was there and inserting a:solidFill at the one position the schema
+    allows, and hand-rolled XML that gets that wrong produces a file PowerPoint
+    offers to repair rather than open (the same reason qc.remedy defers to it).
+    """
+    from pptx.dml.color import RGBColor
+
+    raw = str(record.get("new_value") or "").lstrip("#")
+    if len(raw) != 6:
+        return "new_value is not a six-digit hex colour"
+    try:
+        rgb = RGBColor.from_string(raw.upper())
+    except ValueError:
+        return f"'{raw}' is not a colour"
+
+    prop = record.get("property") or ""
+    if prop.startswith("rPr"):
+        m = _LOC_RE.match(record.get("locator") or "")
+        if not m:
+            return "record has no run locator"
+        if not getattr(shape, "has_text_frame", False):
+            return "shape has no text frame"
+        paras = shape.text_frame.paragraphs
+        p_idx, r_idx = int(m.group(1)), int(m.group(2))
+        if p_idx >= len(paras) or r_idx >= len(paras[p_idx].runs):
+            return "locator no longer resolves (deck changed since audit)"
+        paras[p_idx].runs[r_idx].font.color.rgb = rgb
+        return None
+
+    try:
+        shape.fill.solid()
+        shape.fill.fore_color.rgb = rgb
+    except (AttributeError, NotImplementedError, TypeError) as exc:
+        # A picture, a group or a connector has no fill python-pptx will set.
+        return f"this shape's fill cannot be set ({type(exc).__name__})"
     return None
 
 
@@ -800,6 +908,110 @@ def _fix_edge(shape, record, slide=None) -> str | None:
                       delta if vertical else 0)
 
 
+def _fix_space_edge(shape, record, slide=None) -> str | None:
+    """Snap every stacked element that drifted inboard back onto the frame's
+    leading edge, each carrying its own contents.
+
+    One fix for the whole stack, because "these all start on one line" is one
+    decision. The record's new_value is the FRAME EDGE, not a left coordinate:
+    on an RTL slide the shapes align by their right edges, so a stack of
+    different widths lands on different lefts and the same edge.
+    """
+    if slide is None:
+        return "frame snap needs slide context"
+    loc = record.get("locator") or ""
+    if not loc.startswith("edge:"):
+        return "record has no frame-edge target"
+    try:
+        edge = int(record["new_value"])
+    except (TypeError, ValueError):
+        return "new_value is not an EMU integer"
+    parts = loc.split(":", 3)
+    if len(parts) < 3:
+        return "frame-edge locator is malformed"
+    rtl = parts[1] == "r"
+    ids = [sid for sid in parts[2].split(",") if sid]
+    by_id = {str(sh.shape_id): sh for sh, _p in iter_shapes_deep(slide.shapes)}
+    movers = [by_id.get(sid) for sid in ids]
+    if not movers or any(m is None for m in movers):
+        return "stack member no longer resolves (deck changed since audit)"
+
+    # NOTHING IN THE STACK RIDES. Shapes stacked across the axis of a move are
+    # exactly what rides_with treats as a collection, so left alone every member
+    # would be carried by its neighbour's translate as well as moved by its own
+    # - and the member already ON the frame, which this fix deliberately does
+    # not move, would be dragged a full delta to the wrong side of it. The
+    # stack's position is entirely decided here: the strays go to the edge, the
+    # rest stay, and neither is anybody's satellite.
+    pinned = set(parts[3].split(",")) if len(parts) > 3 else set()
+    pinned |= {str(m.shape_id) for m in movers}
+    for member in movers:
+        error = _materialize_xfrm(member)
+        if error:
+            return f"shape {member.shape_id}: {error}"
+        target = (edge - member.width) if rtl else edge
+        delta = target - member.left
+        if not delta:
+            continue
+        carried = [c for c in _carried_contents(slide, member, "x")
+                   if str(c.shape_id) not in pinned]
+        error = _translate([member] + carried, delta, 0)
+        if error:
+            return error
+    return None
+
+
+def _fix_component_edge(shape, record, slide=None) -> str | None:
+    """Move a whole component onto a stated line.
+
+    The component is named in the locator ("comp:<axis>:<ids>") because the
+    entity was decided by the review that raised this, not re-derived here.
+    That is the point of the layer: _carried_contents infers what travels with
+    a shape from overlap and adjacency, and on a stack of blocks it decides
+    each one carries its neighbours - so every member moves once for itself and
+    again for the member beside it. A component states its own membership, so
+    nothing rides and nothing moves twice.
+    """
+    if slide is None:
+        return "component move needs slide context"
+    loc = record.get("locator") or ""
+    if not loc.startswith("comp:"):
+        return "record names no component"
+    parts = loc.split(":", 2)
+    if len(parts) < 3:
+        return "component locator is malformed"
+    axis = parts[1]
+    if axis not in ("top", "left", "right"):
+        return f"'{axis}' is not an edge this fix understands"
+    try:
+        target = int(record["new_value"])
+    except (TypeError, ValueError):
+        return "new_value is not an EMU integer"
+
+    by_id = {str(sh.shape_id): sh for sh, _p in iter_shapes_deep(slide.shapes)}
+    members = [by_id.get(sid) for sid in parts[2].split(",") if sid]
+    if not members or any(m is None for m in members):
+        return "component member no longer resolves (deck changed since audit)"
+    for member in members:
+        error = _materialize_xfrm(member)
+        if error:
+            return f"shape {member.shape_id}: {error}"
+
+    # ONE delta for the whole component, measured on its bounding box, so the
+    # arrangement inside it is untouched.
+    if axis == "top":
+        current = min(m.top for m in members)
+    elif axis == "left":
+        current = min(m.left for m in members)
+    else:
+        current = max(m.left + m.width for m in members)
+    delta = target - current
+    if not delta:
+        return None
+    return _translate(members, 0 if axis == "top" else delta,
+                      delta if axis == "top" else 0)
+
+
 def _fix_distribute(record, slide) -> str | None:
     """Distribute a line of shapes evenly: first and last stay anchored,
     the middles spread so every gap matches (the designer's 'distribute
@@ -906,6 +1118,13 @@ _FIXERS = {
     "font.cs_typeface_missing": _fix_font_family,
     "margin_alignment.recurring_off_position": _fix_pin,
     "margin_alignment.body_band_intrusion": _fix_body_band,
+    # the same single translate; only the sign of the delta differs
+    "margin_alignment.body_below_band": _fix_body_band,
+    "color_palette.off_palette_rgb": _fix_off_palette_color,
+    # a single-axis snap to a stated edge: the same fixer the cluster snap
+    # uses, because the only difference is where the target came from
+    "margin_alignment.space_edge_misaligned": _fix_space_edge,
+    "margin_alignment.component_edge_misaligned": _fix_component_edge,
 }
 
 
@@ -1002,6 +1221,7 @@ def apply_fixes(deck_bytes: bytes, records: list[dict], record_ids: set[str]) ->
                 "margin_alignment.panel_row_misaligned": 2,
                 "margin_alignment.content_overflow": 3,
                 "margin_alignment.body_band_intrusion": 3,
+                "margin_alignment.body_below_band": 3,
                 "header_footer.footer_off_canvas": 4}.get(issue, 1)
 
     def _order(rid: str):
@@ -1059,7 +1279,8 @@ def apply_fixes(deck_bytes: bytes, records: list[dict], record_ids: set[str]) ->
 
         fixer = _FIXERS[rec["issue_type"]]
         if fixer in (_fix_uneven_spacing, _fix_edge, _fix_fake_slide_number,
-                     _fix_lift, _fix_rescale, _fix_pin, _fix_body_band):
+                     _fix_lift, _fix_rescale, _fix_pin, _fix_body_band,
+                     _fix_space_edge, _fix_component_edge):
             error = fixer(shape, rec, slide=slide)
         else:
             error = fixer(shape, rec)

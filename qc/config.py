@@ -81,6 +81,23 @@ ASSIST_MODEL = os.getenv("QC_ASSIST_MODEL", "claude-haiku-4-5").strip()
 # assistant, this sends slide IMAGES to the API - the UI discloses it.
 COPILOT_MODEL = os.getenv("QC_COPILOT_MODEL", "claude-opus-4-8").strip()
 
+# The judgment passes - component review (qc/components.py) and layout matching
+# when applying a master (qc/layoutmatch.py) - all go through qc.llm, and this
+# is the only place their provider and model are chosen. Gemini by default
+# (design lead, 24/08/2026); "anthropic" is still wired, so a provider switch is
+# not a one-way door.
+#
+# These send slide IMAGES, like the design copilot, and the UI discloses it.
+# Vision quality sets the ceiling on how good the fixes can be - a wrongly
+# grouped component means a fix that tears a card off its label - so the default
+# is the strongest vision tier rather than the cheapest.
+LLM_PROVIDER = os.getenv("QC_LLM_PROVIDER", "gemini").strip().lower()
+_DEFAULT_MODELS = {"gemini": "gemini-3-pro-preview",
+                   "anthropic": "claude-opus-5"}
+LLM_MODEL = os.getenv(
+    "QC_LLM_MODEL", _DEFAULT_MODELS.get(LLM_PROVIDER, "gemini-3-pro-preview")
+).strip()
+
 # Max upload size in MB. Raise on the desktop/LAN box for large image-heavy
 # client decks; keep modest on small-RAM cloud tiers (the whole file is held
 # in memory during processing, and recent decks are retained for the fix

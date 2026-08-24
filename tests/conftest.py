@@ -53,6 +53,26 @@ def bilingual_profile() -> Profile:
     return Profile.load("prezlab_bilingual")
 
 
+def job_id_of(response) -> str:
+    """The job an upload created.
+
+    ONE place that knows how, because the answer changed: an upload used to
+    respond with the audit report and the id was read out of its markup, and it
+    now redirects to Design QC (design lead, 24/08/2026 - the report is a list
+    of two thousand occurrences with no picture, and a designer's first question
+    is about a slide). Reading it off the final URL works for both, so a test
+    that wants the report asks for /audit/<id> and says so."""
+    import re
+
+    m = re.search(r"/(?:design|audit)/([0-9a-f]{32})", str(response.url))
+    if m:
+        return m.group(1)
+    # pre-redirect shape: the id in a link on the returned page
+    m = re.search(r"/manifest/([0-9a-f]{32})", response.text)
+    assert m, f"no job id in the response or its url ({response.url})"
+    return m.group(1)
+
+
 def save_and_ctx(prs, tmp_path: Path, profile: Profile, name: str = "case.pptx"):
     """Save a built deck and return a ready AuditContext for direct module
     detect() calls (reopens the file so tests exercise the real read path)."""

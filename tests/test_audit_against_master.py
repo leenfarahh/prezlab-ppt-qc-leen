@@ -14,6 +14,7 @@ from pptx.util import Emu, Pt
 
 from qc import web
 from qc.stylespec import extract_style_spec
+from tests.conftest import job_id_of
 
 IN = 914400
 
@@ -76,8 +77,9 @@ def test_deck_audited_against_an_uploaded_master(monkeypatch):
     })
     assert r.status_code == 200
     # The report names the master the rules came from, not a saved profile.
-    assert "master:brand" in r.text
-    assert "rough.pptx" in r.text
+    report = client.get(f"/audit/{job_id_of(r)}").text
+    assert "master:brand" in report
+    assert "rough.pptx" in report
 
     job = web._jobs[next(reversed(web._jobs))]
     assert job["profile"] == "__master__"

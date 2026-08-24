@@ -23,6 +23,7 @@ from pptx import Presentation
 from qc.stylespec import (MAX_EMBEDDED_ASSET_BYTES, extract_style_spec,
                           spec_to_profile)
 from qc.ui_master import render_style_spec
+from tests.conftest import job_id_of
 
 P_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
 A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -273,8 +274,10 @@ def test_report_hides_the_ai_panel_when_ai_is_off(ai_off):
     r = ai_off.post("/audit", data={"profile": "prezlab_en"},
                     files={"deck": ("d.pptx", buf.getvalue(), "app/x")})
     assert r.status_code == 200
-    assert _PANEL not in r.text
-    assert _COPILOT_FORM not in r.text
+    # the panel lives on the report, which the upload no longer lands on
+    report = ai_off.get(f"/audit/{job_id_of(r)}").text
+    assert _PANEL not in report
+    assert _COPILOT_FORM not in report
 
 
 def test_the_switch_is_what_hides_the_panel(monkeypatch):
@@ -299,11 +302,13 @@ def test_the_switch_is_what_hides_the_panel(monkeypatch):
         sh.fill.fore_color.rgb = RGBColor.from_string("FF00AA")
     buf = io.BytesIO(); prs.save(buf)
 
-    r = TestClient(web.app).post("/audit", data={"profile": "prezlab_en"},
-                                 files={"deck": ("d.pptx", buf.getvalue(), "app/x")})
+    client = TestClient(web.app)
+    r = client.post("/audit", data={"profile": "prezlab_en"},
+                    files={"deck": ("d.pptx", buf.getvalue(), "app/x")})
     assert r.status_code == 200
-    assert _PANEL in r.text
-    assert _COPILOT_FORM in r.text
+    report = client.get(f"/audit/{job_id_of(r)}").text
+    assert _PANEL in report
+    assert _COPILOT_FORM in report
 
 
 def test_the_switch_defaults_on_so_other_instances_are_unchanged(monkeypatch):

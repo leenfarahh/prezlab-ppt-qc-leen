@@ -20,7 +20,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from .engine import run_audit
@@ -528,6 +528,42 @@ def format_deck(request: Request, deck: UploadFile = File(...),
     if not plans:
         return _fail("That deck has no slides to format.")
 
+    # A FALLBACK plan is the one place this pass knows it does not know: no
+    # layout of that name, none of that archetype, so the slide is rebuilt onto
+    # whatever came first in a preference list and PowerPoint moves its content
+    # into boxes nobody chose. A designer looking at both files answers that in
+    # two seconds because they can SEE the structure, so the review looks
+    # (qc.layoutmatch). Only fallbacks are sent - a name match is not a
+    # question - and anything it cannot answer stays the fallback it was.
+    match_note = ""
+    if AI_ENABLED and any(p.match_rule == "fallback" for p in plans):
+        from .llm import api_configured
+
+        if api_configured():
+            try:
+                from .layoutmatch import review_fallbacks
+
+                pngs = export_decks_png(
+                    {"deck": data},
+                    [p.slide_index for p in plans
+                     if p.match_rule == "fallback"][:20]).items()
+                plans, looked = review_fallbacks(
+                    data, master_bytes, plans,
+                    {int(k.split(":", 1)[1]): v for k, v in pngs})
+                placed = sum(1 for p in plans
+                             if p.match_rule.startswith("reviewed"))
+                if looked:
+                    match_note = (f" Looked at {looked} slide"
+                                  f"{'s' if looked != 1 else ''} whose layout "
+                                  f"had no match and placed {placed}.")
+            except Exception as exc:
+                # Rendering or the model was unavailable. The format run is the
+                # deliverable; the review is an improvement to its plan, so it
+                # fails quietly and says so rather than taking the run with it.
+                match_note = (f" The layout review could not run "
+                              f"({type(exc).__name__}), so unmatched slides "
+                              f"kept their fallback layout.")
+
     result = apply_master(data, master_bytes, plans)
     if result.fatal:
         return _fail(result.fatal, 503)
@@ -946,22 +982,52 @@ def audit(request: Request, deck: UploadFile = File(...),
 
     user = current_user(request)
     record_audit(manifest, user["name"] if user else "anonymous")
-    return render_report(manifest, job_id, can_fix=True,
-                         promoted=promoted_issue_types(),
-                         comments=comment_counts(filename),
-                         design=design_count(_jobs[job_id]),
-                         assist=AI_ENABLED and not _ephemeral(profile))
+    # Straight to the slides. The audit report is a list of 2,000 occurrences
+    # with no picture; a designer's first question is "what is wrong with THIS
+    # slide", and answering it used to cost them a page they had to leave
+    # (design lead, 24/08/2026). The report is still there - Design QC links
+    # back to it, and it is where the exports, the triage buttons and the
+    # comments live - it is just no longer the doorway.
+    return RedirectResponse(f"/design/{job_id}", status_code=303)
 
 
 def _job(job_id: str) -> dict | None:
     return _jobs.get(job_id)
 
 
+def _apply_audit_fixes(job, selected: set):
+    """Apply the selected audit fixes to the job's deck and verify by
+    re-auditing. Returns (FixResult, the total before, a staleness note or None).
+
+    ONE path, because there are now two doors onto it: the report's Apply button
+    and the tick list on the design page. Two copies of this bookkeeping is how
+    the two pages start disagreeing about what the deck currently is - one of
+    them forgetting to drop a cached render, say, and showing a picture of the
+    deck as it stood before the fix.
+    """
+    from .fixer import apply_fixes
+
+    before_total = job["manifest"]["summary"]["total"]
+    fx = apply_fixes(job["deck"], job["manifest"]["records"], selected)
+    changed_ids = {o.record_id for o in fx.outcomes if o.outcome == "changed"}
+    applied = [r for r in job["manifest"]["records"]
+               if r["record_id"] in changed_ids]
+    with _jobs_lock:
+        job["prev_deck"] = job["deck"]   # pre-fix bytes for the visual diff
+        job["applied_records"] = job.get("applied_records", []) + applied
+        job["deck"] = fx.cleaned_bytes   # further fixes build on the cleaned deck
+        job["cleaned"] = fx.cleaned_bytes
+        # every render and every finding derived from the old bytes, dropped:
+        # a fix that moved a shape may have created or cleared an overlap
+        _invalidate_renders(job)
+    # Verify-after-write: re-audit the cleaned bytes so both pages reflect the
+    # actual new state of the deck, not an assumption.
+    return fx, before_total, _reaudit_in_place(job)
+
+
 @app.post("/apply", response_class=HTMLResponse)
 def apply(request: Request, job_id: str = Form(...),
           record_ids: list[str] = Form(None)):
-    from .fixer import apply_fixes
-
     job = _job(job_id)
     if job is None:
         return HTMLResponse(render_index(_pickable_profiles(), MODULES,
@@ -977,44 +1043,17 @@ def apply(request: Request, job_id: str = Form(...),
                              banner="No fixes selected.",
                              assist=AI_ENABLED and not _ephemeral(job["profile"]))
 
-    fx = apply_fixes(job["deck"], job["manifest"]["records"], selected)
+    fx, before_total, stale = _apply_audit_fixes(job, selected)
     skipped = [o for o in fx.outcomes if o.outcome == "skipped"]
-    before_total = job["manifest"]["summary"]["total"]
-
-    # Verify-after-write: re-audit the cleaned bytes so the report reflects
-    # the actual new state of the deck, not an assumption.
-    fd, tmp_name = tempfile.mkstemp(suffix=".pptx")
-    os.close(fd)
-    tmp = Path(tmp_name)
-    try:
-        tmp.write_bytes(fx.cleaned_bytes)
-        prof = job.get("profile_obj") or Profile.load(job["profile"])
-        result = run_audit(tmp, prof)
-    finally:
-        tmp.unlink(missing_ok=True)
-
-    manifest = result.to_manifest()
-    manifest["deck"] = job["filename"]
-    changed_ids = {o.record_id for o in fx.outcomes if o.outcome == "changed"}
-    applied = [r for r in job["manifest"]["records"] if r["record_id"] in changed_ids]
-    with _jobs_lock:
-        job["prev_deck"] = job["deck"]   # pre-fix bytes for the visual diff
-        job["applied_records"] = job.get("applied_records", []) + applied
-        job["diff"] = None               # invalidate any cached render
-        job["thumbs"] = None             # slides changed: thumbnails are stale
-        job["rects"] = None
-        job["design"] = None             # and so are the design findings: a fix
-                                         # that moved a shape may have created
-                                         # or cleared an overlap
-        job["manifest"] = manifest
-        job["deck"] = fx.cleaned_bytes   # further fixes build on the cleaned deck
-        job["cleaned"] = fx.cleaned_bytes
+    manifest = job["manifest"]
     after_total = manifest["summary"]["total"]
     note = (f"Applied {fx.applied} fix{'es' if fx.applied != 1 else ''}. "
             f"Re-audit of the cleaned deck: {after_total} findings remain "
             f"(was {before_total}).")
     if skipped:
         note += f" Skipped {len(skipped)}."
+    if stale:
+        note += f" {stale}"
     from .auth import current_user
     from .promotion import promoted_issue_types
     from .store import comment_counts, record_audit
@@ -1177,6 +1216,7 @@ def _design_severity_map(findings, records, answered) -> dict:
 def _design_page(job_id: str, job, banner: str = "", error: str | None = None,
                  view: str = "slide", current: int = 0):
     from .design import slide_rects
+    from .promotion import promoted_issue_types
     from .ui_design import render_design
 
     err = _ensure_design(job) or error
@@ -1217,7 +1257,10 @@ def _design_page(job_id: str, job, banner: str = "", error: str | None = None,
         rects=rects,
         per_slide=_design_severity_map(every, records, answered),
         banner=banner, error=err, render_error=shot_error,
-        has_deck=job.get("deck") is not None))
+        has_deck=job.get("deck") is not None,
+        can_fix=job.get("deck") is not None,
+        promoted=promoted_issue_types(),
+        auto=_auto_plan(job, current)))
 
 
 def _invalidate_renders(job) -> None:
@@ -1289,6 +1332,43 @@ def design_img(job_id: str, idx: int):
                     headers={"Cache-Control": "private, max-age=600"})
 
 
+def _perform_picks(job, picks):
+    """Perform (finding, remedy) pairs, record them, re-audit. Returns
+    (applied, staleness note or None).
+
+    Shared by the card-by-card apply and by "let the tool decide", because the
+    difference between those two is only who chose the remedy. A second copy of
+    this would be a second set of rules about what an applied decision is, and
+    Undo reads that record."""
+    from .remedy import apply as apply_remedies
+
+    deck, applied = apply_remedies(job["deck"], picks)
+    acted = [a for a in applied if a.done and a.undo]
+    with _jobs_lock:
+        if acted:
+            job["prev_deck"] = job["deck"]   # pre-change bytes, for the diff
+            job["deck"] = deck
+            job["cleaned"] = deck
+        job["design_applied"] = (job.get("design_applied") or []) + applied
+        _invalidate_renders(job)
+    return applied, (_reaudit_in_place(job) if acted else None)
+
+
+def _picks_note(applied: list) -> str:
+    acted = [a for a in applied if a.done and a.undo]
+    left = [a for a in applied if a.done and not a.undo]
+    failed = [a for a in applied if not a.done]
+    note = []
+    if acted:
+        note.append(f"Applied {len(acted)} change"
+                    f"{'s' if len(acted) != 1 else ''}")
+    if left:
+        note.append(f"recorded {len(left)} as deliberate")
+    if failed:
+        note.append(f"{len(failed)} could not be applied and say why below")
+    return "; ".join(note)
+
+
 @app.post("/design/{job_id}/apply", response_class=HTMLResponse)
 async def design_apply(request: Request, job_id: str):
     """Perform the remedy picked on each card, and nothing else.
@@ -1296,8 +1376,6 @@ async def design_apply(request: Request, job_id: str):
     The radio group per finding is named pick_<finding_id>, so the form is read
     rather than declared: the set of findings is not known until the deck is
     scanned, and a fixed signature would have to be a list of opaque pairs."""
-    from .remedy import apply as apply_remedies
-
     job = _job(job_id)
     if job is None:
         return HTMLResponse(render_index(_pickable_profiles(), MODULES,
@@ -1331,34 +1409,203 @@ async def design_apply(request: Request, job_id: str):
                                    "was changed.")
 
     try:
-        deck, applied = apply_remedies(job["deck"], picks)
+        applied, stale = _perform_picks(job, picks)
     except Exception as exc:
         return _design_page(job_id, job, current=back_to,
                             error=f"Nothing was changed: {type(exc).__name__}: "
                                   f"{exc}")
-
-    acted = [a for a in applied if a.done and a.undo]
-    left = [a for a in applied if a.done and not a.undo]
-    failed = [a for a in applied if not a.done]
-    with _jobs_lock:
-        if acted:
-            job["prev_deck"] = job["deck"]   # pre-change bytes, for the diff
-            job["deck"] = deck
-            job["cleaned"] = deck
-        job["design_applied"] = (job.get("design_applied") or []) + applied
-        _invalidate_renders(job)
-
-    note = []
-    if acted:
-        note.append(f"Applied {len(acted)} change"
-                    f"{'s' if len(acted) != 1 else ''}")
-    if left:
-        note.append(f"recorded {len(left)} as deliberate")
-    if failed:
-        note.append(f"{len(failed)} could not be applied and say why below")
-    stale = _reaudit_in_place(job) if acted else None
     return _design_page(job_id, job, current=back_to,
-                        banner="; ".join(note) + ".", error=stale)
+                        banner=_picks_note(applied) + ".", error=stale)
+
+
+# ------------------------------------------------- the audit's own fixes, here
+#
+# The rows under "Also on this slide" were read-only for one release, on the
+# argument that duplicating the report's tick box would give a designer two
+# buttons for one action. The argument was wrong in the only way that matters:
+# it is not two actions, it is one action reachable from the place the problem
+# is visible. A designer looking at slide 7, reading "Calibri is not in the
+# allowed set", was being told to go to another page and find the same row
+# (design lead, 24/08/2026).
+#
+# So the tick is here too, and it is THE SAME tick: same qc.fixer, same
+# selection rules, same verify-after-write (_apply_audit_fixes). What is not
+# duplicated is the engine.
+
+
+@app.post("/design/{job_id}/fix", response_class=HTMLResponse)
+def design_fix(job_id: str, record_ids: list[str] = Form(None),
+               n: int = Form(0)):
+    """Apply the audit fixes ticked on the design page, and come back to the
+    slide they were ticked on."""
+    job = _job(job_id)
+    if job is None:
+        return HTMLResponse(render_index(_pickable_profiles(), MODULES,
+                                         "Unknown or expired job."),
+                            status_code=404)
+    back_to = max(0, n or 0)
+    if job.get("deck") is None:
+        return _design_page(job_id, job, current=back_to)
+    selected = set(record_ids or [])
+    if not selected:
+        return _design_page(job_id, job, current=back_to,
+                            banner="No fix was ticked, so nothing was changed.")
+
+    fx, before_total, stale = _apply_audit_fixes(job, selected)
+    skipped = [o for o in fx.outcomes if o.outcome == "skipped"]
+    note = (f"Applied {fx.applied} fix{'es' if fx.applied != 1 else ''}. "
+            f"Re-audit of the deck: "
+            f"{job['manifest']['summary']['total']} findings remain "
+            f"(was {before_total}).")
+    if skipped:
+        note += (f" Skipped {len(skipped)}: "
+                 + "; ".join(sorted({o.reason for o in skipped if o.reason}))
+                 + ".")
+    return _design_page(job_id, job, current=back_to, banner=note, error=stale)
+
+
+def _auto_targets(job, scope: str, current: int) -> tuple[list, list]:
+    """What "let the tool decide" would look at: (fixable audit records, open
+    design findings), for one slide or for the whole deck.
+
+    The same function counts the work for the button and selects it for the
+    route, so the number a designer reads before pressing is the number that
+    gets acted on."""
+    from .fixer import is_fixable
+
+    deck_wide = scope == "deck"
+    records = [r for r in job["manifest"]["records"]
+               if r.get("module") != "preflight" and is_fixable(r)
+               and (deck_wide or r["slide_index"] == current)]
+    answered = {a.finding_id for a in job.get("design_applied") or []}
+    findings = [f for f in (job.get("design") or [])
+                if f.finding_id not in answered
+                and (deck_wide or f.slides == [current])]
+    return records, findings
+
+
+def _auto_plan(job, current: int) -> dict:
+    """The counts behind the two buttons on the hand-it-over card, and the
+    checks' own words for what they would not answer."""
+    from .design import auto_choice, auto_skip_reason
+    from .fixer import needs_explicit_tick
+
+    if job.get("deck") is None:
+        return {}
+    _ensure_design(job)
+    plan = {}
+    for scope in ("slide", "deck"):
+        records, findings = _auto_targets(job, scope, current)
+        held = [r for r in records if needs_explicit_tick(r)]
+        decides = [f for f in findings if auto_choice(f) is not None]
+        left = [f for f in findings if auto_choice(f) is None]
+        plan[scope] = {
+            "fixes": len(records) - len(held),
+            "held": len(held),
+            "picks": len(decides),
+            "left": len(left),
+            "reasons": sorted({auto_skip_reason(f) for f in left} - {None}),
+        }
+    return plan
+
+
+@app.post("/design/{job_id}/auto", response_class=HTMLResponse)
+def design_auto(job_id: str, scope: str = Form("slide"), n: int = Form(0),
+                include_holds: str = Form(None)):
+    """Let the tool answer everything it has an answer for.
+
+    Two passes, in this order and for this reason: the audit's own fixes are
+    deterministic conformance to the profile, and the design decisions are
+    judgments about how the deck then LOOKS. Making the judgments first would
+    mean judging a slide the tool is about to change - a contrast reading taken
+    before a font substitution, an overlap measured before a shape is snapped
+    back onto its margin. So the deck is brought into line first, re-audited,
+    and only then is it looked at.
+
+    Every decision made here lands in the same list as a hand-picked one, with
+    the same Undo. That is the whole safety story: this is a starting point a
+    designer corrects, not a commitment they have to accept.
+    """
+    from .design import auto_choice, auto_skip_reason
+    from .fixer import needs_explicit_tick
+
+    job = _job(job_id)
+    if job is None:
+        return HTMLResponse(render_index(_pickable_profiles(), MODULES,
+                                         "Unknown or expired job."),
+                            status_code=404)
+    back_to = max(0, n or 0)
+    scope = "deck" if scope == "deck" else "slide"
+    if job.get("deck") is None:
+        return _design_page(job_id, job, current=back_to)
+    holds_too = bool(include_holds)
+
+    # --- pass one: the audit's own fixes
+    records, _ = _auto_targets(job, scope, back_to)
+    held = [r for r in records if needs_explicit_tick(r)]
+    chosen = {r["record_id"] for r in records
+              if holds_too or not needs_explicit_tick(r)}
+    note, stale = [], None
+    if chosen:
+        try:
+            fx, _before, stale = _apply_audit_fixes(job, chosen)
+        except Exception as exc:
+            return _design_page(
+                job_id, job, current=back_to,
+                error=f"Nothing was changed: the audit fixes could not be "
+                      f"applied ({type(exc).__name__}: {exc}), so the design "
+                      f"decisions were not attempted either.")
+        note.append(f"applied {fx.applied} audit fix"
+                    f"{'es' if fx.applied != 1 else ''}")
+        skipped = len([o for o in fx.outcomes if o.outcome == "skipped"])
+        if skipped:
+            note.append(f"skipped {skipped} the fixer could not perform")
+
+    # --- pass two: the design decisions, on the deck pass one left behind
+    _ensure_design(job)
+    _records, findings = _auto_targets(job, scope, back_to)
+    picks, untouched = [], []
+    for finding in findings:
+        remedy = auto_choice(finding)
+        if remedy is None:
+            untouched.append(finding)
+        else:
+            picks.append((finding, remedy))
+    if picks:
+        try:
+            applied, pick_stale = _perform_picks(job, picks)
+            done = _picks_note(applied)
+            if done:
+                note.append(done[0].lower() + done[1:])
+            stale = stale or pick_stale
+        except Exception as exc:
+            # Pass one already landed and is already re-audited; saying so is
+            # the difference between a designer who knows what state the deck
+            # is in and one who presses the button again.
+            return _design_page(
+                job_id, job, current=back_to,
+                banner=(("Applied the audit fixes only: " + "; ".join(note)
+                         + ".") if note else ""),
+                error=f"The design decisions could not be performed: "
+                      f"{type(exc).__name__}: {exc}")
+
+    where = "the whole deck" if scope == "deck" else f"slide {back_to + 1}"
+    if not note:
+        banner = (f"Nothing on {where} was the tool's to decide, so nothing "
+                  f"changed.")
+    else:
+        banner = f"Decided {where}: " + "; ".join(note) + "."
+    reasons = sorted({auto_skip_reason(f) for f in untouched} - {None})
+    if untouched:
+        banner += (f" {len(untouched)} left for you, because "
+                   + "; and ".join(reasons) + ".")
+    if held and not holds_too:
+        banner += (f" {len(held)} fix{'es' if len(held) != 1 else ''} still "
+                   f"ask{'' if len(held) != 1 else 's'} for your explicit "
+                   f"approval and {'were' if len(held) != 1 else 'was'} not "
+                   f"applied.")
+    return _design_page(job_id, job, current=back_to, banner=banner,
+                        error=stale)
 
 
 @app.post("/design/{job_id}/undo", response_class=HTMLResponse)
@@ -1771,22 +2018,103 @@ def copilot(request: Request, job_id: str):
 
     new_records, reviewed = run_copilot(job["deck"], job["thumbs"],
                                         job["manifest"])
-    if new_records:
-        from collections import Counter
-
-        manifest = job["manifest"]
-        manifest["records"].extend(new_records)
-        records = manifest["records"]
-        manifest["summary"] = {
-            "by_severity": dict(Counter(r["severity"] for r in records)),
-            "by_issue_type": dict(Counter(r["issue_type"] for r in records)),
-            "by_module": dict(Counter(r["module"] for r in records)),
-            "arabic_flagged": sum(1 for r in records if r["arabic_flag"]),
-            "total": len(records),
-        }
-        job["rects"] = None  # pins are renumbered on next preview
+    _merge_records(job, new_records)
     return _report(f"Design copilot reviewed {reviewed} slide"
                    f"{'s' if reviewed != 1 else ''} and added "
+                   f"{len(new_records)} suggestion"
+                   f"{'s' if len(new_records) != 1 else ''} "
+                   "(tickable, never pre-selected).")
+
+
+def _merge_records(job, new_records: list[dict]) -> None:
+    """Fold reviewed suggestions into the manifest and re-count it.
+
+    Shared by the copilot and the component review: two passes appending to one
+    manifest with two copies of the summary arithmetic is how the counts on the
+    report start disagreeing with the rows under them."""
+    from collections import Counter
+
+    if not new_records:
+        return
+    manifest = job["manifest"]
+    manifest["records"].extend(new_records)
+    records = manifest["records"]
+    manifest["summary"] = {
+        "by_severity": dict(Counter(r["severity"] for r in records)),
+        "by_issue_type": dict(Counter(r["issue_type"] for r in records)),
+        "by_module": dict(Counter(r["module"] for r in records)),
+        "arabic_flagged": sum(1 for r in records if r["arabic_flag"]),
+        "total": len(records),
+    }
+    job["rects"] = None  # pins are renumbered on next preview
+
+
+@app.post("/components/{job_id}", response_class=HTMLResponse)
+def components(request: Request, job_id: str):
+    """Component review: Claude names what the things on each slide ARE and
+    which line they belong on; code measures, computes the targets and emits
+    ordinary tickable records.
+
+    Its own door rather than part of the audit, for the same two reasons the
+    copilot has one: it costs a vision call per slide, and it sends slide
+    IMAGES to the API. Neither belongs on the path a designer takes by
+    default."""
+    from .assist import api_configured
+
+    off = _ai_disabled_response()
+    if off is not None:
+        return off
+
+    from .components import run_components
+
+    job = _job(job_id)
+    if job is None:
+        return HTMLResponse(render_index(_pickable_profiles(), MODULES,
+                                         "Unknown or expired job."),
+                            status_code=404)
+    if job["deck"] is None:
+        return HTMLResponse(render_index(
+            _pickable_profiles(), MODULES,
+            "The deck is no longer held in memory; re-upload it."),
+            status_code=410)
+
+    def _report(banner):
+        from .promotion import promoted_issue_types
+        from .store import comment_counts
+
+        return render_report(job["manifest"], job_id, can_fix=True,
+                             banner=banner, promoted=promoted_issue_types(),
+                             comments=comment_counts(job["filename"]),
+                             assist=AI_ENABLED and not _ephemeral(job["profile"]))
+
+    if not api_configured():
+        return _report("Component review needs an Anthropic API key "
+                       "(ANTHROPIC_API_KEY) on the server.")
+    try:
+        _ensure_thumbs(job_id, job)
+    except RuntimeError as exc:
+        return _report(f"Component review needs slide renders: {exc}")
+
+    # The frame is handed in rather than re-read: the audit already resolved it
+    # from the profile or the deck's own master, and a second read could pick a
+    # different rectangle than the records were measured against.
+    from pptx import Presentation
+
+    from .modules.margin_alignment import _space_box
+
+    try:
+        profile = job.get("profile_obj") or Profile.load(job["profile"])
+        space = _space_box(profile, Presentation(io.BytesIO(job["deck"])))
+    except Exception:
+        space = None
+
+    new_records, reviewed = run_components(job["deck"], job["thumbs"],
+                                           job["manifest"], space)
+    _merge_records(job, new_records)
+    frame = "against the master's frame" if space is not None \
+        else "with no frame stated, so only component-to-component lines"
+    return _report(f"Component review looked at {reviewed} slide"
+                   f"{'s' if reviewed != 1 else ''} {frame} and added "
                    f"{len(new_records)} suggestion"
                    f"{'s' if len(new_records) != 1 else ''} "
                    "(tickable, never pre-selected).")

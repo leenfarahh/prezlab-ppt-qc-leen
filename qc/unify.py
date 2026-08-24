@@ -80,11 +80,21 @@ _COM_ADVICE = {
         "Windows has no PowerPoint registered for automation. Applying a "
         "master runs PowerPoint's own placeholder matching, so it needs "
         "desktop PowerPoint installed on this machine."),
-    # 0x80080005 CO_E_SERVER_EXEC_FAILURE
+    # 0x80080005 CO_E_SERVER_EXEC_FAILURE. The COM server was launched and did
+    # not register its class factory in time. Two causes seen on real hosts, and
+    # the message named only the second one for a release - which sent a
+    # designer looking for a repair prompt that was not there while a leftover
+    # instance from 10:05 that morning was the actual cause (24/08/2026).
+    # Leftovers are now swept before every run (sweep_automation), so the prompt
+    # is what is left, but the leftover is named first because it is the one a
+    # person can check in ten seconds.
     -2146959355: (
-        "PowerPoint would not start. This is usually an update or repair "
-        "prompt waiting to be answered: open PowerPoint by hand once, clear "
-        "whatever it asks for, then try again."),
+        "PowerPoint would not start. Check Task Manager for a POWERPNT.EXE "
+        "with no window - a leftover from an interrupted run wedges the next "
+        "one, and although these are now cleared automatically before each run, "
+        "one that refuses to close has to go by hand. Otherwise this is an "
+        "update or repair prompt waiting to be answered: open PowerPoint "
+        "yourself once, clear whatever it asks for, then try again."),
 }
 
 
@@ -103,10 +113,37 @@ _PS_AUTOMATION_PIDS = (
     "ForEach-Object { $_.ProcessId }")
 
 
+_WQL_AUTOMATION = ("SELECT ProcessId, CommandLine FROM Win32_Process "
+                   "WHERE Name = 'POWERPNT.EXE'")
+
+
+def _automation_pids_wmi() -> set | None:
+    """The same answer through in-process WMI, or None when WMI is not
+    reachable and the caller should fall back.
+
+    Worth having its own path because this question is asked several times per
+    render and it is not cheap either way: reading a process's command line
+    means opening the process. Spawning PowerShell to ask costs ~510ms;
+    asking WMI directly costs ~330ms (measured 24/08/2026)."""
+    try:
+        import win32com.client
+    except ImportError:
+        return None
+    try:
+        rows = win32com.client.GetObject("winmgmts:").ExecQuery(_WQL_AUTOMATION)
+        return {int(row.ProcessId) for row in rows
+                if row.CommandLine and "/AUTOMATION" in row.CommandLine.upper()}
+    except Exception:
+        return None
+
+
 def automation_pids() -> set:
     """PIDs of the headless PowerPoint instances running right now."""
     if os.name != "nt":
         return set()
+    found = _automation_pids_wmi()
+    if found is not None:
+        return found
     try:
         done = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command",
@@ -134,6 +171,51 @@ def _terminate(pid: int, grace_ms: int) -> None:
         ctypes.windll.kernel32.CloseHandle(handle)
 
 
+def sweep_automation(grace_ms: int = 2000) -> set:
+    """End every headless PowerPoint on the host BEFORE a run starts driving
+    one, and return the pids ended.
+
+    This is the hole the teardown snapshot cannot cover, and it is the reason a
+    single interrupted run made the machine refuse to render for the rest of the
+    day (real host, 24/08/2026: one /AUTOMATION instance left from 10:05, and
+    every design page after it answered "PowerPoint would not start").
+
+    Two measured facts make it necessary:
+
+    DispatchEx DOES NOT START A SECOND POWERPOINT. Two DispatchEx calls in one
+    process return one pid (checked 24/08/2026), because PowerPoint is
+    single-instance for automation. So a run that begins with a leftover alive
+    does not get a clean instance - it ATTACHES to the wedged one, and inherits
+    whatever state wedged it.
+
+    AND A LEFTOVER IS THEREFORE INVISIBLE TO force_quit. Its snapshot is taken
+    before the dispatch, so a pre-existing pid is in `started` and can never
+    appear in the difference; teardown asks Quit, a wedged instance ignores it,
+    and the leftover survives to break the next run too. Self-perpetuating,
+    which is why it has to be cleared at the START of a run rather than the end.
+
+    Killing rather than asking is deliberate: an instance that answers Quit is
+    not the one this exists for. What makes it safe is the /AUTOMATION filter -
+    a person opening a deck never produces one - and the render lock, which is
+    held by the only caller that can be driving PowerPoint from this process.
+
+    RETURNS WHAT IS STILL ALIVE, not what it ended, because that is exactly the
+    snapshot force_quit wants and a render should not pay for a second process
+    listing to ask the same question. Normally empty. Each listing is a WMI or
+    PowerShell round trip that has to read every process's command line, and
+    four of them per render was 2s of a 7.7s wait spent asking Windows the same
+    thing twice over (measured 24/08/2026); the clean case now costs one.
+    """
+    if os.name != "nt":
+        return set()
+    leftovers = automation_pids()
+    if not leftovers:
+        return leftovers          # the normal case: nothing to kill, nothing to re-ask
+    for pid in leftovers:
+        _terminate(pid, grace_ms)
+    return automation_pids()      # only the ones that refused to go
+
+
 def force_quit(app, started: set | None = None, grace_ms: int = 5000) -> None:
     """Quit PowerPoint, and make sure it actually went.
 
@@ -149,6 +231,11 @@ def force_quit(app, started: set | None = None, grace_ms: int = 5000) -> None:
     kill is limited to headless instances that appeared since. Without it this
     only asks Quit nicely, which is the old behaviour and the reason for the
     leak - so callers driving PowerPoint should always pass it.
+
+    The snapshot covers instances THIS run created and nothing else, by design.
+    An instance that was already alive is in `started` and survives here however
+    wedged it is, which is why every caller sweeps first (sweep_automation): the
+    two halves together are what keep the host clean.
 
     Quit is asked first and given `grace_ms` to land, because a clean exit
     flushes PowerPoint's own state; the kill is only for when it does not."""
@@ -478,7 +565,10 @@ def com_unify(deck_bytes: bytes, assignments: dict[int, str]) -> tuple[bytes | N
         try:
             with open(path, "wb") as f:
                 f.write(deck_bytes)
-            started = automation_pids()
+            # leftovers first: DispatchEx attaches to a running /AUTOMATION
+            # instance rather than starting a clean one. What survives the sweep
+            # is the teardown's snapshot, so that is one listing, not two.
+            started = sweep_automation()
             try:
                 app = win32com.client.DispatchEx("PowerPoint.Application")
                 app.DisplayAlerts = 1  # ppAlertsNone

@@ -38,8 +38,8 @@ from dataclasses import dataclass, field
 
 from pptx import Presentation
 
-from .unify import (automation_pids, com_available,
-                    com_failure_advice, force_quit)
+from .unify import (com_available, com_failure_advice, force_quit,
+                    sweep_automation)
 
 # Archetypes that can stand in for an unmatched slide, best first. A content
 # layout is the safest home for a slide whose own archetype has no counterpart:
@@ -215,9 +215,13 @@ def apply_master(deck_bytes: bytes, master_bytes: bytes,
             os.remove(out_path)  # SaveAs will not overwrite silently
             paths.append(out_path)
 
-            # Snapshotted before the instance exists, so the teardown knows
-            # which headless PowerPoint is ours to end (qc.unify.force_quit).
-            started = automation_pids()
+            # Leftovers from an interrupted run go first: DispatchEx attaches to
+            # a running /AUTOMATION instance rather than starting a clean one,
+            # and the snapshot below cannot see one that predates this run
+            # (qc.unify.sweep_automation).
+            # What it hands back is what survived, which is exactly the
+            # snapshot the teardown needs (qc.unify.force_quit).
+            started = sweep_automation()
             try:
                 app = _com_retry(
                     lambda: win32com.client.DispatchEx("PowerPoint.Application"))

@@ -1,8 +1,8 @@
-"""Design copilot: Claude looks at rendered slides and proposes layout
+"""Design copilot: a model looks at rendered slides and proposes layout
 actions a designer would make; code verifies and executes them.
 
 Strict division of labor (the lesson of the ground-truth calibration):
-- Claude (vision) supplies JUDGMENT: which shapes should be distributed,
+- The model (vision) supplies JUDGMENT: which shapes should be distributed,
   aligned, or size-matched. It chooses from a CLOSED action vocabulary and
   may only reference shape ids from the inventory we hand it.
 - Code supplies PRECISION: every observation is re-verified against the
@@ -11,24 +11,42 @@ Strict division of labor (the lesson of the ground-truth calibration):
   (never pre-selected), collision-guarded, before/after rendered.
 - The designer supplies APPROVAL, as with every other fix.
 
+WHICH model is qc.llm's business, not this file's (30/08/2026). This pass named
+its own vendor and its own model id until then, which made it the one judgment
+pass in the package without a timeout, without retries and without a truncation
+guard - see _ask_vision.
+
 Confidentiality: unlike the metadata-only assistant, this sends SLIDE
-IMAGES to the Anthropic API. The UI says so explicitly; use it only on
+IMAGES to the configured provider. The UI says so explicitly; use it only on
 decks approved for cloud processing.
 """
 
-import base64
 import io
 import json
 
 from pptx import Presentation
 
-from .config import COPILOT_MODEL
+from .llm import ask_in_parallel, ask_json
 from .records import make_record
 
 MAX_SLIDES = 20
 MAX_OBS_PER_SLIDE = 3
 TOL_EMU = 28575           # perceptual floor, same as calibrated profiles
-WINDOW_EMU = 137160       # sanity ceiling for "meant to align"
+
+# How far a shape may be off a shared edge and still be SNAPPED to it in one
+# press. Past this the finding is still reported; it is just not offered as a
+# computed move, because a move this big is more likely to be the model having
+# grouped the wrong shapes than a designer having missed by that much.
+#
+# This replaced a 0.15in ceiling that DROPPED anything further out (31/08/2026).
+# 0.15in is a perceptual threshold - it answers "were these meant to line up?",
+# which is the right question in qc.modules.margin_alignment where nothing else
+# supplies intent. Here the model has ALREADY supplied the intent, so reusing it
+# inverted the pass: the further off a shape was, the more certain the silence,
+# and the defects a designer sees from across the room were exactly the ones
+# thrown away. A label sitting 0.35in left of the block it heads was reported by
+# the model on every run and discarded by this line every time.
+SNAP_MAX_EMU = 914400     # 1in: a designer's miss, not a mis-grouping
 
 ACTIONS = ("distribute_row", "distribute_col", "align_left", "align_top",
            "match_widths", "match_heights")
@@ -62,7 +80,19 @@ Propose at most {max_obs} layout actions a designer would make, chosen ONLY
 from: distribute_row / distribute_col (spread a line of shapes to equal
 gaps), align_left / align_top (line up edges that should match),
 match_widths / match_heights (make sibling cards the same size). Reference
-shapes ONLY by ids from the inventory, at least three per action.
+shapes ONLY by ids from the inventory.
+
+distribute_* and match_* need at least three shapes. align_left and
+align_top take TWO or more, because the commonest real misalignment is a
+pair: a label sitting over the block it heads, a caption under its image, a
+column heading over its column. If one column's label sits square with its
+body and another's does not, that is exactly the case to report.
+
+Judge what you SEE. Do not skip something because the gap looks large; a
+badly placed element is still a misalignment, and how far to move it is not
+your problem. Equally, one item in an otherwise even row that sits lower, or
+smaller, than its neighbours is worth reporting even when the rest are
+perfect.
 
 Rules: propose an action only when the improvement would be clearly
 visible and safe; analogous elements (a row of cards, a set of columns)
@@ -72,7 +102,7 @@ clear US English without em dashes."""
 
 
 def inventory(slide, slide_w: int, slide_h: int) -> list[dict]:
-    """Shape inventory Claude reasons over: ids, kind, normalized geometry.
+    """Shape inventory the model reasons over: ids, kind, normalized geometry.
     No text content - the image already shows it; the inventory stays
     minimal."""
     out = []
@@ -93,32 +123,44 @@ def inventory(slide, slide_w: int, slide_h: int) -> list[dict]:
 
 
 def _ask_vision(png: bytes, inv: list[dict]) -> list[dict]:
-    import anthropic
+    """The one call this module makes. Which model answers is qc.llm's business
+    and no part of this file's - the question and the schema are.
 
-    client = anthropic.Anthropic()
-    response = client.messages.create(
-        model=COPILOT_MODEL,
-        max_tokens=8192,
-        thinking={"type": "adaptive"},
-        output_config={"format": {"type": "json_schema",
-                                  "schema": OBSERVATIONS_SCHEMA}},
+    THIS USED TO BUILD ITS OWN MODEL CLIENT (until 30/08/2026), which is the
+    exact drift qc.llm exists to prevent and which its docstring already claimed
+    was not happening. Going direct meant this pass alone had: no timeout, so a
+    half-open connection pinned a worker until the process died; no retry, so a
+    429 on slide 7 of 20 read as "slide 7 is fine"; no MAX_TOKENS guard, so a
+    truncated reply came out of the route as a 500 rather than a skipped slide;
+    and a second place where a model id lived.
+    """
+    parsed = ask_json(
         system=_SYSTEM.format(max_obs=MAX_OBS_PER_SLIDE),
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image",
-                 "source": {"type": "base64", "media_type": "image/png",
-                            "data": base64.b64encode(png).decode()}},
-                {"type": "text",
-                 "text": "Shape inventory:\n"
-                         + json.dumps(inv, sort_keys=True)},
-            ],
-        }],
+        prompt="Shape inventory:\n" + json.dumps(inv, sort_keys=True),
+        schema=OBSERVATIONS_SCHEMA,
+        images=[png],
     )
-    if response.stop_reason == "refusal":
-        return []
-    text = "".join(b.text for b in response.content if b.type == "text")
-    return json.loads(text)["observations"][:MAX_OBS_PER_SLIDE]
+    return (parsed.get("observations") or [])[:MAX_OBS_PER_SLIDE]
+
+
+def _shared_edge(shapes, edge) -> int:
+    """The edge the set is meant to share, in EMU.
+
+    Three or more: the MEDIAN, because a majority already sitting on a line is
+    the strongest statement of where the line is.
+
+    Exactly two: the edge of the LARGER shape. A pair carries no majority, and
+    taking the median of two would pick whichever value happens to sort second
+    - so half the time a label would drag the block it heads sideways instead
+    of moving to it. Size is the tie-break that matches how the pair reads: a
+    caption belongs to its image, an eyebrow to its heading, a label to its
+    column. The big one is the spine and the small one is the satellite.
+    """
+    if len(shapes) > 2:
+        vals = sorted(edge(s) for s in shapes)
+        return vals[len(vals) // 2]
+    spine = max(shapes, key=lambda s: s.width * s.height)
+    return edge(spine)
 
 
 def synthesize(slide, s_idx: int, observations: list[dict],
@@ -132,8 +174,11 @@ def synthesize(slide, s_idx: int, observations: list[dict],
     out: list[dict] = []
 
     def emit(**kw):
+        # Defaults, not fixed values: a caller that states its own confidence
+        # (the alignment branch drops to "low" past the snap rail) has to win.
+        kw = {"severity": "warning", "confidence": "medium", **kw}
         rec = make_record(slide_index=s_idx, action="flagged",
-                          severity="warning", confidence="medium", **kw)
+                          source="vision", **kw)
         key = (rec.issue_type, rec.shape_id, rec.locator)
         if key not in seen:
             seen.add(key)
@@ -144,10 +189,16 @@ def synthesize(slide, s_idx: int, observations: list[dict],
         shapes = [s for s in shapes if s is not None
                   and None not in (s.left, s.top, s.width, s.height)
                   and not getattr(s, "rotation", 0)]
-        if len(shapes) < 3:
+        action = obs.get("action")
+        # Two shapes is a real alignment case and the commonest one there is: a
+        # label over the block it heads, a caption under its image. Distributing
+        # or size-matching a PAIR is meaningless - there is no rhythm in two
+        # gaps and no sibling set in two shapes - so those keep the floor of
+        # three. Requiring three everywhere is why the comparison slide went
+        # unreported: the defect was a pair and a pair could not be expressed.
+        if len(shapes) < (2 if action in ("align_left", "align_top") else 3):
             continue
         note = f"Design copilot: {obs.get('rationale', '').strip()[:160]}"
-        action = obs.get("action")
 
         if action in ("distribute_row", "distribute_col"):
             row = action == "distribute_row"
@@ -173,19 +224,31 @@ def synthesize(slide, s_idx: int, observations: list[dict],
         elif action in ("align_left", "align_top"):
             left = action == "align_left"
             edge = (lambda s: s.left) if left else (lambda s: s.top)
-            vals = sorted(edge(s) for s in shapes)
-            median = vals[len(vals) // 2]
+            target = _shared_edge(shapes, edge)
             for s in shapes:
-                off = abs(edge(s) - median)
-                if TOL_EMU < off <= WINDOW_EMU:
-                    emit(shape_id=s.shape_id, module="margin_alignment",
-                         issue_type="margin_alignment.edge_misaligned",
-                         property="spPr.xfrm.off.x" if left
-                         else "spPr.xfrm.off.y",
-                         old_value=edge(s), new_value=int(median),
-                         profile_rule_id="geometry.alignment.edge_tolerance_emu",
-                         message=f"{note} Snap to the shared "
-                                 f"{'left' if left else 'top'} edge.")
+                off = abs(edge(s) - target)
+                if off <= TOL_EMU:
+                    continue          # already on the line, to the eye
+                # Past the snap rail the finding is REPORTED, never dropped.
+                # Low confidence keeps it out of the one-click set
+                # (qc.fixer.is_fixable), so a designer sees it and decides,
+                # which is the right answer for a move this big.
+                snappable = off <= SNAP_MAX_EMU
+                emit(shape_id=s.shape_id, module="margin_alignment",
+                     issue_type="margin_alignment.edge_misaligned",
+                     confidence="medium" if snappable else "low",
+                     property="spPr.xfrm.off.x" if left
+                     else "spPr.xfrm.off.y",
+                     old_value=edge(s),
+                     new_value=int(target) if snappable else None,
+                     profile_rule_id="geometry.alignment.edge_tolerance_emu",
+                     message=(f"{note} Snap to the shared "
+                              f"{'left' if left else 'top'} edge."
+                              if snappable else
+                              f"{note} It sits {off // 36000}mm off the "
+                              f"{'left' if left else 'top'} edge the others "
+                              f"share, which is too far to move for you: check "
+                              f"whether it belongs on that line at all."))
 
         elif action in ("match_widths", "match_heights"):
             widths = action == "match_widths"
@@ -215,10 +278,14 @@ def run_copilot(deck_bytes: bytes, thumbs: dict[int, bytes],
     bad call never sinks the run."""
     prs = Presentation(io.BytesIO(deck_bytes))
     existing = manifest.get("records") or []
-    new_records: list[dict] = []
-    reviewed = 0
+
+    # The candidates are chosen first and the budget is spent on CALLS, not on
+    # successes. The loop here used to stop once MAX_SLIDES had answered, which
+    # meant that under an outage - when nothing answers - a 200-slide deck made
+    # 200 failing calls to review nothing.
+    candidates = []
     for s_idx, slide in enumerate(prs.slides):
-        if reviewed >= MAX_SLIDES:
+        if len(candidates) >= MAX_SLIDES:
             break
         png = thumbs.get(s_idx)
         if png is None:
@@ -226,11 +293,19 @@ def run_copilot(deck_bytes: bytes, thumbs: dict[int, bytes],
         inv = inventory(slide, prs.slide_width, prs.slide_height)
         if len(inv) < 3:
             continue
-        try:
-            observations = _ask_vision(png, inv)
-        except Exception:
+        candidates.append((s_idx, slide, png, inv))
+
+    # Independent questions, asked together (qc.llm.ask_in_parallel).
+    answers = ask_in_parallel(candidates, lambda c: _ask_vision(c[2], c[3]))
+
+    new_records: list[dict] = []
+    reviewed = 0
+    for (s_idx, slide, _png, _inv), observations in zip(candidates, answers):
+        if isinstance(observations, Exception):
             continue
         reviewed += 1
+        # Verification runs in slide order on the main thread: it reads geometry
+        # off the Presentation, which is not safe to share between threads.
         new_records.extend(
             synthesize(slide, s_idx, observations, existing + new_records))
     return new_records, reviewed

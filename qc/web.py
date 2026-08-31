@@ -17,10 +17,12 @@ import threading
 import uuid
 import zipfile
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
+                               Response)
 from fastapi.staticfiles import StaticFiles
 
 from .engine import run_audit
@@ -40,6 +42,11 @@ MAX_UPLOAD_BYTES = _MAX_UPLOAD_MB * 1024 * 1024  # configurable (QC_MAX_UPLOAD_M
 MAX_UNCOMPRESSED_BYTES = MAX_UPLOAD_BYTES * 6
 MAX_COMPRESSION_RATIO = 120.0
 RATIO_CHECK_FLOOR = 64 * 1024 * 1024  # small decks legitimately compress well
+# What to tell a designer when no model key is set. Named once: the provider is
+# configurable, so hard-coding one vendor's variable in a message is how the
+# component review ended up asking for a key it does not use.
+_MODEL_KEY_NOTE = "set GEMINI_API_KEY in the .env file at the project root and restart."
+
 MAX_STORED_MANIFESTS = 50
 # Deck bytes are retained in memory for the newest jobs only, so "apply
 # selected fixes" can run without re-upload. Older jobs keep their manifest
@@ -56,17 +63,31 @@ AUTH_REQUIRED = _ENV_AUTH_REQUIRED
 _PUBLIC_PATHS = ("/signin", "/signout", "/health", "/me")
 _PUBLIC_PREFIXES = ("/static/",)
 
-app = FastAPI(title="Prezlab PPT QC", docs_url=None, redoc_url=None)
-app.state.auth_required = _ENV_AUTH_REQUIRED
-
-
-@app.on_event("startup")
 def _bootstrap_admin():
+    """Create the first-run admin when the user table is empty.
+
+    Auth is mandatory on a cloud deploy, so a fresh one with no users would lock
+    everybody out including the person who deployed it. No effect once any user
+    exists."""
     from .config import BOOTSTRAP_ADMIN
     from .store import add_user, list_users
 
     if BOOTSTRAP_ADMIN and not list_users():
         add_user(BOOTSTRAP_ADMIN, "admin")
+
+
+@asynccontextmanager
+async def _lifespan(_app):
+    """Startup and shutdown. `@app.on_event("startup")` is deprecated in this
+    FastAPI and warns twice on every import; a lifespan handler is the
+    supported form and is what the next major version will require."""
+    _bootstrap_admin()
+    yield
+
+
+app = FastAPI(title="Prezlab PPT QC", docs_url=None, redoc_url=None,
+              lifespan=_lifespan)
+app.state.auth_required = _ENV_AUTH_REQUIRED
 
 
 @app.middleware("http")
@@ -180,11 +201,11 @@ def _ephemeral(profile_key: str) -> bool:
     return profile_key in _EPHEMERAL
 
 
-# Anthropic-backed features are refused at the route, not just hidden in the
+# Model-backed features are refused at the route, not just hidden in the
 # UI: hiding a button is a presentation choice, and QC_AI=0 has to mean no
 # request leaves this machine even for someone POSTing the endpoint directly.
 _AI_OFF = {"error": "AI features are disabled on this instance (QC_AI=0). "
-                    "No request is sent to the Anthropic API."}
+                    "No request is sent to the model API."}
 
 
 def _ai_disabled_response():
@@ -268,46 +289,111 @@ def _get_spec_master(spec_id: str) -> bytes | None:
     return held["master"] if held else None
 
 
-@app.get("/master", response_class=HTMLResponse)
-def master_intake():
-    from .ui_master import render_master_intake
+def _prep_intake_page(request: Request, message: str = "", status: int = 200,
+                      saved: str = "", spec: dict | None = None,
+                      spec_id: str = "", spec_message: str = "",
+                      replaced: bool = False):
+    """The ONE prepare intake: read a master, save it as a profile, apply it.
 
-    return HTMLResponse(render_master_intake())
+    Every step of Prepare a deck answers on this page, including the ones that
+    used to have pages of their own (reading a master, checking coverage,
+    applying a master). `spec` is how the read master gets back here instead of
+    onto a page of its own."""
+    from .ui_prep import render_prep_intake
+    from .unify import com_available
+    from .web_admin import _editor
+
+    can_look, why = _can_look()
+    return HTMLResponse(render_prep_intake(
+        _formattable_profiles(), message=message, com_ready=com_available(),
+        look=can_look, look_note=why, saved=saved,
+        can_save=_editor(request) is not None, spec=spec, spec_id=spec_id,
+        spec_message=spec_message, replaced=replaced), status_code=status)
 
 
 @app.post("/master", response_class=HTMLResponse)
 def master_read(request: Request, master: UploadFile = File(...)):
+    """Step 1: read the master, and answer on the page that asked.
+
+    A form endpoint, not a page. There is no GET /master any more: the master
+    is dropped on Prepare a deck and the spec renders under the form."""
     from pptx import Presentation
 
     from .stylespec import extract_style_spec
-    from .ui_master import render_master_intake, render_style_spec
-    from .web_admin import _editor
 
     filename = master.filename or "master.pptx"
     if not filename.lower().endswith(".pptx"):
-        return HTMLResponse(render_master_intake("Only .pptx files are accepted."),
-                            status_code=400)
+        return _prep_intake_page(request, "Only .pptx files are accepted.", 400)
 
     data = master.file.read(MAX_UPLOAD_BYTES + 1)
     if len(data) > MAX_UPLOAD_BYTES:
-        return HTMLResponse(
-            render_master_intake(f"File exceeds the {_MAX_UPLOAD_MB} MB cap."),
-            status_code=413)
+        return _prep_intake_page(
+            request, f"File exceeds the {_MAX_UPLOAD_MB} MB cap.", 413)
     bomb = _zip_bomb_reason(data)
     if bomb:
-        return HTMLResponse(render_master_intake(f"File rejected: {bomb}."),
-                            status_code=413)
+        return _prep_intake_page(request, f"File rejected: {bomb}.", 413)
 
     try:
         spec = extract_style_spec(Presentation(io.BytesIO(data)), source=filename)
     except Exception as exc:
-        return HTMLResponse(
-            render_master_intake(f"Could not read that master: "
-                                 f"{type(exc).__name__}: {exc}"), status_code=422)
+        return _prep_intake_page(
+            request,
+            f"Could not read that master: {type(exc).__name__}: {exc}", 422)
 
-    spec_id = _remember_spec(spec, data)
-    return HTMLResponse(render_style_spec(
-        spec, spec_id, can_save=_editor(request) is not None))
+    return _prep_intake_page(request, spec=spec,
+                             spec_id=_remember_spec(spec, data))
+
+
+@app.post("/spec/{spec_id}/pspace")
+def spec_stamp_pspace(spec_id: str, left: str = Form(...), top: str = Form(...),
+                      right: str = Form(...), bottom: str = Form(...)):
+    """Hand back a COPY of this master carrying a presentation-space rectangle.
+
+    The frame a master states is the single thing that ends the guessing
+    downstream: without one, the content area is inferred from where the
+    master's own placeholders happen to sit, and every deck formatted against it
+    is seated on that inference (qc.stylespec.infer_grid). This writes the
+    designer's own numbers in, so the next run reads a stated frame.
+
+    A DOWNLOAD, not an edit. The stored master is untouched and nothing is
+    written to the template store: the designer opens the copy, checks it, and
+    re-uploads it if they want it. A client's master is not a file this tool
+    changes on its own (qc.pspace.stamp_master).
+    """
+    from .pspace import stamp_master
+
+    data = _get_spec_master(spec_id)
+    if data is None:
+        return JSONResponse(
+            {"error": "that master is no longer held in memory; read it again"},
+            status_code=410)
+    try:
+        box = tuple(int(round(float(v) * 914400))
+                    for v in (left, top, right, bottom))
+    except (TypeError, ValueError):
+        return JSONResponse(
+            {"error": "the four edges have to be numbers, in inches"},
+            status_code=400)
+    try:
+        out, note = stamp_master(data, box)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse(
+            {"error": f"that master could not be stamped: "
+                      f"{type(exc).__name__}: {exc}"}, status_code=422)
+
+    spec = _get_spec(spec_id) or {}
+    source = (spec.get("meta") or {}).get("source_file") or "master"
+    stem = Path(source).stem or "master"
+    return Response(
+        content=out,
+        media_type="application/vnd.openxmlformats-officedocument."
+                   "presentationml.presentation",
+        headers={**_attachment(f"{stem}-presentation-space.pptx"),
+                 # The note is what the designer needs and a file download has
+                 # nowhere to put it, so it rides on a header the page reads.
+                 "X-QC-Note": note[:900]})
 
 
 @app.get("/spec/{spec_id}.json")
@@ -324,37 +410,70 @@ def spec_json(spec_id: str):
 
 
 @app.post("/spec/{spec_id}/profile", response_class=HTMLResponse)
-def spec_to_profile_route(request: Request, spec_id: str, name: str = Form(...)):
+def spec_to_profile_route(request: Request, spec_id: str, name: str = Form(""),
+                          target: str = Form("")):
+    """Turn the master just read into a profile: a new one, or an existing one
+    pointed at this file.
+
+    `target` is the second door and it is the one that stops the profile list
+    filling up with near-duplicates. Revising a master and reading it again is
+    the normal case, and creating "Client X 2" for it means half the team
+    prepares decks on last month's file."""
     from datetime import date
 
     from fastapi.responses import RedirectResponse
 
     from .profile import PROFILES_DIR
     from .stylespec import spec_to_profile
-    from .ui_admin import render_admin_error
-    from .ui_master import render_style_spec
-    from .web_admin import _editor, _slugify, _unique_pid
+    from .web_admin import (_editor, _slugify, _unique_pid,
+                            replace_profile_master)
 
+    # Every refusal comes back to Prepare a deck rather than to an error page,
+    # and the two that still have a spec bring it with them: a designer who
+    # mistyped the name should not have to read the master again to retry.
     spec = _get_spec(spec_id)
     if spec is None:
-        return HTMLResponse(render_admin_error(
-            "Style Spec", "That spec has expired",
-            "Specs are held in memory only. Read the master again.",
-            back="/master"), status_code=404)
+        return _prep_intake_page(
+            request, "That spec has expired. Specs are held in memory only, "
+                     "so read the master again.", 404)
 
     editor = _editor(request)
     if editor is None:
-        return HTMLResponse(render_admin_error(
-            "Style Spec", "Saving a profile needs a lead or admin",
-            "Sign in as a lead or admin to save this spec as a profile.",
-            back="/master"), status_code=403)
+        return _prep_intake_page(
+            request, "Saving a profile needs a lead or admin. Sign in, then "
+                     "save it; the master stays read below.", 403,
+            spec=spec, spec_id=spec_id)
+
+    if target:
+        # The master bytes, not the spec: a profile has to carry a real .pptx
+        # for PowerPoint to match placeholders against, and a spec describes a
+        # design system rather than being one.
+        master_bytes = _get_spec_master(spec_id)
+        if not master_bytes:
+            return _prep_intake_page(
+                request, "That master file is no longer held in memory, so "
+                         "there is nothing to replace it with. Read it again.",
+                410)
+        if target not in _profiles():
+            return _prep_intake_page(request, "Unknown profile.", 404,
+                                     spec=spec, spec_id=spec_id)
+        source = (spec.get("meta") or {}).get("source_file") or "master.pptx"
+        saved, note = replace_profile_master(target, master_bytes, source,
+                                             editor["name"])
+        if not saved:
+            return _prep_intake_page(request, "", 422, spec=spec,
+                                     spec_id=spec_id, spec_message=note)
+        # Redirect rather than render: this POST is not idempotent (it bumps the
+        # profile's version), and a designer who refreshes the result should not
+        # walk the version number up one press at a time.
+        return RedirectResponse(f"/prep?saved={target}&replaced=1",
+                                status_code=303)
 
     slug = _slugify(name)
     if not slug:
-        return HTMLResponse(render_style_spec(
-            spec, spec_id, can_save=True,
-            message="Give the profile a name with letters or numbers."),
-            status_code=400)
+        return _prep_intake_page(
+            request, "", 400, spec=spec, spec_id=spec_id,
+            spec_message="Give the profile a name with letters or numbers.")
 
     pid = _unique_pid(slug)
     profile = spec_to_profile(spec, pid, name.strip())
@@ -371,7 +490,7 @@ def spec_to_profile_route(request: Request, spec_id: str, name: str = Form(...))
         from .templates import save_master
 
         save_master(pid, master_bytes)
-    return RedirectResponse(f"/profiles/{pid}/edit", status_code=303)
+    return RedirectResponse(f"/prep?saved={pid}", status_code=303)
 
 
 def _profile_from_master(master: UploadFile | None):
@@ -419,6 +538,53 @@ MAX_FORMAT_JOBS = 10
 _format_jobs: OrderedDict[str, dict] = OrderedDict()
 _format_lock = threading.Lock()
 
+# Decks read against a master and waiting on their layout decision. Distinct
+# from a format job, and deliberately so: a Plan has no rebuilt deck, no
+# manifest and nothing to download, and putting one in _format_jobs would make
+# every page that reads a job have to ask whether this one is real yet.
+#
+# HALF THE CEILING OF A FORMAT JOB, because a Plan is not cheap and it is not
+# finished work. It holds the upload, the master, and the PNGs of every slide
+# and layout on its page - most of what a job holds, for something nobody has
+# pressed Apply on yet. Ten of these alongside ten format jobs is two client
+# decks in memory per run. They expire oldest first, and a designer who leaves
+# the layout page open past that gets "start again" rather than a stack trace.
+MAX_PLANS = 5
+_plans: OrderedDict[str, dict] = OrderedDict()
+_plans_lock = threading.Lock()
+
+
+def _remember_plan_stage(plan, profile: str, profile_obj,
+                         master_bytes: bytes) -> str:
+    """Hold a planned deck between step 1 and step 2, and return its id.
+
+    The MASTER BYTES are held with it. Re-reading the profile's stored master
+    on submit would be one fewer thing in memory and would also mean a master
+    replaced between the two presses gets applied to layouts chosen against the
+    old one - which is a corrupted rebuild that nothing on the page would
+    explain."""
+    plan_id = uuid.uuid4().hex
+    with _plans_lock:
+        _plans[plan_id] = {"plan": plan, "profile": profile,
+                           "profile_obj": profile_obj, "master": master_bytes,
+                           "shots": {}, "layout_thumbs": {},
+                           "render_note": ""}
+        while len(_plans) > MAX_PLANS:
+            _plans.popitem(last=False)
+    return plan_id
+
+
+def _get_plan(plan_id: str) -> dict | None:
+    with _plans_lock:
+        return _plans.get(plan_id)
+
+
+def _drop_plan(plan_id: str) -> None:
+    """Once the rebuild has run, the Plan is dead weight: its plans live on the
+    job and its source bytes are held there too."""
+    with _plans_lock:
+        _plans.pop(plan_id, None)
+
 
 def _formattable_profiles() -> list[dict]:
     """Every saved profile, flagged with whether it carries a master. Profiles
@@ -463,172 +629,333 @@ def _formattable_profiles() -> list[dict]:
     return out
 
 
-@app.get("/format", response_class=HTMLResponse)
-def format_intake():
-    from .ui_format import render_format_intake
-    from .unify import com_available
+# ------------------------------------------- pre-flight: layout coverage
+# The same question the format result answers, asked BEFORE anything is
+# rewritten. Applying a master is a rewrite that needs desktop PowerPoint and
+# takes about a second a slide; learning afterwards that the master had no
+# layout for a third of the deck means running the whole pass twice. This route
+# writes nothing, stores nothing, and returns no file.
 
-    return HTMLResponse(render_format_intake(_formattable_profiles(),
-                                             com_ready=com_available()))
+
+def _can_look() -> tuple[bool, str]:
+    """Whether the slides can be looked at on this host, and why not when they
+    cannot.
+
+    Four separate reasons, each with its own sentence, because a designer is
+    entitled to know which of them they got: "switched off here" and "no key"
+    are somebody's decision, and the other two are a broken setting.
+
+    WHAT IS LOST IS THE JUDGMENT, NOT THE REPORT. Every count on every page is
+    read from the two files and stands without a model - the coverage, the gaps,
+    the audit, and the layout choices. What a host without this cannot do is ask
+    what a designer would ADJUST (qc.copilot, qc.components) or propose a layout
+    for a gap (qc.layoutsuggest)."""
+    from .config import RENDERER
+    from .llm import api_configured, configuration_note
+
+    # Before the key check, because this one is true WITH a valid key: the model
+    # id names a model the endpoint will not answer on, which fails as a 404
+    # inside every pass rather than as a setting anyone can see.
+    misconfigured = configuration_note()
+    if misconfigured and AI_ENABLED:
+        return False, (f"The model settings on this host are wrong, so the "
+                       f"slides cannot be looked at. {misconfigured}")
+    if not AI_ENABLED:
+        return False, ("Model-backed features are switched off on this host, so "
+                       "the slides are not looked at. Everything else on this "
+                       "page is read from the files and is unaffected.")
+    if RENDERER == "none":
+        return False, ("Rendering is disabled on this host, and looking at a "
+                       "slide means rendering it first. Everything else on this "
+                       "page is read from the files and is unaffected.")
+    if not api_configured():
+        return False, ("No model key is configured on this host, so the slides "
+                       "are not looked at. Set GEMINI_API_KEY in the .env file "
+                       "at the project root and restart. Everything else on "
+                       "this page is read from the files and is unaffected.")
+    return True, ""
 
 
-@app.post("/format", response_class=HTMLResponse)
-def format_deck(request: Request, deck: UploadFile = File(...),
-                profile: str = Form(...)):
+
+# How many checked decks are held for a re-check. The loop this exists for is
+# short - look at the gaps, build the layout, check again - so a handful is
+# plenty, and the deck bytes are the expensive part to keep.
+MAX_CHECK_JOBS = 8
+_check_jobs: OrderedDict[str, dict] = OrderedDict()
+
+
+def _run_check(request: Request, data: bytes, filename: str,
+               master_bytes: bytes, master_name: str, profile: str,
+               can_look: bool, why: str, check_id: str | None = None):
+    """The coverage check for a REVISED master, against the deck already
+    prepared under this id.
+
+    There is no longer a pre-flight door onto this: coverage is reported on the
+    Prepare a deck result as a matter of course, and the only reason to run it
+    again is that the designer has built the missing layout and wants to know
+    whether the gap closed. Failures therefore go back to Prepare a deck, which
+    is the page they came from.
+    """
     from pptx import Presentation
 
-    from .applymaster import apply_master, plan_assignments
+    from .applymaster import plan_assignments
+    from .layoutgap import misfits as find_misfits
+    from .layoutgap import report as layout_coverage
     from .stylespec import dominant_master, extract_layouts, infer_grid
-    from .templates import load_master
-    from .ui_format import render_format_intake, render_format_result
-    from .unify import com_available
+    from .ui_check import render_check_result
 
     def _fail(msg, code=400):
-        return HTMLResponse(
-            render_format_intake(_formattable_profiles(), msg,
-                                 com_ready=com_available()), status_code=code)
-
-    filename = deck.filename or "deck.pptx"
-    if not filename.lower().endswith(".pptx"):
-        return _fail("Only .pptx files are accepted.")
-    if profile not in _profiles():
-        return _fail("Unknown profile.")
-    master_bytes = load_master(profile)
-    if not master_bytes:
-        return _fail("That profile carries no master file, so there is nothing "
-                     "to apply. Create it from a master on the Read a master page.")
-
-    data = deck.file.read(MAX_UPLOAD_BYTES + 1)
-    if len(data) > MAX_UPLOAD_BYTES:
-        return _fail(f"File exceeds the {_MAX_UPLOAD_MB} MB cap.", 413)
-    bomb = _zip_bomb_reason(data)
-    if bomb:
-        return _fail(f"File rejected: {bomb}.", 413)
+        return _prep_intake_page(request, msg, code)
 
     try:
         deck_prs = Presentation(io.BytesIO(data))
         master_prs = Presentation(io.BytesIO(master_bytes))
         target = dominant_master(master_prs)
         if target is None:
-            return _fail("That profile's master file has no slide master.")
-        # Layouts are read from the stored master rather than from an archived
-        # spec: the file is the source of truth and cannot drift from itself.
-        plans = plan_assignments(deck_prs,
-                                 extract_layouts(target, embed_assets=False))
-        # The submitted master's own frame, kept only as a fallback: the output
-        # deck is asked first, because PowerPoint resizes a loaded design to the
-        # deck's slide size and the file it writes is the only place the frame's
-        # real numbers are (qc.pspace).
-        master_space = (infer_grid(master_prs, target)
-                        or {}).get("presentation_space")
-        master_size = (master_prs.slide_width, master_prs.slide_height)
+            return _fail("That master file has no slide master.")
+        # The same layout list and the same planner the format pass uses, so a
+        # slide reported here as having no home is the same slide that would
+        # fall back there. A second reading could differ, and a pre-flight that
+        # disagrees with the run it precedes is worse than no pre-flight.
+        target_layouts = extract_layouts(target, embed_assets=False)
+        plans = plan_assignments(deck_prs, target_layouts)
     except Exception as exc:
         return _fail(f"Could not read that deck: {type(exc).__name__}: {exc}", 422)
 
     if not plans:
-        return _fail("That deck has no slides to format.")
+        return _fail("That deck has no slides to check.")
 
-    # A FALLBACK plan is the one place this pass knows it does not know: no
-    # layout of that name, none of that archetype, so the slide is rebuilt onto
-    # whatever came first in a preference list and PowerPoint moves its content
-    # into boxes nobody chose. A designer looking at both files answers that in
-    # two seconds because they can SEE the structure, so the review looks
-    # (qc.layoutmatch). Only fallbacks are sent - a name match is not a
-    # question - and anything it cannot answer stays the fallback it was.
-    match_note = ""
-    if AI_ENABLED and any(p.match_rule == "fallback" for p in plans):
-        from .llm import api_configured
-
-        if api_configured():
-            try:
-                from .layoutmatch import review_fallbacks
-
-                pngs = export_decks_png(
-                    {"deck": data},
-                    [p.slide_index for p in plans
-                     if p.match_rule == "fallback"][:20]).items()
-                plans, looked = review_fallbacks(
-                    data, master_bytes, plans,
-                    {int(k.split(":", 1)[1]): v for k, v in pngs})
-                placed = sum(1 for p in plans
-                             if p.match_rule.startswith("reviewed"))
-                if looked:
-                    match_note = (f" Looked at {looked} slide"
-                                  f"{'s' if looked != 1 else ''} whose layout "
-                                  f"had no match and placed {placed}.")
-            except Exception as exc:
-                # Rendering or the model was unavailable. The format run is the
-                # deliverable; the review is an improvement to its plan, so it
-                # fails quietly and says so rather than taking the run with it.
-                match_note = (f" The layout review could not run "
-                              f"({type(exc).__name__}), so unmatched slides "
-                              f"kept their fallback layout.")
-
-    result = apply_master(data, master_bytes, plans)
-    if result.fatal:
-        return _fail(result.fatal, 503)
-
-    # The presentation space goes in BEFORE the content moves. The migration
-    # seats every slide's body on the frame it reads from that slide's own
-    # master, so a deck whose masters carry the marker seats its stragglers on
-    # the new frame too, instead of on whatever the original design implied.
-    from .pspace import ensure_presentation_space
-
+    # Two kinds of slide need a decision: the ones nothing matched, and the ones
+    # that matched by NAME and whose content does not fit the boxes that layout
+    # offers. The second kind is invisible to matching by construction, since a
+    # name match is a claim about intent (qc.layoutgap.misfits).
+    #
+    # NEITHER IS GUESSED AT HERE ANY MORE (31/08/2026). This used to render the
+    # slides and ask a vision model to place them, which is the pass that became
+    # the layout step on Prepare a deck. A re-check is asking one question -
+    # "did the layout I just built close the gap?" - and the honest answer to it
+    # is arithmetic over the revised master, not a second opinion that can come
+    # back differently from the one the rebuild will use.
+    look_note = ""
+    fallbacks = [p.slide_index for p in plans if p.match_rule == "fallback"]
     try:
-        result.deck, space_notes = ensure_presentation_space(
-            result.deck,
-            fallback_box=(master_space or {}).get("box_emu")
-            if not (master_space or {}).get("problem") else None,
-            fallback_size=master_size)
-    except Exception as exc:
-        space_notes = [f"The presentation space could not be written into the "
-                       f"deck ({type(exc).__name__}: {exc}). The layouts were "
-                       f"still applied; the marker is missing from the masters."]
+        suspect = [m.slide_index
+                   for m in find_misfits(deck_prs, target_layouts, plans)]
+    except Exception:
+        suspect = []
+    worth_looking = fallbacks + [i for i in suspect if i not in fallbacks]
+    if worth_looking:
+        look_note = (f"{len(worth_looking)} slide"
+                     f"{'s' if len(worth_looking) != 1 else ''} still need a "
+                     f"layout decision against this master. Prepare the deck "
+                     f"to choose one for each of them.")
 
-    # Applying the layout is only half of it: PowerPoint remaps placeholder
-    # content, but a deck of free-floating shapes keeps them exactly where
-    # they were, leaving the master's empty placeholders on top of the old
-    # content. The migration pass moves the content into the master.
-    from .migrate import migrate_deck
+    coverage = layout_coverage(deck_prs, target_layouts, plans)
 
-    try:
-        deck_out, content_changes = migrate_deck(result.deck)
-    except Exception as exc:
-        deck_out, content_changes = result.deck, []
-        content_changes = [type("C", (), {
-            "slide_index": 0, "action": "migration skipped",
-            "detail": f"{type(exc).__name__}: {exc}; layouts applied, content "
-                      f"left where it was"})()]
-    result.deck = deck_out
+    # The proposal half. Only the re-check runs it here: this is where a
+    # designer decides what to add to a master, and the format result is read
+    # after the rebuild, when the answer is too late to act on cheaply. One call
+    # per group and no render, since a layout that does not exist yet cannot be
+    # photographed.
+    wanted = list(coverage.gaps or []) + list(coverage.misfit_clusters or [])
+    suggestions, pictures, suggest_note = [], {}, ""
+    if wanted and can_look:
+        try:
+            from .layoutsuggest import suggest, wireframe
 
-    job_id = uuid.uuid4().hex
-    with _format_lock:
-        # The job keeps the changes as well as the deck: putting a removed
-        # piece back re-renders this same page, and re-deriving the change list
-        # would mean running the whole migration again.
-        # `source` is the deck exactly as it was uploaded, kept for the review
-        # page: "before" is not derivable from the output, and re-uploading the
-        # file to see what changed is the thing the review exists to avoid.
-        _format_jobs[job_id] = {"deck": result.deck, "source": data,
-                                "filename": filename,
-                                "profile": profile, "plans": result.plans,
-                                "errors": result.errors,
-                                "applied": result.applied,
-                                "masters": result.masters,
-                                "stragglers": result.stragglers,
-                                "space_notes": space_notes,
-                                "changes": content_changes, "restored": [],
-                                "undone": [], "undo_notes": {}}
-        while len(_format_jobs) > MAX_FORMAT_JOBS:
-            _format_jobs.popitem(last=False)
+            space = (infer_grid(master_prs, target) or {}).get(
+                "presentation_space")
+            suggestions, asked, unreachable = suggest(
+                coverage, deck_prs, target_layouts, space, target)
+            pictures = {i: wireframe(s, deck_prs)
+                        for i, s in enumerate(suggestions)}
+            if unreachable and not suggestions:
+                # NOT the same sentence as a rejected proposal: nothing was
+                # proposed because nothing was asked.
+                suggest_note = (
+                    f"The layouts could not be proposed: the model could not "
+                    f"be reached ({unreachable}). The findings above are read "
+                    f"from the plans and are unaffected.")
+            elif asked and not suggestions:
+                suggest_note = (
+                    "No layout could be proposed for these groups. The findings "
+                    "above stand on their own; a proposal that did not answer "
+                    "the group it was asked about is discarded rather than "
+                    "shown.")
+        except Exception as exc:
+            suggest_note = (f"The layouts could not be proposed "
+                            f"({type(exc).__name__}). The coverage above is "
+                            f"unaffected.")
+    elif wanted:
+        suggest_note = why or (
+            "Proposing a layout needs a model, and none is configured here. "
+            "The findings above are read from the file and stand without one.")
+
+    # Held for the re-check, not stored: the loop this page exists for is
+    # propose, build, check again, and asking a designer to re-upload the deck
+    # every time they revise a layout is the friction that stops them checking.
+    if check_id is None:
+        check_id = uuid.uuid4().hex
+    with _jobs_lock:
+        _check_jobs[check_id] = {"deck": data, "filename": filename,
+                                 "profile": profile}
+        _check_jobs.move_to_end(check_id)
+        while len(_check_jobs) > MAX_CHECK_JOBS:
+            _check_jobs.popitem(last=False)
 
     profile_meta = next((p for p in _profiles_meta() if p["id"] == profile), None)
-    return HTMLResponse(render_format_result(
-        deck_name=filename, profile_name=(profile_meta or {}).get("name", profile),
-        job_id=job_id, plans=result.plans, errors=result.errors,
-        applied=result.applied, content_changes=content_changes,
-        masters=result.masters, stragglers=result.stragglers,
-        space_notes=space_notes))
+    return HTMLResponse(render_check_result(
+        deck_name=filename,
+        profile_name=(master_name or (profile_meta or {}).get("name", profile)),
+        profile_id=profile, coverage=coverage, look_note=look_note,
+        suggestions=suggestions, pictures=pictures,
+        suggest_note=suggest_note, check_id=check_id,
+        master_name=master_name))
+
+
+def _read_master(master, profile: str):
+    """(bytes, name, error) for whichever master this check is against.
+
+    An uploaded file wins over the profile's stored one: it is the file the
+    designer just changed, and checking the old copy would answer a question
+    nobody asked. It is read for this check and dropped - promoting it to the
+    profile is a separate decision, taken in step 1 of Prepare a deck, and
+    doing it silently here would change what every future run applies.
+    """
+    from .templates import load_master
+
+    if master is not None and getattr(master, "filename", ""):
+        if not master.filename.lower().endswith(".pptx"):
+            return None, "", "The master must be a .pptx file."
+        blob = master.file.read(MAX_UPLOAD_BYTES + 1)
+        if len(blob) > MAX_UPLOAD_BYTES:
+            return None, "", f"The master exceeds the {_MAX_UPLOAD_MB} MB cap."
+        bomb = _zip_bomb_reason(blob)
+        if bomb:
+            return None, "", f"The master was rejected: {bomb}."
+        return blob, master.filename, None
+
+    if profile:
+        if profile not in _profiles():
+            return None, "", "Unknown profile."
+        blob = load_master(profile)
+        if not blob:
+            return None, "", ("That profile carries no master file, so there is "
+                              "nothing to check against. Save a master as a "
+                              "profile on Prepare a deck first.")
+        return blob, "", None
+    return None, "", ("Pick a profile to check against, or upload the master "
+                      "file directly.")
+
+
+@app.post("/check/{check_id}/again", response_class=HTMLResponse)
+def check_again(request: Request, check_id: str, master: UploadFile = File(...)):
+    """Check the same deck against the master the designer has just revised.
+
+    The other half of a proposal. Suggesting a layout and stopping there leaves
+    a designer to work out for themselves whether what they built closed the gap,
+    and the answer to that is this page run again (design lead, 26/08/2026).
+
+    The deck is the one already checked, held in memory, so a designer revising a
+    master three times uploads three masters rather than three masters and three
+    decks.
+    """
+    can_look, why = _can_look()
+    with _jobs_lock:
+        job = _check_jobs.get(check_id)
+    if job is None:
+        return _prep_intake_page(
+            request, "That deck is no longer held in memory, so the revised "
+                     "master has nothing to be checked against. Prepare the "
+                     "deck again.", 404)
+
+    master_bytes, master_name, error = _read_master(master, "")
+    if error:
+        return _prep_intake_page(request, error, 400)
+
+    return _run_check(request, job["deck"], job["filename"], master_bytes,
+                      master_name, job.get("profile") or "", can_look,
+                      why, check_id=check_id)
+
+
+def _perform_removals(job, remove_ids) -> int:
+    """Take out the pieces named on this job, and record what came back.
+
+    ONE implementation, because there are now two doors onto it: the tick list
+    on the review page and a sentence in the ask box. Two copies of this
+    bookkeeping is how the removed list and the change list start disagreeing
+    about what is in the deck, and the Undo button reads both.
+
+    Returns how many pieces were taken out; the reason for a failure lands on
+    job["remove_error"], which is what the page renders.
+    """
+    from .migrate import apply_removals
+
+    # Anything already taken out is skipped rather than attempted twice: a
+    # browser resubmitting the POST would otherwise report a failure for a
+    # piece that is correctly gone.
+    done = set(job.get("removed") or [])
+    wanted = set(remove_ids or []) - done
+    ops = [c.remove_op for c in job.get("changes") or []
+           if getattr(c, "remove_id", None) in wanted
+           and getattr(c, "remove_op", None)]
+    if not ops:
+        return 0
+    try:
+        deck, performed = apply_removals(job["deck"], ops)
+    except Exception as exc:
+        job["remove_error"] = f"{type(exc).__name__}: {exc}"
+        return 0
+    with _format_lock:
+        job["deck"] = deck
+        # New bytes, so every cached picture of the old ones is wrong. A prep
+        # job is also an audit job, so its design renders and findings go too.
+        _drop_review_renders(job)
+        if job.get("manifest") is not None:
+            _invalidate_renders(job)
+        changes = list(job.get("changes") or [])
+        # Stamped past the existing ids so an undo of a removal cannot collide
+        # with an undo of a migration change.
+        for n, change in enumerate(performed, start=len(changes)):
+            change.change_id = f"c{n}"
+        changes.extend(performed)
+        job["changes"] = changes
+        job["removed"] = sorted(done | wanted)
+    # Verify after write, the same as every other path that changes the deck.
+    # A prep job carries an audit of these bytes, and a count taken before a
+    # shape left the slide is a description of a file that no longer exists.
+    if job.get("manifest") is not None:
+        _reaudit_in_place(job)
+    return len(performed)
+
+
+@app.post("/format/{job_id}/remove", response_class=HTMLResponse)
+def format_remove(job_id: str, remove_ids: list[str] = Form(None)):
+    """Take out the pieces a designer ticked, and nothing else.
+
+    The mirror image of the route below, and it replaced it as the normal path
+    (design lead, 26/08/2026): the migration used to remove first and offer the
+    pieces back, so a designer's first sight of the deck was already missing
+    things. Now it proposes, and this performs.
+
+    Each removal comes back as an ordinary change carrying its own undo, so one
+    a designer regrets is taken back by the same Undo button as every other
+    change rather than by a second mechanism.
+    """
+    with _format_lock:
+        job = _format_jobs.get(job_id)
+    # A job with no prep is not a job this can answer on: the page it returns is
+    # drawn from the run, and every run comes through Prepare a deck now.
+    if job is None or job.get("deck") is None or job.get("prep") is None:
+        return JSONResponse({"error": "unknown or expired job"}, status_code=404)
+
+    _perform_removals(job, remove_ids)
+
+    # Back to the page the tick list is on. Every format job is a prepared
+    # deck now that Prepare a deck is the only door onto the master pass, so
+    # there is one page to come back to and it is the one that sent us here.
+    return _prep_page(job_id, job, error=job.get("remove_error")
+                      or job.get("restore_error"))
 
 
 @app.post("/format/{job_id}/restore", response_class=HTMLResponse)
@@ -640,11 +967,12 @@ def format_restore(job_id: str, restore_ids: list[str] = Form(None)):
     the tool, decides whether the removal was right, and the piece goes back
     exactly as it was rather than being retyped from the report."""
     from .migrate import restore_shapes
-    from .ui_format import render_format_result
 
     with _format_lock:
         job = _format_jobs.get(job_id)
-    if job is None or job.get("deck") is None:
+    # A job with no prep is not a job this can answer on: the page it returns is
+    # drawn from the run, and every run comes through Prepare a deck now.
+    if job is None or job.get("deck") is None or job.get("prep") is None:
         return JSONResponse({"error": "unknown or expired job"}, status_code=404)
 
     # Anything already back is skipped rather than inserted twice: a browser
@@ -664,6 +992,11 @@ def format_restore(job_id: str, restore_ids: list[str] = Form(None)):
         else:
             with _format_lock:
                 job["deck"] = deck
+                # New bytes, so every picture of the old ones is wrong - the same
+                # reason an undo drops them. This was missed: restoring a piece
+                # here and then opening the review tab showed the deck without
+                # it.
+                _drop_review_renders(job)
                 # Kept per piece, not as a bare list of ids: a piece nudged clear
                 # of the master's header is back in a different place than it
                 # left, and a designer has to be told which.
@@ -674,20 +1007,11 @@ def format_restore(job_id: str, restore_ids: list[str] = Form(None)):
                 job["restored_notes"] = notes
                 job["restored"] = sorted(notes)
 
-    profile = job.get("profile")
-    profile_meta = next((p for p in _profiles_meta() if p["id"] == profile), None)
-    return HTMLResponse(render_format_result(
-        deck_name=job["filename"],
-        profile_name=(profile_meta or {}).get("name", profile),
-        job_id=job_id, plans=job.get("plans") or [],
-        errors=job.get("errors") or {}, applied=job.get("applied") or 0,
-        content_changes=job.get("changes") or [],
-        restored=job.get("restored") or [],
-        restored_notes=job.get("restored_notes") or {},
-        restore_error=job.get("restore_error"),
-        masters=job.get("masters") or 1,
-        stragglers=job.get("stragglers") or [],
-        space_notes=job.get("space_notes") or []))
+    # Back to the page the tick list is on. Every format job is a prepared
+    # deck now that Prepare a deck is the only door onto the master pass, so
+    # there is one page to come back to and it is the one that sent us here.
+    return _prep_page(job_id, job, error=job.get("remove_error")
+                      or job.get("restore_error"))
 
 
 # How many slides the deck view renders on ONE PAGE. Every render is a
@@ -775,10 +1099,16 @@ def _ensure_review(job, view: str, page: int = 0) -> str | None:
 def _drop_review_renders(job) -> None:
     """Forget every cached render. Called after an undo: the deck has changed,
     and a stale "after" picture beside a row marked undone is the one thing this
-    page must never show."""
+    page must never show.
+
+    The render TAG goes with them, and it is the other half of that sentence:
+    clearing the server's copy only makes the page ask again, and the browser
+    was answering out of its own cache under an unchanged URL
+    (_render_tag)."""
     for key in [k for k in list(job) if k.startswith(("review_master",
                                                       "review_deck"))]:
         job[key] = None
+    job["render_tag"] = None
 
 
 def _review_page(job_id: str, job, view: str, undo_error: str | None = None,
@@ -792,6 +1122,7 @@ def _review_page(job_id: str, job, view: str, undo_error: str | None = None,
     profile = job.get("profile")
     meta = next((p for p in _profiles_meta() if p["id"] == profile), None)
     return HTMLResponse(render_review(
+        job_tabs=_tabs_for(job_id, job, "review"),
         deck_name=job["filename"],
         profile_name=(meta or {}).get("name", profile or ""),
         job_id=job_id, view=view, previews=previews,
@@ -807,6 +1138,7 @@ def _review_page(job_id: str, job, view: str, undo_error: str | None = None,
         used_before=_layout_use(job.get("plans"), "source_layout"),
         used_after=_layout_use(job.get("plans"), "target_layout"),
         truncated=bool(previews.get("truncated")),
+        img_tag=_render_tag(job),
         render_error=error, undo_error=undo_error))
 
 
@@ -915,6 +1247,476 @@ def format_download(job_id: str):
         headers=_attachment(f"{stem} (master applied).pptx"))
 
 
+# ------------------------------------------- prepare: the master, then the audit
+#
+# One upload, one page, in the order the work actually happens. Applying a
+# master and auditing a deck were two routes and two pages, and a designer
+# needed both of them in that order every time - so the pipeline is qc.prep and
+# this is bookkeeping around it.
+
+
+def _register_prep(job_id: str, prep, profile: str, profile_obj) -> dict:
+    """One job, in both registries, under one id.
+
+    A prepared deck IS a format job and an audit job: it has plans and a
+    before/after review, and it has a manifest and design cards. Putting ONE
+    dict in both registries is what lets every page that already exists - the
+    review, the design cards, the checklist, the download, the ask box - work
+    on it without a second copy of any of them.
+
+    One dict rather than two, and that is the part that matters. Two would each
+    hold their own `deck`, and the first fix applied from the design page would
+    leave the download serving the file as it stood before it. One page has to
+    mean one file (design lead, 27/08/2026).
+
+    A run whose audit failed is registered as a format job only. The design
+    page reads the manifest for the slide count on its first line, so a job
+    with no manifest is not an audit job however much it looks like one, and
+    half-registering it would trade a missing link for a stack trace.
+    """
+    job = {
+        # --- the format half
+        "deck": prep.deck, "source": prep.source, "filename": prep.filename,
+        "profile": profile, "plans": prep.plans, "errors": prep.errors,
+        "applied": prep.applied, "masters": prep.masters,
+        "stragglers": prep.stragglers, "space_notes": prep.space_notes,
+        "coverage": prep.coverage, "changes": prep.changes,
+        "restored": [], "removed": [], "undone": [], "undo_notes": {},
+        # --- the audit half
+        "manifest": prep.manifest, "cleaned": None,
+        "profile_obj": profile_obj, "master_spec": None,
+        # --- what makes it one job rather than two
+        "prep": prep,
+    }
+    with _format_lock:
+        _format_jobs[job_id] = job
+        while len(_format_jobs) > MAX_FORMAT_JOBS:
+            _format_jobs.popitem(last=False)
+
+    # The UPLOAD, held under the same id, so "add the missing layout and check
+    # again" works from this page too. The gaps panel is the same one the
+    # prepared deck draws, and its re-check form needs a deck to re-read; the
+    # upload is the right one, because the coverage was computed against it
+    # before anything was rebuilt.
+    with _jobs_lock:
+        _check_jobs[job_id] = {"deck": prep.source, "filename": prep.filename,
+                               "profile": profile}
+        _check_jobs.move_to_end(job_id)
+        while len(_check_jobs) > MAX_CHECK_JOBS:
+            _check_jobs.popitem(last=False)
+
+    if prep.manifest is None:
+        return job
+    with _jobs_lock:
+        _jobs[job_id] = job
+        _expire_old_decks()
+    return job
+
+
+def _prep_layout_review(job_id: str, job) -> None:
+    """The visual layout pass, on the REBUILT deck, as part of the prepare run.
+
+    Part of the run rather than a button, because a button on a page two clicks
+    down is a feature that does not run. The geometric alignment pass answers
+    "were these meant to line up?" from proximity alone and therefore has to be
+    cautious: it will not compare shapes more than 0.15in apart, it drops any
+    cluster smaller than three, and it diverts repeated structures and touching
+    clusters out of its pools entirely. Those are the right calls WITHOUT a
+    model. With one, a designer's eye supplies the intent that proximity was
+    standing in for, and the code still supplies every number (qc.copilot).
+
+    Runs AFTER the audit and on the rebuilt deck, for the same reason the audit
+    does: half of what is wrong on the raw file is about to be rewritten by the
+    master, and judging the slides before that is judging a file nobody will
+    send.
+
+    Degrades to a sentence, never raises. Losing this pass costs the alignment
+    judgments; it must not cost the rebuilt deck or the audit that came with it.
+    The thumbnails it renders are cached on the job, so the design QC page that
+    a designer opens next does not render them a second time.
+    """
+    job["layout_note"] = ""
+    job["layout_ok"] = True
+    if job.get("manifest") is None:
+        return  # the audit did not run; the page already says so, once
+
+    can_look, why = _can_look()
+    if not can_look:
+        job["layout_note"] = why
+        job["layout_ok"] = False
+        return
+
+    from .copilot import run_copilot
+
+    try:
+        _ensure_thumbs(job_id, job)
+        new_records, reviewed = run_copilot(job["deck"], job["thumbs"],
+                                            job["manifest"])
+    except Exception as exc:
+        job["layout_note"] = (f"The slides could not be looked at for "
+                              f"alignment: {type(exc).__name__}: {exc}. "
+                              f"Everything else on this page still stands.")
+        job["layout_ok"] = False
+        return
+
+    _merge_records(job, new_records)
+    n = len(new_records)
+    job["layout_note"] = (
+        f"The visual model looked at {reviewed} slide"
+        f"{'s' if reviewed != 1 else ''} and found {n} alignment "
+        f"{'thing' if n == 1 else 'things'} a designer would adjust"
+        + (", listed with the rest below and tickable like any other finding."
+           if n else
+           ". Nothing on the slides it saw reads as out of line."))
+
+
+def _prep_page(job_id: str, job, banner: str = "", error: str | None = None):
+    """The prepared deck's one page, drawn from the job rather than from the
+    run that produced it. Every count on it therefore reflects the deck as it
+    now stands, including after a fix applied from the ask box."""
+    from .prep import headline
+    from .ui_prep import render_prep_result
+
+    prep = job["prep"]
+    prep.deck = job.get("deck")
+    prep.manifest = job.get("manifest")
+
+    design_open = design_error = None
+    auto: dict = {}
+    per_slide: dict = {}
+    if job.get("manifest") is not None:
+        design_open = design_count(job)
+        design_error = job.get("design_error")
+        auto = _auto_plan(job, 0)
+        answered = {a.finding_id for a in job.get("design_applied") or []}
+        every = [f for f in (job.get("design") or [])
+                 if f.finding_id not in answered]
+        records = [r for r in (job["manifest"].get("records") or [])
+                   if r.get("module") != "preflight"]
+        per_slide = _design_severity_map(every, records, answered)
+
+    meta = next((p for p in _profiles_meta() if p["id"] == job.get("profile")),
+                None)
+    chat_ready, chat_note = _chat_available()
+    return HTMLResponse(render_prep_result(
+        prep=prep, job_id=job_id, tabs=_tabs_for(job_id, job, "overview"),
+        profile_name=(meta or {}).get("name") or job.get("profile") or "",
+        headline=headline(prep), auto=auto, design_open=design_open,
+        design_error=design_error, per_slide=per_slide,
+        banner=banner, error=error, chat=chat_ready, chat_note=chat_note,
+        # What the remove and restore buttons on this page have already done.
+        # These used to be hardcoded empty, so a piece put back went back into
+        # the deck and the page still offered to put it back.
+        restored=job.get("restored") or [],
+        restored_notes=job.get("restored_notes") or {},
+        restore_error=job.get("restore_error"),
+        removed=job.get("removed") or [],
+        remove_error=job.get("remove_error"),
+        layout_note=job.get("layout_note") or "",
+        layout_ok=job.get("layout_ok", True)))
+
+
+@app.get("/prep", response_class=HTMLResponse)
+def prep_intake(request: Request, saved: str = "", replaced: str = ""):
+    return _prep_intake_page(request, saved=saved, replaced=bool(replaced))
+
+
+@app.get("/prep/{job_id}", response_class=HTMLResponse)
+def prep_view(job_id: str):
+    """The prepared deck's page, for a run that already happened.
+
+    Its own GET because the page is now the doorway to four others, and a page
+    a designer cannot get back to is a page they will not leave (the audit
+    report learned the same lesson)."""
+    with _format_lock:
+        job = _format_jobs.get(job_id)
+    if job is None or job.get("prep") is None:
+        return HTMLResponse(render_index(_pickable_profiles(), MODULES,
+                                         "Unknown or expired job."),
+                            status_code=404)
+    return _prep_page(job_id, job)
+
+
+@app.post("/prep/{job_id}/propose", response_class=HTMLResponse)
+def prep_propose(job_id: str):
+    """Draw a layout for each gap the master could not fill.
+
+    A BUTTON RATHER THAN A STEP (31/08/2026). This ran inside every prepare run
+    until the model came out of the master application; it is the last pass in
+    the flow that asks a model anything, and leaving it in the run meant the
+    deterministic half still finished by waiting on a network call. Most runs
+    have no gaps worth acting on, and the ones that do are a conversation with
+    whoever owns the master rather than something to fix this afternoon.
+    """
+    from .prep import propose_layouts
+    from .templates import load_master
+
+    with _format_lock:
+        job = _format_jobs.get(job_id)
+    if job is None or job.get("prep") is None:
+        return HTMLResponse(render_index(_pickable_profiles(), MODULES,
+                                         "Unknown or expired job."),
+                            status_code=404)
+
+    off = _ai_disabled_response()
+    if off is not None:
+        return off
+    can_look, why = _can_look()
+    if not can_look:
+        return _prep_page(job_id, job, error=why)
+
+    master = load_master(job.get("profile") or "")
+    if not master:
+        return _prep_page(job_id, job, error=(
+            "That profile no longer carries a master file, so a proposal "
+            "cannot be drawn on its frame."))
+    try:
+        propose_layouts(job["prep"], master)
+    except Exception as exc:
+        return _prep_page(job_id, job, error=(
+            f"The layouts could not be proposed ({type(exc).__name__}: {exc}). "
+            f"The gaps below are read from the plans and are unaffected."))
+    return _prep_page(job_id, job)
+
+
+@app.post("/prep", response_class=HTMLResponse)
+def prep_deck(request: Request, deck: UploadFile = File(...),
+              profile: str = Form(...), look: str = Form(None)):
+    """Step 1 -> step 2. Reads the deck against the master and STOPS.
+
+    Nothing is rebuilt here. What used to be one press is now two, with the
+    layout decisions in between, so the expensive irreversible half only runs
+    against layouts a designer has seen (qc.prep.plan)."""
+    from .prep import PrepError
+    from .prep import plan as plan_prep
+    from .templates import load_master
+
+    def _fail(msg, code=400):
+        return _prep_intake_page(request, msg, code)
+
+    filename = deck.filename or "deck.pptx"
+    if not filename.lower().endswith(".pptx"):
+        return _fail("Only .pptx files are accepted.")
+    if profile not in _profiles():
+        return _fail("Unknown profile.")
+    master_bytes = load_master(profile)
+    if not master_bytes:
+        return _fail("That profile carries no master file, so there is nothing "
+                     "to apply. Save a master as a profile in step 1 first.")
+
+    data = deck.file.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        return _fail(f"File exceeds the {_MAX_UPLOAD_MB} MB cap.", 413)
+    bomb = _zip_bomb_reason(data)
+    if bomb:
+        return _fail(f"File rejected: {bomb}.", 413)
+
+    try:
+        profile_obj = _resolve_profile(profile, data)
+    except Exception as exc:
+        return _fail(f"That profile could not be loaded: "
+                     f"{type(exc).__name__}: {exc}", 422)
+
+    try:
+        prepared = plan_prep(data, filename, master_bytes)
+    except PrepError as exc:
+        return _fail(str(exc), exc.status)
+    except Exception as exc:
+        return _fail(f"That deck could not be read against the master: "
+                     f"{type(exc).__name__}: {exc}", 422)
+
+    plan_id = _remember_plan_stage(prepared, profile, profile_obj, master_bytes)
+    # The checkbox is remembered here rather than acted on: it decides whether
+    # the REBUILT deck gets looked at for alignment, which happens after the
+    # rebuild, two presses from now.
+    with _plans_lock:
+        _plans[plan_id]["look"] = bool(look)
+    return _layouts_page(plan_id)
+
+
+# ---------------------------------------------- Step 2: choosing the layouts
+# The one page between an upload and a rewritten file. Only the slides the file
+# could not place with confidence appear on it; everything else is a count.
+
+
+def _layout_shots(plan_id: str, held: dict) -> None:
+    """Render the uncertain slides and the master's layouts, once per plan.
+
+    Two renders, both capped by what the page shows: the slides in question
+    (never the whole deck) and the master's layout catalogue (which is one
+    small file whatever the deck's length). Cached on the held plan because a
+    designer who changes one radio and reloads must not pay for them twice.
+
+    DEGRADES TO WORDS. A host with no renderer still gets the page - layout
+    names, what each one holds, and what the slide is asking for are all read
+    from the files - and it says so rather than showing broken images.
+    """
+    if held.get("shots") or held.get("render_note"):
+        return
+    plan = held["plan"]
+    wanted = [c.slide_index for c in plan.choices]
+    if not wanted:
+        return
+    from .render import export_decks_png, layout_catalogue
+
+    try:
+        pngs = export_decks_png({"s": plan.source}, wanted)
+        held["shots"] = {int(k.split(":", 1)[1]): v for k, v in pngs.items()}
+    except Exception as exc:
+        held["render_note"] = (
+            f"The slides could not be rendered on this machine "
+            f"({type(exc).__name__}), so the pictures are missing. What each "
+            f"slide holds and what each layout offers are read from the files "
+            f"and are unaffected.")
+        return
+    try:
+        catalogue, entries, _ = layout_catalogue(held["master"])
+        shots = export_decks_png({"l": catalogue},
+                                 [e["index"] for e in entries])
+        by_index = {int(k.split(":", 1)[1]): v for k, v in shots.items()}
+        held["layout_thumbs"] = {e["layout"]: by_index[e["index"]]
+                                 for e in entries if e["index"] in by_index}
+    except Exception:
+        # The slide pictures are the ones that matter; a missing layout preview
+        # leaves a named option with a description, which is still a choice a
+        # designer can make.
+        held["layout_thumbs"] = {}
+
+
+def _layouts_page(plan_id: str, message: str = "", status: int = 200):
+    held = _get_plan(plan_id)
+    if held is None:
+        return HTMLResponse(
+            render_index(_pickable_profiles(), MODULES,
+                         "That layout review has expired. Upload the deck "
+                         "again to start over."), status_code=404)
+    from .ui_layouts import render_layouts, render_nothing_to_choose
+
+    plan = held["plan"]
+    meta = next((p for p in _profiles_meta() if p["id"] == held["profile"]),
+                None)
+    profile_name = (meta or {}).get("name") or held["profile"]
+
+    if not plan.choices:
+        return HTMLResponse(render_nothing_to_choose(
+            deck_name=plan.filename, profile_name=profile_name,
+            plan_id=plan_id, slides=plan.slides), status_code=status)
+
+    _layout_shots(plan_id, held)
+    return HTMLResponse(render_layouts(
+        deck_name=plan.filename, profile_name=profile_name, plan_id=plan_id,
+        choices=plan.choices,
+        layout_names=[l["name"] for l in plan.layouts if l.get("name")],
+        matched=plan.slides - plan.undecided,
+        slide_shots={i: f"/plan-img/{plan_id}/slide-{i}.png"
+                     for i in held.get("shots", {})},
+        layout_thumbs={n: f"/plan-img/{plan_id}/layout-{i}.png"
+                       for i, n in enumerate(held.get("layout_thumbs", {}))},
+        render_note=held.get("render_note", ""), message=message),
+        status_code=status)
+
+
+@app.get("/prep/{plan_id}/layouts", response_class=HTMLResponse)
+def prep_layouts(plan_id: str):
+    return _layouts_page(plan_id)
+
+
+@app.get("/plan-img/{plan_id}/{key}.png")
+def plan_img(plan_id: str, key: str):
+    """A rendered slide or layout from a plan awaiting its decision.
+
+    Served rather than inlined as data URIs: a twenty-slide review with
+    twenty-four layout previews is megabytes of base64 in one document, and the
+    browser cannot cache any of it across the reload a designer does after
+    changing a pick."""
+    held = _get_plan(plan_id)
+    if held is None:
+        return Response(status_code=404)
+    png = None
+    if key.startswith("slide-"):
+        try:
+            png = held.get("shots", {}).get(int(key[6:]))
+        except ValueError:
+            png = None
+    elif key.startswith("layout-"):
+        try:
+            png = list(held.get("layout_thumbs", {}).values())[int(key[7:])]
+        except (ValueError, IndexError):
+            png = None
+    if png is None:
+        return Response(status_code=404)
+    return Response(png, media_type="image/png",
+                    headers={"Cache-Control": "private, max-age=600"})
+
+
+@app.post("/prep/{plan_id}/layouts", response_class=HTMLResponse)
+async def prep_apply_layouts(request: Request, plan_id: str):
+    """Step 2 -> step 3. The picks go onto the plans, then the master is
+    applied and the rebuilt deck is audited.
+
+    The form is read raw rather than through typed parameters because the field
+    names carry the slide index (pick_7, other_7) and FastAPI cannot declare a
+    parameter per slide of a deck it has not seen."""
+    from .prep import PrepError
+    from .prep import run as run_prep
+
+    held = _get_plan(plan_id)
+    if held is None:
+        return HTMLResponse(
+            render_index(_pickable_profiles(), MODULES,
+                         "That layout review has expired. Upload the deck "
+                         "again to start over."), status_code=404)
+
+    from .layoutpick import LEAVE, apply_picks
+    from .layoutpick import note as layout_note
+
+    plan = held["plan"]
+    form = await request.form()
+    picks = {}
+    for choice in plan.choices:
+        idx = choice.slide_index
+        # The select wins over the radio when it names something: it is only
+        # reachable by opening it and choosing, where the radio carries a
+        # default nobody had to touch.
+        other = (form.get(f"other_{idx}") or "").strip()
+        wanted = other or (form.get(f"pick_{idx}") or "").strip()
+        if wanted:
+            picks[idx] = wanted
+
+    moved = apply_picks(plan.plans, picks, plan.layouts)
+    refused = sum(1 for v in picks.values() if v == LEAVE)
+    match_note = layout_note(len(plan.choices), len(picks) - refused, moved,
+                             refused)
+
+    try:
+        prep = run_prep(plan, held["master"], held["profile_obj"],
+                        match_note=match_note)
+    except PrepError as exc:
+        return _layouts_page(plan_id, str(exc), exc.status)
+    except Exception as exc:
+        return _layouts_page(plan_id, f"That deck could not be prepared: "
+                                      f"{type(exc).__name__}: {exc}", 422)
+
+    job_id = uuid.uuid4().hex
+    job = _register_prep(job_id, prep, held["profile"], held["profile_obj"])
+
+    # The checkbox from step 1. A designer who asked for the slides to be looked
+    # at meant the REBUILT slides: judging the upload is judging a file nobody
+    # will send. Runs before the audit is recorded, because it adds records to
+    # the manifest and the archived copy should be the one the designer saw.
+    if held.get("look"):
+        _prep_layout_review(job_id, job)
+
+    if prep.manifest is not None:
+        from .auth import current_user
+        from .store import record_audit
+
+        user = current_user(request)
+        record_audit(prep.manifest, user["name"] if user else "anonymous")
+    _drop_plan(plan_id)
+    return _prep_page(job_id, job)
+
+
 @app.post("/audit", response_class=HTMLResponse)
 def audit(request: Request, deck: UploadFile = File(...),
           profile: str = Form("prezlab_en"),
@@ -966,16 +1768,7 @@ def audit(request: Request, deck: UploadFile = File(...),
                          # kept so the report can offer the spec it used; the
                          # master's own bytes are already gone
                          "master_spec": master_spec}
-        while len(_jobs) > MAX_STORED_MANIFESTS:
-            _jobs.popitem(last=False)
-        # drop deck bytes beyond the newest N jobs (manifests stay)
-        with_deck = [k for k, v in _jobs.items() if v["deck"] is not None]
-        for k in with_deck[:-MAX_DECKS_IN_MEMORY]:
-            _jobs[k]["deck"] = None
-            _jobs[k].pop("prev_deck", None)
-            _jobs[k].pop("diff", None)
-            _jobs[k].pop("thumbs", None)
-            _jobs[k].pop("rects", None)
+        _expire_old_decks()
     from .auth import current_user
     from .promotion import promoted_issue_types
     from .store import comment_counts, record_audit
@@ -989,6 +1782,42 @@ def audit(request: Request, deck: UploadFile = File(...),
     # back to it, and it is where the exports, the triage buttons and the
     # comments live - it is just no longer the doorway.
     return RedirectResponse(f"/design/{job_id}", status_code=303)
+
+
+def _tabs_for(job_id: str, job: dict | None, active: str) -> str:
+    """The tab strip for whichever views this job actually has.
+
+    Availability is computed from the job rather than assumed, because the six
+    views are not all reachable for every run: an upload that was only audited
+    was never rebuilt, so there is no before/after; a prepare run whose audit
+    failed has a deck and no findings. A tab that 404s is worse than an absent
+    one - it reads as the tool losing the page.
+    """
+    from .ui import job_tabs
+
+    if job is None:
+        return ""
+    available, counts = set(), {}
+    manifest = job.get("manifest")
+    if job.get("prep") is not None:
+        available.add("overview")
+    if job.get("plans"):
+        available.add("review")
+    if job.get("deck") is not None:
+        available.add("checklist")
+    if manifest is not None:
+        available |= {"findings", "design"}
+        counts["findings"] = sum(
+            1 for r in (manifest.get("records") or [])
+            if r.get("module") != "preflight")
+        open_design = design_count(job)
+        if open_design:
+            counts["design"] = open_design
+    if job.get("applied_records") and job.get("prev_deck") is not None:
+        available.add("changes")
+    # A strip with one tab on it is a label, not navigation.
+    return job_tabs(job_id, active, available, counts) \
+        if len(available) > 1 else ""
 
 
 def _job(job_id: str) -> dict | None:
@@ -1035,6 +1864,7 @@ def apply(request: Request, job_id: str = Form(...),
     if job["deck"] is None:
         return HTMLResponse(render_report(
             job["manifest"], job_id, can_fix=False,
+            tabs=_tabs_for(job_id, job, "findings"),
             banner="The deck is no longer held in memory (newer audits replaced it). "
                    "Re-upload to apply fixes."), status_code=410)
     selected = set(record_ids or [])
@@ -1061,6 +1891,7 @@ def apply(request: Request, job_id: str = Form(...),
     user = current_user(request)
     record_audit(manifest, user["name"] if user else "anonymous", kind="fix")
     return render_report(manifest, job_id, can_fix=True, banner=note,
+                         tabs=_tabs_for(job_id, job, "findings"),
                          has_cleaned=True, diff_href=f"/diff/{job_id}",
                          promoted=promoted_issue_types(),
                          comments=comment_counts(job["filename"]),
@@ -1176,7 +2007,7 @@ def _ensure_design_shot(job, index: int) -> str | None:
         return None
     from .render import export_decks_png
 
-    lock = _thumb_locks.setdefault(f"design:{id(job)}", threading.Lock())
+    lock = _render_lock_for(job, "design_shot_lock")
     with lock:
         if index in shots:
             return None
@@ -1248,7 +2079,15 @@ def _design_page(job_id: str, job, banner: str = "", error: str | None = None,
             except Exception:
                 rects = []
 
+    chat_ok, chat_why = _chat_available()
+    # A prepared deck came from one page carrying the coverage, the gaps and
+    # these findings together. Sending a designer to the audit report from here
+    # would strand the half of the answer that is about the master.
+    back = ((f"/prep/{job_id}", "Back to the prepared deck")
+            if job.get("prep") is not None else None)
     return HTMLResponse(render_design(
+        job_tabs=_tabs_for(job_id, job, "design"),
+        chat=chat_ok, chat_note=chat_why, back=back,
         deck_name=job["filename"],
         profile_name=(meta or {}).get("name") or job.get("profile") or "",
         job_id=job_id, view=view, current=current, total_slides=total,
@@ -1260,7 +2099,67 @@ def _design_page(job_id: str, job, banner: str = "", error: str | None = None,
         has_deck=job.get("deck") is not None,
         can_fix=job.get("deck") is not None,
         promoted=promoted_issue_types(),
+        shot_tag=_render_tag(job),
         auto=_auto_plan(job, current)))
+
+
+def _render_tag(job) -> str:
+    """A short token for the deck bytes the pictures on a page were rendered
+    FROM, to be spent in the image URL.
+
+    Dropping the server's cached renders is only HALF of an update. The browser
+    already holds the old PNG, cached for ten minutes under a URL that depends
+    on nothing but the job and the slide number, so a designer who applied a
+    decision was handed back the same URL and shown the deck as it stood before
+    they touched it: the row said applied, the change really had been made, and
+    the slide did not move (design lead, 26/08/2026). A URL that changes with
+    the bytes cannot serve a stale picture, and the long cache stays useful for
+    the pictures that genuinely have not changed.
+
+    Hashed rather than counted. A counter is a second record of the same fact
+    and it drifts the first time a route changes the deck and forgets to bump
+    it; a digest of the bytes cannot disagree with the bytes. Computed once per
+    change rather than once per page, on the same discipline the renders
+    already follow - every place that assigns new deck bytes clears this too.
+    """
+    tag = job.get("render_tag")
+    if tag is None:
+        import hashlib
+
+        deck = job.get("deck")
+        tag = (hashlib.blake2s(deck, digest_size=6).hexdigest()
+               if deck else "none")
+        job["render_tag"] = tag
+    return tag
+
+
+def _expire_old_decks() -> None:
+    """Trim the job registry, and drop the deck bytes of all but the newest few.
+
+    Manifests stay - a designer can still read the report - but the bytes and
+    everything derived from them go, which is the truth: the fix option really
+    has expired. The dict is shared with the format registry, so this expires
+    the download too.
+
+    ONE COPY. This was written out twice, verbatim, in the two places that
+    register a job, and the copies had already drifted from the rest of the
+    codebase: both dropped the deck, the diff, the thumbnails and the rects, and
+    neither dropped `design_shots` - a dict of rendered PNGs, by far the largest
+    thing hanging off a job. An evicted deck was freeing its bytes and keeping
+    its pictures (30/08/2026).
+
+    Callers hold _jobs_lock.
+    """
+    while len(_jobs) > MAX_STORED_MANIFESTS:
+        _jobs.popitem(last=False)
+    with_deck = [k for k, v in _jobs.items() if v.get("deck") is not None]
+    for key in with_deck[:-MAX_DECKS_IN_MEMORY]:
+        job = _jobs[key]
+        job["deck"] = None
+        job.pop("prev_deck", None)
+        # Everything else derived from those bytes, by the same rule that drops
+        # it when a fix lands, so a new derived cache cannot be forgotten here.
+        _invalidate_renders(job)
 
 
 def _invalidate_renders(job) -> None:
@@ -1271,7 +2170,35 @@ def _invalidate_renders(job) -> None:
     job["rects"] = None
     job["design"] = None
     job["design_shots"] = {}
+    job["render_tag"] = None
     job.pop("design_shot_error", None)
+    # The extraction is derived from the same bytes and goes stale the same way:
+    # a recolour changes the palette roll-up, and a checklist showing the old one
+    # beside a row marked applied is the same lie as a stale thumbnail.
+    job.pop("extracted", None)
+
+
+def _extracted(job) -> dict | None:
+    """This job's deck as ground truth (qc.extract), read once and kept.
+
+    Two pages want it - the colour and type checklist, and the ask box's palette
+    facts - and both read it fresh on EVERY request. That is a full parse plus a
+    colour and font resolution of every run on every slide (about 1.4s for a
+    200-slide deck), repeated for a document that cannot change between requests
+    unless a fix lands, and a fix already calls _invalidate_renders.
+
+    Returns None when the deck bytes are gone, which the callers already handle:
+    the checklist says so and the ask box drops the palette from its facts.
+    """
+    if job.get("deck") is None:
+        return None
+    cached = job.get("extracted")
+    if cached is not None:
+        return cached
+    from .extract import extract_deck
+
+    job["extracted"] = extract_deck(job["deck"])
+    return job["extracted"]
 
 
 @app.get("/audit/{job_id}", response_class=HTMLResponse)
@@ -1290,6 +2217,7 @@ def audit_view(request: Request, job_id: str):
                                          "Unknown or expired job."),
                             status_code=404)
     return render_report(job["manifest"], job_id,
+                         tabs=_tabs_for(job_id, job, "findings"),
                          can_fix=job.get("deck") is not None,
                          has_cleaned=job.get("cleaned") is not None,
                          promoted=promoted_issue_types(),
@@ -1509,10 +2437,8 @@ def _auto_plan(job, current: int) -> dict:
     return plan
 
 
-@app.post("/design/{job_id}/auto", response_class=HTMLResponse)
-def design_auto(job_id: str, scope: str = Form("slide"), n: int = Form(0),
-                include_holds: str = Form(None)):
-    """Let the tool answer everything it has an answer for.
+def _auto_apply(job, scope: str, current: int, holds_too: bool) -> dict:
+    """Apply everything the tool has an answer for, on one slide or the deck.
 
     Two passes, in this order and for this reason: the audit's own fixes are
     deterministic conformance to the profile, and the design decisions are
@@ -1522,12 +2448,76 @@ def design_auto(job_id: str, scope: str = Form("slide"), n: int = Form(0),
     back onto its margin. So the deck is brought into line first, re-audited,
     and only then is it looked at.
 
+    Returns {note, stale, error, stage, untouched, held}. `stage` says how far
+    it got, because a failure in pass two leaves a deck that pass one already
+    changed and re-audited, and telling a designer "nothing happened" then
+    would be false. The button on the design page and the sentence in the ask
+    box both come through here, so they cannot mean different things.
+    """
+    from .design import auto_choice
+    from .fixer import needs_explicit_tick
+
+    out = {"note": [], "stale": None, "error": None, "stage": "none",
+           "untouched": [], "held": []}
+
+    # --- pass one: the audit's own fixes
+    records, _ = _auto_targets(job, scope, current)
+    out["held"] = [r for r in records if needs_explicit_tick(r)]
+    chosen = {r["record_id"] for r in records
+              if holds_too or not needs_explicit_tick(r)}
+    if chosen:
+        try:
+            fx, _before, out["stale"] = _apply_audit_fixes(job, chosen)
+        except Exception as exc:
+            out["error"] = (f"Nothing was changed: the audit fixes could not "
+                            f"be applied ({type(exc).__name__}: {exc}), so the "
+                            f"design decisions were not attempted either.")
+            return out
+        out["stage"] = "fixes"
+        out["note"].append(f"applied {fx.applied} audit fix"
+                           f"{'es' if fx.applied != 1 else ''}")
+        skipped = len([o for o in fx.outcomes if o.outcome == "skipped"])
+        if skipped:
+            out["note"].append(f"skipped {skipped} the fixer could not perform")
+
+    # --- pass two: the design decisions, on the deck pass one left behind
+    _ensure_design(job)
+    _records, findings = _auto_targets(job, scope, current)
+    picks = []
+    for finding in findings:
+        remedy = auto_choice(finding)
+        if remedy is None:
+            out["untouched"].append(finding)
+        else:
+            picks.append((finding, remedy))
+    if picks:
+        try:
+            applied, pick_stale = _perform_picks(job, picks)
+        except Exception as exc:
+            # Pass one already landed and is already re-audited; saying so is
+            # the difference between a designer who knows what state the deck
+            # is in and one who presses the button again.
+            out["error"] = (f"The design decisions could not be performed: "
+                            f"{type(exc).__name__}: {exc}")
+            return out
+        done = _picks_note(applied)
+        if done:
+            out["note"].append(done[0].lower() + done[1:])
+        out["stale"] = out["stale"] or pick_stale
+    out["stage"] = "all"
+    return out
+
+
+@app.post("/design/{job_id}/auto", response_class=HTMLResponse)
+def design_auto(job_id: str, scope: str = Form("slide"), n: int = Form(0),
+                include_holds: str = Form(None)):
+    """Let the tool answer everything it has an answer for.
+
     Every decision made here lands in the same list as a hand-picked one, with
     the same Undo. That is the whole safety story: this is a starting point a
     designer corrects, not a commitment they have to accept.
     """
-    from .design import auto_choice, auto_skip_reason
-    from .fixer import needs_explicit_tick
+    from .design import auto_skip_reason
 
     job = _job(job_id)
     if job is None:
@@ -1540,54 +2530,15 @@ def design_auto(job_id: str, scope: str = Form("slide"), n: int = Form(0),
         return _design_page(job_id, job, current=back_to)
     holds_too = bool(include_holds)
 
-    # --- pass one: the audit's own fixes
-    records, _ = _auto_targets(job, scope, back_to)
-    held = [r for r in records if needs_explicit_tick(r)]
-    chosen = {r["record_id"] for r in records
-              if holds_too or not needs_explicit_tick(r)}
-    note, stale = [], None
-    if chosen:
-        try:
-            fx, _before, stale = _apply_audit_fixes(job, chosen)
-        except Exception as exc:
-            return _design_page(
-                job_id, job, current=back_to,
-                error=f"Nothing was changed: the audit fixes could not be "
-                      f"applied ({type(exc).__name__}: {exc}), so the design "
-                      f"decisions were not attempted either.")
-        note.append(f"applied {fx.applied} audit fix"
-                    f"{'es' if fx.applied != 1 else ''}")
-        skipped = len([o for o in fx.outcomes if o.outcome == "skipped"])
-        if skipped:
-            note.append(f"skipped {skipped} the fixer could not perform")
-
-    # --- pass two: the design decisions, on the deck pass one left behind
-    _ensure_design(job)
-    _records, findings = _auto_targets(job, scope, back_to)
-    picks, untouched = [], []
-    for finding in findings:
-        remedy = auto_choice(finding)
-        if remedy is None:
-            untouched.append(finding)
-        else:
-            picks.append((finding, remedy))
-    if picks:
-        try:
-            applied, pick_stale = _perform_picks(job, picks)
-            done = _picks_note(applied)
-            if done:
-                note.append(done[0].lower() + done[1:])
-            stale = stale or pick_stale
-        except Exception as exc:
-            # Pass one already landed and is already re-audited; saying so is
-            # the difference between a designer who knows what state the deck
-            # is in and one who presses the button again.
-            return _design_page(
-                job_id, job, current=back_to,
-                banner=(("Applied the audit fixes only: " + "; ".join(note)
-                         + ".") if note else ""),
-                error=f"The design decisions could not be performed: "
-                      f"{type(exc).__name__}: {exc}")
+    result = _auto_apply(job, scope, back_to, holds_too)
+    note, stale = result["note"], result["stale"]
+    untouched, held = result["untouched"], result["held"]
+    if result["error"]:
+        return _design_page(
+            job_id, job, current=back_to,
+            banner=(("Applied the audit fixes only: " + "; ".join(note) + ".")
+                    if note and result["stage"] == "fixes" else ""),
+            error=result["error"])
 
     where = "the whole deck" if scope == "deck" else f"slide {back_to + 1}"
     if not note:
@@ -1608,26 +2559,18 @@ def design_auto(job_id: str, scope: str = Form("slide"), n: int = Form(0),
                         error=stale)
 
 
-@app.post("/design/{job_id}/undo", response_class=HTMLResponse)
-def design_undo(job_id: str, finding_ids: list[str] = Form(None),
-                n: int = Form(None)):
-    """Take one decision back, exactly, and say what came with it."""
+def _perform_undo(job, wanted: set) -> dict:
+    """Take the named decisions back, exactly, and say what came with them.
+
+    Returns {chain, dragged, put_back, error}. One implementation for the same
+    reason the apply path has one: the Undo button and the ask box are two
+    doors onto a replay that must never happen twice, and a second copy of the
+    chain arithmetic is how that starts.
+    """
     from .remedy import followers, undo_items
     from .undo import apply_undo
 
-    job = _job(job_id)
-    if job is None:
-        return HTMLResponse(render_index(_pickable_profiles(), MODULES,
-                                         "Unknown or expired job."),
-                            status_code=404)
-    # Which view to answer on: the slide the button was pressed on, or the
-    # deck-wide tab when it carried no slide.
-    view = "slide" if n is not None else "deck"
-    back_to = max(0, n or 0)
     applied = list(job.get("design_applied") or [])
-    wanted = set(finding_ids or [])
-    if not wanted:
-        return _design_page(job_id, job, view=view, current=back_to)
 
     # Chains are unioned before anything is replayed: two requested decisions
     # can drag the same third one, and undoing it twice would put back a state
@@ -1645,7 +2588,8 @@ def design_undo(job_id: str, finding_ids: list[str] = Form(None),
         try:
             deck, outcomes = apply_undo(job["deck"], items)
         except Exception as exc:
-            error = f"The undo failed and nothing was changed: {type(exc).__name__}: {exc}"
+            error = (f"The undo failed and nothing was changed: "
+                     f"{type(exc).__name__}: {exc}")
         else:
             with _jobs_lock:
                 job["deck"] = deck
@@ -1662,7 +2606,13 @@ def design_undo(job_id: str, finding_ids: list[str] = Form(None),
         if items:
             _reaudit_in_place(job)
 
-    put_back = sum(1 for o in outcomes if o.get("done"))
+    return {"chain": chain, "dragged": dragged, "error": error,
+            "put_back": sum(1 for o in outcomes if o.get("done"))}
+
+
+def _undo_note(result: dict) -> str:
+    chain, dragged = result["chain"], result["dragged"]
+    put_back = result["put_back"]
     note = [f"{len(chain)} decision{'s' if len(chain) != 1 else ''} reopened"]
     if put_back:
         note.append(f"{put_back} change{'s' if put_back != 1 else ''} put back "
@@ -1670,14 +2620,49 @@ def design_undo(job_id: str, finding_ids: list[str] = Form(None),
     if dragged:
         note.append(f"including {len(dragged)} that touched the same shape and "
                     f"could not come back on its own")
+    return "; ".join(note) + "."
+
+
+@app.post("/design/{job_id}/undo", response_class=HTMLResponse)
+def design_undo(job_id: str, finding_ids: list[str] = Form(None),
+                n: int = Form(None)):
+    """Take one decision back, exactly, and say what came with it."""
+    job = _job(job_id)
+    if job is None:
+        return HTMLResponse(render_index(_pickable_profiles(), MODULES,
+                                         "Unknown or expired job."),
+                            status_code=404)
+    # Which view to answer on: the slide the button was pressed on, or the
+    # deck-wide tab when it carried no slide.
+    view = "slide" if n is not None else "deck"
+    back_to = max(0, n or 0)
+    wanted = set(finding_ids or [])
+    if not wanted:
+        return _design_page(job_id, job, view=view, current=back_to)
+
+    result = _perform_undo(job, wanted)
     # Back to the view the Undo button was on. Returning a designer to slide 1
     # after they pressed a button on slide 7 is the small rudeness that makes a
     # tool tiring to use.
     return _design_page(job_id, job, view=view, current=back_to,
-                        banner="; ".join(note) + ".", error=error)
+                        banner=_undo_note(result), error=result["error"])
 
 
-_thumb_locks: dict[str, threading.Lock] = {}
+def _render_lock_for(job, name: str) -> threading.Lock:
+    """The lock guarding one job's renders, kept ON the job.
+
+    It used to live in a module-level dict keyed by job id and, in one case, by
+    `id(job)`. Both were wrong in the same two ways: nothing ever removed an
+    entry, so the dict grew for the life of the process and pinned a Lock per
+    job ever seen; and id() is reused by CPython the moment an evicted job is
+    collected, so a new job could be handed the lock of a dead one and two
+    requests could render into each other.
+
+    On the job, it is created once, shared by every request for that job, and
+    collected with it. setdefault is the atomic step, exactly as before.
+    """
+    return job.setdefault(name, threading.Lock())
+
 THUMB_WIDTH = 1100
 
 
@@ -1690,7 +2675,7 @@ def _ensure_thumbs(job_id: str, job: dict) -> None:
         raise RuntimeError("deck bytes no longer in memory; re-upload to preview")
     from .render import export_decks_png
 
-    lock = _thumb_locks.setdefault(job_id, threading.Lock())
+    lock = _render_lock_for(job, "thumbs_lock")
     with lock:
         if job.get("thumbs"):
             return
@@ -1708,6 +2693,281 @@ def _ensure_rects(job: dict) -> dict:
                    if r["module"] != "preflight"]
         job["rects"] = audit_rects(job["deck"], flagged)
     return job["rects"]
+
+
+# --------------------------------------------------- ask about this deck
+# One door onto what the passes recorded, because a designer holding a client
+# deck does not arrive knowing which of the five pages answers their question.
+# It answers and it navigates; it cannot act (qc.chat).
+
+
+def _chat_available() -> tuple[bool, str]:
+    """Whether a question can be answered on this host, and why not when it
+    cannot. Same three reasons as the coverage review, and worth the same
+    sentence each: a text box that silently does nothing is worse than an
+    absence with a reason beside it."""
+    from .llm import api_configured
+
+    if not AI_ENABLED:
+        return False, ("Model-backed features are switched off on this host, so "
+                       "there is nothing to ask. The reports below are the same "
+                       "facts it would have read.")
+    if not api_configured():
+        return False, ("No model key on this host, so questions cannot be "
+                       "answered and the visual passes are off too. Set "
+                       "GEMINI_API_KEY in the .env file at the project root and "
+                       "restart. The reports below are the same facts it would "
+                       "have read.")
+    return True, ""
+
+
+@app.get("/checklist/{job_id}", response_class=HTMLResponse)
+def checklist(job_id: str):
+    """What this deck is made of: every colour and every typeface, with the level
+    each one comes from.
+
+    Read-only and read fresh out of the deck's own bytes. It serves both job
+    kinds off one route because the question does not depend on which pass ran -
+    a designer wants the palette whether they audited the deck or rebuilt it."""
+    from .extract import font_inventory, palette_inventory
+    from .ui_checklist import render_checklist
+
+    job = _job(job_id)
+    back = f"/design/{job_id}"
+    if job is None:
+        with _format_lock:
+            job = _format_jobs.get(job_id)
+        back = f"/format/{job_id}/review?view=deck"
+    if job is not None and job.get("prep") is not None:
+        back = f"/prep/{job_id}"
+    if job is None:
+        return HTMLResponse(render_index(_pickable_profiles(), MODULES,
+                                        "Unknown or expired job."),
+                            status_code=404)
+    if job.get("deck") is None:
+        return HTMLResponse(render_index(
+            _pickable_profiles(), MODULES,
+            "The deck is no longer held in memory, so its colours and type "
+            "cannot be read. Re-upload it."), status_code=410)
+
+    try:
+        deck = _extracted(job)
+        palette, fonts = palette_inventory(deck), font_inventory(deck)
+    except Exception as exc:
+        return HTMLResponse(render_index(
+            _pickable_profiles(), MODULES,
+            f"That deck's colours could not be read: {type(exc).__name__}: "
+            f"{exc}"), status_code=422)
+
+    return HTMLResponse(render_checklist(
+        tabs=_tabs_for(job_id, job, "checklist"),
+        deck_name=job.get("filename") or "deck.pptx", job_id=job_id,
+        back=back, palette=palette, fonts=fonts))
+
+
+def _chat_job(job_id: str) -> tuple[dict | None, str]:
+    """(job, kind) for whichever registry holds it.
+
+    A prep job is in both, and it answers as "prep": it has plans AND records,
+    so answering it as one or the other would leave half of what a designer can
+    see on the page out of the fact sheet."""
+    job = _job(job_id)
+    if job is not None:
+        return job, ("prep" if job.get("prep") is not None else "audit")
+    with _format_lock:
+        job = _format_jobs.get(job_id)
+    if job is None:
+        return None, ""
+    return job, ("prep" if job.get("prep") is not None else "format")
+
+
+# How many proposed plans one job keeps. A designer asks two or three things
+# before pressing anything; beyond that the older ones describe a deck that has
+# since moved, and a plan resolved against a deck that no longer exists is the
+# one thing this must not perform.
+MAX_PENDING_PLANS = 8
+
+
+def _remember_plan(job, plan) -> str:
+    """Hold a proposed plan until it is confirmed, and hand back its handle."""
+    pending = job.get("chat_plans")
+    if pending is None:
+        pending = job["chat_plans"] = OrderedDict()
+    token = uuid.uuid4().hex[:12]
+    pending[token] = plan
+    while len(pending) > MAX_PENDING_PLANS:
+        pending.popitem(last=False)
+    return token
+
+
+@app.post("/chat/{job_id}")
+async def chat(request: Request, job_id: str):
+    """Answer one question about one job, and propose what it asked for.
+
+    THIS ROUTE CHANGES NOTHING. An action comes back as a plan and a handle;
+    performing it is the route below, which the designer reaches by pressing a
+    button that says what would happen."""
+    off = _ai_disabled_response()
+    if off is not None:
+        return off
+
+    available, why = _chat_available()
+    if not available:
+        return JSONResponse({"error": why}, status_code=503)
+
+    from .chat import ask
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    question = str((payload or {}).get("q") or "")
+
+    job, kind = _chat_job(job_id)
+    if job is None:
+        return JSONResponse({"error": "That job is no longer held in memory. "
+                                      "Re-run the deck and ask again."},
+                            status_code=404)
+
+    try:
+        out = ask(job, kind, job_id, question)
+    except Exception as exc:
+        # A model that cannot be reached is not an answer of "nothing found".
+        #
+        # WITH the reason, not just the exception class. "That could not be
+        # answered (RuntimeError)" is what this said for a fortnight while
+        # every call was in fact dying on a closed HTTP client, and the type
+        # name alone was not enough for anyone to guess that (design lead,
+        # 27/08/2026 - "why doesn't the chatbot work?"). This is a local pilot
+        # tool: the person reading the box is the person who can fix the cause.
+        reason = " ".join(str(exc).split())[:300]
+        return JSONResponse(
+            {"error": f"That could not be answered. {type(exc).__name__}: "
+                      f"{reason or 'no detail given'}. The reports on this "
+                      f"page are unaffected."},
+            status_code=503)
+
+    plan = out.pop("plan", None)
+    if plan is not None:
+        out["plan"] = {"token": _remember_plan(job, plan),
+                       "summary": plan.summary, "changes": plan.changes,
+                       "name": plan.name}
+    return JSONResponse(out)
+
+
+def _perform_plan(job, plan) -> tuple[str, bool]:
+    """Perform one confirmed plan. Returns (what happened, redraw the page).
+
+    Every branch calls the SAME function the button on the page calls, and none
+    of them re-implements a fix, a re-audit or an undo chain. That is what makes
+    the ask box a new door onto the tool rather than a second tool: there is no
+    change reachable from here that is not in the Undo list, and none that skips
+    the verify-after-write.
+    """
+    if plan.name == "fix_findings":
+        fx, before, stale = _apply_audit_fixes(job, set(plan.record_ids))
+        after = job["manifest"]["summary"]["total"]
+        note = (f"Applied {fx.applied} fix{'es' if fx.applied != 1 else ''}. "
+                f"Re-audit of the deck: {after} findings remain (was {before}).")
+        skipped = [o for o in fx.outcomes if o.outcome == "skipped"]
+        if skipped:
+            note += f" Skipped {len(skipped)}."
+        return note + (f" {stale}" if stale else ""), True
+
+    if plan.name == "decide":
+        result = _auto_apply(job, plan.scope, plan.slide or 0,
+                             plan.include_holds)
+        if result["error"] and result["stage"] == "none":
+            return result["error"], False
+        where = ("the whole deck" if plan.slide is None
+                 else f"slide {plan.slide + 1}")
+        if result["note"]:
+            note = f"Decided {where}: " + "; ".join(result["note"]) + "."
+        else:
+            note = (f"Nothing on {where} turned out to be the tool's to "
+                    f"decide, so nothing changed.")
+        if result["error"]:
+            note += " " + result["error"]
+        if result["untouched"]:
+            note += f" {len(result['untouched'])} left for you."
+        return note + (f" {result['stale']}" if result["stale"] else ""), True
+
+    if plan.name == "take_remedy":
+        applied, stale = _perform_picks(job, plan.picks)
+        note = _picks_note(applied) or "Nothing was changed"
+        if not note.endswith("."):
+            note += "."
+        return note + (f" {stale}" if stale else ""), True
+
+    if plan.name == "undo":
+        result = _perform_undo(job, set(plan.finding_ids))
+        if result["error"]:
+            return result["error"], False
+        return _undo_note(result), True
+
+    if plan.name == "recheck":
+        stale = _reaudit_in_place(job)
+        if stale:
+            return stale, False
+        total = job["manifest"]["summary"]["total"]
+        return (f"Read the deck again: {total} finding"
+                f"{'s' if total != 1 else ''} on it as it now stands."), True
+
+    if plan.name == "remove_pieces":
+        removed = _perform_removals(job, set(plan.remove_ids))
+        if not removed:
+            return (job.get("remove_error")
+                    or "Nothing was removed."), False
+        return (f"Removed {removed} piece{'s' if removed != 1 else ''}. Each "
+                f"one is in the change list with its own Undo."), True
+
+    return "That plan is not one this build can perform.", False
+
+
+@app.post("/chat/{job_id}/do")
+async def chat_do(request: Request, job_id: str):
+    """Perform one plan the ask box proposed, once.
+
+    THE TOKEN IS SPENT ON USE. A plan describes a deck in a particular state -
+    these record ids, this many findings - and performing it twice would apply
+    it to a deck the first pass already changed. So it is popped before
+    anything runs, and a second press is told the plan is gone rather than
+    quietly doing it again.
+    """
+    off = _ai_disabled_response()
+    if off is not None:
+        return off
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    token = str((payload or {}).get("token") or "")
+
+    job, _kind = _chat_job(job_id)
+    if job is None:
+        return JSONResponse({"error": "That job is no longer held in memory, "
+                                      "so nothing was changed."},
+                            status_code=404)
+    plan = (job.get("chat_plans") or {}).pop(token, None)
+    if plan is None:
+        return JSONResponse(
+            {"error": "That plan is no longer on offer, so nothing was "
+                      "changed. Ask again and the tool will re-read the deck "
+                      "as it now stands."}, status_code=409)
+    if plan.changes and job.get("deck") is None:
+        return JSONResponse(
+            {"error": "The deck is no longer held in memory, so nothing could "
+                      "be changed."}, status_code=410)
+
+    try:
+        note, redraw = _perform_plan(job, plan)
+    except Exception as exc:
+        return JSONResponse(
+            {"error": f"That could not be performed ({type(exc).__name__}: "
+                      f"{exc}). Open the page it belongs to and check the "
+                      f"deck before pressing anything else."}, status_code=500)
+    return JSONResponse({"done": True, "note": note, "reload": redraw})
 
 
 @app.get("/signin", response_class=HTMLResponse)
@@ -1754,32 +3014,6 @@ def signout(request: Request):
     resp.delete_cookie("qc_session")
     resp.delete_cookie("qc_user")
     return resp
-
-
-@app.get("/history", response_class=HTMLResponse)
-def history_page():
-    from .store import list_audits
-    from .ui import render_history
-
-    return render_history(list_audits())
-
-
-@app.get("/history/{audit_id}", response_class=HTMLResponse)
-def history_view(audit_id: int):
-    from .store import comment_counts, get_audit
-    from .ui import render_history
-
-    audit = get_audit(audit_id)
-    if audit is None:
-        return HTMLResponse(render_history([]), status_code=404)
-    manifest = audit["manifest"]
-    when = audit["created_at"].replace("T", " ")[:16]
-    return render_report(
-        manifest, job_id="", can_fix=False, archived=True,
-        banner=(f"Archived {audit['kind']} from {when} UTC by "
-                f"{audit['user_name']}. Read-only record; re-upload the deck "
-                f"to work on it."),
-        comments=comment_counts(manifest["deck"]))
 
 
 @app.get("/me")
@@ -1858,14 +3092,6 @@ async def triage(request: Request):
     counts = {"confirmed": sum(1 for v in states.values() if v == "confirmed"),
               "false_positive": sum(1 for v in states.values() if v == "false_positive")}
     return JSONResponse({"ok": True, "counts": counts})
-
-
-@app.get("/stats", response_class=HTMLResponse)
-def stats_page():
-    from .triage import stats
-    from .ui import render_stats
-
-    return render_stats(stats())
 
 
 @app.post("/assist/{job_id}")
@@ -1972,6 +3198,7 @@ def reaudit(request: Request, job_id: str):
     user = current_user(request)
     record_audit(manifest, user["name"] if user else "anonymous")
     return render_report(manifest, new_id, can_fix=True,
+                         tabs=_tabs_for(new_id, _job(new_id), "findings"),
                          promoted=promoted_issue_types(),
                          comments=comment_counts(job["filename"]),
                          assist=AI_ENABLED and not _ephemeral(job["profile"]),
@@ -1980,10 +3207,14 @@ def reaudit(request: Request, job_id: str):
 
 @app.post("/copilot/{job_id}", response_class=HTMLResponse)
 def copilot(request: Request, job_id: str):
-    """Design copilot: render the slides, let Claude (vision) propose layout
+    """Design copilot: render the slides, let the vision pass propose layout
     actions, verify them in code, and merge the survivors into the report
     as ordinary tickable suggestions."""
-    from .assist import api_configured
+    # qc.llm's check, not qc.assist's. Both now resolve to the same key, but the
+    # seam is still the right one to ask: qc.llm is where the model lives, and
+    # asking a pass about another pass's credentials is how this button came to
+    # refuse on a correctly configured host in the first place.
+    from .llm import api_configured
     off = _ai_disabled_response()
     if off is not None:
         return off
@@ -2000,17 +3231,24 @@ def copilot(request: Request, job_id: str):
             "The deck is no longer held in memory; re-upload it."), status_code=410)
 
     def _report(banner):
+        # Back to the page the button was on. A prepared deck reaching the
+        # audit report here would lose the coverage and the gaps, which are
+        # half of what that page is for.
+        if job.get("prep") is not None:
+            return _prep_page(job_id, job, banner=banner)
+
         from .promotion import promoted_issue_types
         from .store import comment_counts
 
         return render_report(job["manifest"], job_id, can_fix=True,
+                             tabs=_tabs_for(job_id, job, "findings"),
                              banner=banner, promoted=promoted_issue_types(),
                              comments=comment_counts(job["filename"]),
                              assist=AI_ENABLED and not _ephemeral(job["profile"]))
 
     if not api_configured():
-        return _report("Design copilot needs an Anthropic API key "
-                       "(ANTHROPIC_API_KEY) on the server.")
+        return _report("Design copilot needs an API key for the configured "
+                       "model provider on the server.")
     try:
         _ensure_thumbs(job_id, job)
     except RuntimeError as exc:
@@ -2051,15 +3289,21 @@ def _merge_records(job, new_records: list[dict]) -> None:
 
 @app.post("/components/{job_id}", response_class=HTMLResponse)
 def components(request: Request, job_id: str):
-    """Component review: Claude names what the things on each slide ARE and
-    which line they belong on; code measures, computes the targets and emits
-    ordinary tickable records.
+    """Component review: the visual model names what the things on each slide
+    ARE and which line they belong on; code measures, computes the targets and
+    emits ordinary tickable records.
 
-    Its own door rather than part of the audit, for the same two reasons the
+    Its own button rather than part of the audit, for the same two reasons the
     copilot has one: it costs a vision call per slide, and it sends slide
     IMAGES to the API. Neither belongs on the path a designer takes by
-    default."""
-    from .assist import api_configured
+    default. It is offered on BOTH result pages, because it answers the
+    question a designer asks on either one.
+
+    Gated on qc.llm, not on qc.assist. This asked for a second vendor's key and
+    package while run_components has gone through qc.llm with every other
+    judgment pass since 30/08/2026 - so the button refused with a message naming
+    a key the pass does not use and would never have needed (31/08/2026)."""
+    from .llm import api_configured, configuration_note
 
     off = _ai_disabled_response()
     if off is not None:
@@ -2079,17 +3323,24 @@ def components(request: Request, job_id: str):
             status_code=410)
 
     def _report(banner):
+        # Back to the page the button was on. A prepared deck reaching the
+        # audit report here would lose the coverage and the gaps, which are
+        # half of what that page is for.
+        if job.get("prep") is not None:
+            return _prep_page(job_id, job, banner=banner)
+
         from .promotion import promoted_issue_types
         from .store import comment_counts
 
         return render_report(job["manifest"], job_id, can_fix=True,
+                             tabs=_tabs_for(job_id, job, "findings"),
                              banner=banner, promoted=promoted_issue_types(),
                              comments=comment_counts(job["filename"]),
                              assist=AI_ENABLED and not _ephemeral(job["profile"]))
 
     if not api_configured():
-        return _report("Component review needs an Anthropic API key "
-                       "(ANTHROPIC_API_KEY) on the server.")
+        return _report(f"Component review needs a model key on the server: "
+                       f"{configuration_note() or _MODEL_KEY_NOTE}")
     try:
         _ensure_thumbs(job_id, job)
     except RuntimeError as exc:
@@ -2183,6 +3434,7 @@ def diff(job_id: str):
                                          "Unknown or expired job."), status_code=404)
     if not job.get("applied_records") or job.get("prev_deck") is None:
         return render_diff(job["filename"], job_id, None,
+                           tabs=_tabs_for(job_id, job, "changes"),
                            error="No applied fixes to compare yet. Apply fixes first.")
     if job.get("diff") is None:
         try:
@@ -2190,7 +3442,8 @@ def diff(job_id: str):
             job["diff"] = build_diff(job["prev_deck"], job["cleaned"],
                                      job["applied_records"])
         except RuntimeError as exc:
-            return render_diff(job["filename"], job_id, None, error=str(exc))
+            return render_diff(job["filename"], job_id, None,
+                           tabs=_tabs_for(job_id, job, "changes"), error=str(exc))
     return render_diff(job["filename"], job_id, job["diff"])
 
 

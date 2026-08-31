@@ -47,6 +47,7 @@ import re
 from pathlib import Path
 
 from .ui import MODULE_LABELS, esc, _shell, issue_label
+from .ui_chat import chat_css, chat_panel
 
 _KIND_LABEL = {
     "contrast": "Contrast",
@@ -163,7 +164,9 @@ _STYLE = """
   border-top:1px solid var(--line-soft); font-size:0.86rem }
 .auditrow:has(input:checked) { background:var(--hover) }
 .auditrow .afix { flex:0 0 6.5rem; text-align:left }
-.auditrow .nofix { font-size:0.74rem; opacity:0.7 }
+.auditrow .nofixwhy { color: var(--slate-text); font-size: 0.82rem;
+  margin-top: 0.2rem; font-style: italic; }
+.nofix { font-size:0.74rem; opacity:0.7 }
 .autocard { border-color:var(--teal) }
 .autohold { display:flex; gap:0.5rem; align-items:baseline; margin:0.6rem 0 0;
   font-size:0.84rem; color:var(--slate-text) }
@@ -453,13 +456,21 @@ def _audit_rows(job_id: str, records: list, current: int = 0,
 
     Rows with no tick say why in the last column, because "no box here" and
     "nothing wrong here" look identical otherwise."""
-    from .fixer import is_fixable, tick_reason
+    from .fixer import is_fixable, no_fix_reason, tick_reason
+
+    def _cap(text: str) -> str:
+        return text[:1].upper() + text[1:] if text else text
 
     if not records:
         return ""
     promoted = promoted or set()
     rows, fixable, preticked = [], 0, 0
-    for r in sorted(records, key=lambda r: r["severity"]):
+    # Vision first here too, for the reason the audit report does it: what the
+    # model noticed about this slide is the answer to the question the designer
+    # opened this page to ask, and a font family is not. Severity orders within
+    # each half (qc.records.FindingRecord.source).
+    for r in sorted(records, key=lambda r: (r.get("source") != "vision",
+                                            r["severity"])):
         module = MODULE_LABELS.get(r["module"], r["module"])
         if r["action"] == "changed":
             fix_cell = '<span class="pill changed">fixed</span>'
@@ -494,12 +505,21 @@ def _audit_rows(job_id: str, records: list, current: int = 0,
             fix_cell = '<span class="note nofix">Arabic, by hand</span>'
         else:
             fix_cell = '<span class="note nofix">no automatic fix</span>'
+
+        # WHY there is no tick, under the finding. "No automatic fix" on its own
+        # reads as an unfinished tool, and on a slide where three rows say it
+        # that reading is unavoidable - where "the breach is measured, the
+        # correction is not" is a designer telling another designer something
+        # true (qc.fixer.no_fix_reason, 31/08/2026).
+        why_none = "" if can_fix and is_fixable(r) else no_fix_reason(r)
+        no_fix = (f'<div class="note nofixwhy">{esc(_cap(why_none))}.'
+                  f'</div>' if why_none else "")
         rows.append(
             f'<label class="auditrow" data-sev="{esc(r["severity"])}" '
             f'data-kind="{esc(r["module"])}">'
             f'<span class="afix">{fix_cell}</span>{_sev_pill(r["severity"])}'
             f'<span class="grow" style="flex:1"><b>{esc(issue_label(r["issue_type"]))}</b>'
-            f'<div class="note">{esc(r["message"])}</div></span>'
+            f'<div class="note">{esc(r["message"])}</div>{no_fix}</span>'
             f'<span class="note" style="white-space:nowrap">{esc(module)}</span>'
             f'</label>')
 
@@ -665,7 +685,7 @@ def _strip(job_id: str, current: int, per_slide: dict, total: int) -> str:
 
 
 def _pager(job_id: str, current: int, total: int, counted: int,
-           sticky: bool = True) -> str:
+           sticky: bool = True, also_here: int = 0) -> str:
     """Where you are and how to move. The one above the split stays put while
     the slide is read; the one below it is the end of the list and scrolls away
     (two pinned copies of the same bar is two answers to "where am I")."""
@@ -675,16 +695,26 @@ def _pager(job_id: str, current: int, total: int, counted: int,
         return (f'<a class="btn ghost" href="/design/{esc(job_id)}?n={target}">'
                 f'{label}</a>')
 
+    # "nothing to decide here" is only true when nothing DECK-WIDE covers this
+    # slide either. It read as a clean bill of health on slides carrying six
+    # deck-wide decisions, which is the same overclaim _nothing_here fixes.
+    if counted:
+        tail = f" &middot; {counted} to decide here"
+    elif also_here:
+        tail = (f" &middot; nothing on its own, {also_here} deck-wide "
+                f"decision{'s' if also_here != 1 else ''} cover it")
+    else:
+        tail = " &middot; nothing to decide here"
     where = (f'<span class="note"><b>Slide {current + 1}</b> of {total}'
-             + (f" &middot; {counted} to decide here" if counted else
-                " &middot; nothing to decide here") + '</span>')
+             + tail + '</span>')
     return (f'<div class="actionbar no-print {"dbar" if sticky else "dfoot"}">'
             f'{where}<span class="grow"></span>'
             f'{link(current - 1, "&larr; Previous", current > 0)}'
             f'{link(current + 1, "Next &rarr;", current + 1 < total)}</div>')
 
 
-def _shot(job_id: str, index: int, rects: list, error: str | None) -> str:
+def _shot(job_id: str, index: int, rects: list, error: str | None,
+          tag: str = "") -> str:
     if error:
         return (f'<div class="dframe" style="padding:1.1rem">'
                 f'<p class="note">No render: {esc(error)} Everything on the '
@@ -701,17 +731,80 @@ def _shot(job_id: str, index: int, rects: list, error: str | None) -> str:
         f'width:{r["w"] * 100:.2f}%;height:{r["h"] * 100:.2f}%">'
         + (f'<b>{r["pin"]}</b>' if r.get("pin") else "") + '</div>'
         for r in rects)
-    return (f'<div class="dframe"><img src="/design-img/{esc(job_id)}/{index}.png"'
+    # ?v= is the deck's own digest (qc.web._render_tag). Without it the browser
+    # answers this URL from its own cache and the picture beside a row marked
+    # "applied" is the slide as it was before the decision.
+    return (f'<div class="dframe"><img src="/design-img/{esc(job_id)}/{index}.png'
+            f'{f"?v={esc(tag)}" if tag else ""}"'
             f' alt="Slide {index + 1}" loading="lazy">{boxes}</div>')
 
 
 # ------------------------------------------------------------------ the views
 
 
-def _tabs(job_id: str, view: str, deck_n: int, current: int) -> str:
+def _nothing_here(job_id: str, current: int, deck_findings: list) -> str:
+    """The empty state, and it must not overclaim.
+
+    "Nothing to decide on this slide. No color conflict, no unreadable text,
+    nothing overflowing its box, nothing hidden" was printed whenever this
+    slide had no finding OF ITS OWN - and a finding that spans slides is
+    deliberately shown on the deck-wide tab instead (render_design splits on
+    `f.slides == [current]`). So a slide covered by six deck-wide decisions was
+    told it was clean, while the strip above it drew dots for those same six
+    (_design_severity_map counts every finding on every slide it touches). The
+    page contradicted itself, and the half a designer reads is the sentence
+    (design lead, 27/08/2026: "how is there nothing to decide, the contents are
+    all over the place").
+
+    The split itself is right and stays: a colour spelled two ways across forty
+    shapes is one decision about the deck, and pretending it can be taken on
+    slide 2 alone would apply it to the other thirty-nine without saying so.
+    What was wrong was calling that "nothing".
+    """
+    here = [f for f in deck_findings if current in (f.slides or [])]
+    if here:
+        kinds: dict[str, int] = {}
+        for f in here:
+            label = _KIND_LABEL.get(f.kind, f.kind)
+            kinds[label] = kinds.get(label, 0) + 1
+        what = ", ".join(f"{n} {label.lower()}"
+                         for label, n in sorted(kinds.items(),
+                                                key=lambda kv: -kv[1]))
+        return (
+            f'<div class="card"><div class="tag">Decided deck-wide</div>'
+            f'<h3 style="margin:0.4rem 0">Nothing on this slide <em>alone</em>'
+            f'</h3><p class="note">This slide is covered by '
+            f'<b>{len(here)}</b> decision{"s" if len(here) != 1 else ""} that '
+            f'span several slides ({what}). They are taken once, on the '
+            f'deck-wide tab, because taking one here would silently apply it '
+            f'to every other slide it touches.</p>'
+            f'<div class="actions" style="margin-top:0.6rem">'
+            f'<a class="btn primary" href="/design/{esc(job_id)}?view=deck">'
+            f'See the {len(here)} that cover this slide</a></div></div>')
+    # Genuinely nothing from this pass. The scope of the claim is spelled out
+    # rather than left implied: text set over a picture is read as composition
+    # and never flagged (qc.design._overlap_findings - "text drawn over a
+    # graphic is the normal case"), so a visibly busy slide can be quiet here
+    # and a designer should know that is a rule and not an oversight.
+    return ('<div class="card clean"><div class="mark">&#10003;</div>'
+            '<h3 style="margin:0.4rem 0">Nothing to decide on this slide'
+            '</h3><p class="note">No colour conflict, no unreadable text, '
+            'nothing overflowing its box, nothing hidden. Text set over a '
+            'picture is read as composition and is not flagged here, so a busy '
+            'slide can still come out quiet.</p></div>')
+
+
+def _tabs(job_id: str, view: str, deck_n: int, current: int,
+          back: tuple | None = None) -> str:
     def tab(key, label, href):
         on = " primary" if view == key else " ghost"
         return f'<a class="btn{on}" href="{href}">{label}</a>'
+
+    # Where "back" goes depends on how the designer got here. A deck that was
+    # prepared came from one page carrying the coverage, the gaps and these
+    # findings together, and sending them to the audit report instead would
+    # strand the half of the answer that is about the master.
+    back_href, back_label = back or (f"/audit/{job_id}", "Back to the audit")
 
     # Unpinned on the slide view, where the pager below it is the bar that
     # stays; the deck view has no pager, so there it keeps .actionbar's own
@@ -724,8 +817,8 @@ def _tabs(job_id: str, view: str, deck_n: int, current: int) -> str:
             + '<span class="grow"></span>'
             + f'<a class="btn ghost" href="/download/{esc(job_id)}" download>'
               f'Download the deck</a>'
-            + f'<a class="btn ghost" href="/audit/{esc(job_id)}">Back to the '
-              f'audit</a></div>')
+            + f'<a class="btn ghost" href="{esc(back_href)}">'
+              f'{esc(back_label)}</a></div>')
 
 
 def _applied_block(job_id: str, applied: list, only_slide: int | None = None) -> str:
@@ -805,7 +898,11 @@ def render_design(*, deck_name: str, profile_name: str, job_id: str,
                   render_error: str | None = None,
                   has_deck: bool = True, can_fix: bool = False,
                   promoted: set | None = None,
-                  auto: dict | None = None) -> str:
+                  shot_tag: str = "",
+                  auto: dict | None = None,
+                  chat: bool = False, chat_note: str = "",
+                  back: tuple | None = None,
+                  job_tabs: str = "") -> str:
     findings = findings or []
     deck_findings = deck_findings or []
     applied = applied or []
@@ -815,7 +912,8 @@ def render_design(*, deck_name: str, profile_name: str, job_id: str,
 
     head = f"""
 <span class="kicker">Design QC &middot; {esc(profile_name)}</span>
-<h1 class="file">{esc(Path(deck_name).name)}</h1>"""
+<h1 class="file">{esc(Path(deck_name).name)}</h1>
+{job_tabs}"""
 
     notes = ""
     if banner:
@@ -829,7 +927,18 @@ def render_design(*, deck_name: str, profile_name: str, job_id: str,
                   'changed from here. The findings below are still the ones '
                   'this deck had; re-upload it to act on them.</div>')
 
-    tabs = _tabs(job_id, view, len(deck_findings), current)
+    tabs = _tabs(job_id, view, len(deck_findings), current, back)
+    # Under the tabs and above the cards: a designer reads the question they
+    # have before they read forty rows, and the answer usually tells them which
+    # row to read (qc.ui_chat).
+    ask = chat_panel(job_id, "audit", chat, chat_note)
+    # Beside the ask box rather than in the nav: it is about THIS deck, and a
+    # nav entry that needs a job id is a link that breaks when nothing is open.
+    ask += (f'<p class="note" style="margin:-0.6rem 0 1.2rem">'
+            f'What is this deck made of? '
+            f'<a href="/checklist/{esc(job_id)}">Colour and type checklist</a>'
+            f' &mdash; every colour and typeface, and which level each one comes '
+            f'from. Nothing there changes the deck.</p>')
 
     if view == "deck":
         body = (_auto_card(job_id, current, "deck", auto, can_fix)
@@ -856,7 +965,8 @@ def render_design(*, deck_name: str, profile_name: str, job_id: str,
                      '<h2>Nothing deck-wide</h2><p>Every open decision belongs '
                      'to a single slide. Use the slide view.</p></div>')
         return _shell(f"Design QC: {deck_name}",
-                      head + tabs + notes + body + _STYLE + _APPLY_JS)
+                      head + tabs + notes + ask + body + _STYLE + chat_css()
+                      + _APPLY_JS)
 
     # ---- slide view
     counts = {"error": 0, "warning": 0, "info": 0}
@@ -885,10 +995,7 @@ def render_design(*, deck_name: str, profile_name: str, job_id: str,
                                        scope=f"slide {current + 1}")
                          for f in group)
     if not findings:
-        cards = ('<div class="card clean"><div class="mark">&#10003;</div>'
-                 '<h3 style="margin:0.4rem 0">Nothing to decide on this slide'
-                 '</h3><p class="note">No color conflict, no unreadable text, '
-                 'nothing overflowing its box, nothing hidden.</p></div>')
+        cards = _nothing_here(job_id, current, deck_findings)
 
     right = (_filters(counts, sorted(kinds.items(), key=lambda kv: -kv[1]))
              + _auto_card(job_id, current, "slide", auto, can_fix)
@@ -896,14 +1003,16 @@ def render_design(*, deck_name: str, profile_name: str, job_id: str,
              + _applied_block(job_id, applied, current)
              + _audit_rows(job_id, audit_records, current, can_fix, promoted))
 
-    body = (_pager(job_id, current, total_slides, len(findings))
+    covering = sum(1 for f in deck_findings if current in (f.slides or []))
+    body = (_pager(job_id, current, total_slides, len(findings),
+                   also_here=covering)
             + _strip(job_id, current, per_slide or {}, total_slides)
             + f'<div class="dsplit"><div class="dshot">'
-            + _shot(job_id, current, rects, render_error)
+            + _shot(job_id, current, rects, render_error, shot_tag)
             + f'</div><div class="dlist">{right}</div></div>'
             + _pager(job_id, current, total_slides, len(findings),
-                     sticky=False))
+                     sticky=False, also_here=covering))
 
     return _shell(f"Design QC: {deck_name} slide {current + 1}",
-                  head + tabs + notes + body + _STYLE + _STICKY_JS + _APPLY_JS
-                  + _FILTER_JS)
+                  head + tabs + notes + ask + body + _STYLE + chat_css()
+                  + _STICKY_JS + _APPLY_JS + _FILTER_JS)

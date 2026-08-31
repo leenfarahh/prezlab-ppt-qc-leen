@@ -7,25 +7,23 @@ question captures that intent once; the answer updates the profile, so the
 same ambiguity never gets triaged again.
 
 Flow: aggregate(manifest) builds candidate questions deterministically from
-the finding metadata; generate_questions() asks Claude to select and phrase
-the few worth a designer's time (falling back to template phrasing when no
-API is configured, so the feature degrades gracefully to fully offline);
+the finding metadata; generate_questions() asks the model to select and phrase
+the few worth a designer's time (falling back to template phrasing when no API
+is configured, so the feature degrades gracefully to fully offline);
 apply_actions() writes accepted answers into the profile with a version bump.
 
-Confidentiality: only finding METADATA is ever sent to the Claude API -
-issue counts, hex colors, font family names, margin numbers, the profile
-name. Never slide text, never images, never the deck filename. Every action
-the model proposes is validated against the locally computed candidates
-before it is shown or applied; the model chooses and phrases, it does not
-invent values.
+Confidentiality: only finding METADATA is ever sent to the model - issue counts,
+hex colors, font family names, margin numbers, the profile name. Never slide
+text, never images, never the deck filename. This is the one judgment pass in
+the tool that sends no picture. Every action the model proposes is validated
+against the locally computed candidates before it is shown or applied; the model
+chooses and phrases, it does not invent values.
 """
 
 import json
 import re
 import uuid
 from collections import Counter
-
-from .config import ASSIST_MODEL
 
 MIN_COLOR_USES = 3
 MIN_FONT_USES = 3
@@ -267,40 +265,34 @@ def _fallback_questions(agg: dict) -> list[dict]:
 
 
 def api_configured() -> bool:
-    import os
+    """Whether the model can phrase these questions on this host.
 
-    try:
-        import anthropic  # noqa: F401
-    except ImportError:
-        return False
-    return bool(os.getenv("ANTHROPIC_API_KEY")
-                or os.getenv("ANTHROPIC_AUTH_TOKEN"))
+    Delegates to qc.llm rather than reading a key itself. This module built its
+    own client against a second vendor until 31/08/2026, which meant the one
+    pass in the tool that sends no image was also the one pass configured
+    somewhere else, answering to a different key and a different model
+    variable - so a host with Gemini configured got template phrasing here and
+    a model everywhere else, with nothing on the page explaining the
+    difference."""
+    from .llm import api_configured as _configured
+
+    return _configured()
 
 
-def _ask_claude(agg: dict) -> list[dict]:
-    import anthropic
+def _ask_model(agg: dict) -> list[dict]:
+    """The aggregates, phrased. No images: this pass reads finding METADATA
+    only, which is the whole reason it can run on decks whose slides must not
+    leave the machine."""
+    from .llm import ask_json
 
-    client = anthropic.Anthropic()
-    # No `thinking` parameter on purpose: omitting it is valid on every
-    # model tier (Haiku has no adaptive thinking; bigger tiers apply their
-    # own default), so QC_ASSIST_MODEL stays freely swappable.
-    response = client.messages.create(
-        model=ASSIST_MODEL,
-        max_tokens=8192,
-        output_config={"format": {"type": "json_schema",
-                                  "schema": QUESTIONS_SCHEMA}},
-        system=_SYSTEM.format(max_q=MAX_QUESTIONS),
-        messages=[{"role": "user",
-                   "content": json.dumps(agg, sort_keys=True)}],
-    )
-    if response.stop_reason == "refusal":
-        raise RuntimeError("model declined the request")
-    text = "".join(b.text for b in response.content if b.type == "text")
-    return json.loads(text)["questions"]
+    answer = ask_json(system=_SYSTEM.format(max_q=MAX_QUESTIONS),
+                      prompt=json.dumps(agg, sort_keys=True),
+                      schema=QUESTIONS_SCHEMA)
+    return answer["questions"]
 
 
 def generate_questions(agg: dict) -> tuple[list[dict], str]:
-    """(questions, source). Claude selects and phrases when configured;
+    """(questions, source). The model selects and phrases when configured;
     otherwise (or on any API failure) the template fallback asks the same
     questions offline. Either way every action is validated locally."""
     if not (agg["colors"] or agg["fonts"] or agg.get("margins")):
@@ -308,7 +300,7 @@ def generate_questions(agg: dict) -> tuple[list[dict], str]:
     raw, source = None, "assistant"
     if api_configured():
         try:
-            raw = _ask_claude(agg)
+            raw = _ask_model(agg)
         except Exception as exc:
             raw, source = None, f"fallback ({type(exc).__name__})"
     else:

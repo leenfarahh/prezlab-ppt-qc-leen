@@ -10,6 +10,9 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
 SEVERITIES = ("error", "warning", "info")
+# Where a finding came from: arithmetic over the file, or a judgment about a
+# picture of it. See FindingRecord.source.
+SOURCES = ("measured", "vision")
 ACTIONS = ("flagged", "changed", "skipped")
 CONFIDENCES = ("deterministic", "high", "medium", "low")
 MODULES = ("master_slide", "font", "margin_alignment", "color_palette",
@@ -41,6 +44,23 @@ class FindingRecord:
     # the exact paragraph/run inside the shape for fix application, e.g.
     # "p2/r1". None for shape- or slide-level records.
     locator: str | None = None
+    # WHO NOTICED. "measured" is a rule in qc/modules or qc/design.py that
+    # compared two numbers; "vision" is a judgment the model made about a
+    # picture of the slide, which code then re-measured before it became this
+    # record (qc.copilot, qc.components).
+    #
+    # Recorded because the two are different KINDS of claim and a report that
+    # interleaves them reads as one long list of equal-weight complaints. A
+    # measured finding is a fact - this run is Arial and the profile says
+    # Georgia - and it is usually also boring. A vision finding is the answer to
+    # "what would a designer change about this slide", which is the question
+    # someone actually opened the tool to ask, and it belongs at the top
+    # (design lead, 31/08/2026).
+    #
+    # It is NOT a confidence and must not be read as one: `confidence` already
+    # says how sure the tool is, and a vision finding re-measured in code can be
+    # more certain than a geometric one inferred from proximity.
+    source: str = "measured"
     created_at: str = field(default="")
 
     def to_dict(self) -> dict:
@@ -52,11 +72,13 @@ def make_record(*, slide_index: int, shape_id, module: str, issue_type: str,
                 confidence: str = "high", property: str | None = None,
                 old_value=None, new_value=None, shape_path: str | None = None,
                 arabic_flag: bool = False, profile_rule_id: str | None = None,
-                job_id: str | None = None, locator: str | None = None) -> FindingRecord:
+                job_id: str | None = None, locator: str | None = None,
+                source: str = "measured") -> FindingRecord:
     assert severity in SEVERITIES, severity
     assert action in ACTIONS, action
     assert confidence in CONFIDENCES, confidence
     assert module in RECORD_MODULES, module
+    assert source in SOURCES, source
     return FindingRecord(
         record_id=uuid.uuid4().hex,
         job_id=job_id,
@@ -75,5 +97,6 @@ def make_record(*, slide_index: int, shape_id, module: str, issue_type: str,
         profile_rule_id=profile_rule_id,
         message=message,
         locator=locator,
+        source=source,
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )

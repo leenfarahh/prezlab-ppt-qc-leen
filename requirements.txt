@@ -5,9 +5,8 @@ uvicorn[standard]==0.50.0
 python-multipart
 reportlab
 psycopg[binary]        # Postgres/Supabase backend (cloud deploy; unused locally)
-google-genai           # the judgment passes (qc/llm.py, default provider)
-anthropic              # assistant triage (qc/assist.py), and qc/llm.py's other
-                       # provider; both work offline without a key
+google-genai           # every judgment pass (qc/llm.py); the only model SDK
+                       # this build carries, and it works offline without a key
 
 # Windows desktop only (PowerPoint COM renderer). Not installed in the
 # Linux/cloud image, which renders via LibreOffice instead.

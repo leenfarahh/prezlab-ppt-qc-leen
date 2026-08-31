@@ -1,16 +1,16 @@
-"""The formatting page: apply a profile's master to every slide of a deck.
+"""The blocks that describe applying a master, for the page that does it.
 
-Separate from the audit page on purpose. Auditing reads a deck and reports;
-this REWRITES it. Those deserve different doors, different wording, and a
-result screen that says exactly what happened to each slide rather than a
-single "done".
+There is no formatting page any more. Applying a master is step 2 of Prepare a
+deck, and this module is what that page reads a rebuild through: how each slide
+was matched, what the migration moved, and what it took out and can put back.
 
-Rendering only; route logic lives in qc/web.py.
+Rendering only, and fragments only - the shell belongs to qc/ui_prep.py. Route
+logic lives in qc/web.py.
 """
 
-from .ui import _shell, esc
+from .ui import esc
 
-_RULE_LABEL = {
+RULE_LABEL = {
     "name": ("matched by name", "The deck's layout and the master's share a "
                                 "name, so the designer meant them to correspond."),
     "archetype": ("matched by archetype", "No name match, but both layouts "
@@ -28,113 +28,26 @@ _RULE_LABEL = {
         "well or the structure had no real counterpart. Open these first."),
     "none": ("no target", "The master defines no layout that could be used."),
 }
-_RULE_ORDER = ("name", "archetype", "reviewed", "reviewed (uncertain)",
+RULE_ORDER = ("name", "archetype", "reviewed", "reviewed (uncertain)",
                "fallback", "none")
+
+
+def _coverage_block(coverage) -> str:
+    """The deck-level layout gap report, when the route computed one.
+
+    Rendered by qc.ui_check, which owns this block because the re-check page
+    is where it is read most. Imported here rather than at module scope: that
+    module reads the rule labels out of this one, and a top-level import in both
+    directions is a cycle."""
+    if coverage is None:
+        return ""
+    from .ui_check import render_coverage
+
+    return render_coverage(coverage)
 
 
 def _warn(message: str) -> str:
     return f'<div class="banner warn">{esc(message)}</div>' if message else ""
-
-
-def render_format_intake(profiles: list[dict], message: str = "",
-                         com_ready: bool = True) -> str:
-    """profiles: [{id, name, has_master, layouts}] - only ones carrying a
-    master can be applied, and the rest are shown disabled WITH the reason,
-    because a silently missing option reads as a bug."""
-    usable = [p for p in profiles if p["has_master"]]
-    unusable = [p for p in profiles if not p["has_master"]]
-
-    # Each card names the master file it would apply and what frame that file
-    # states. A profile whose stored master predates the designer's latest one
-    # formats decks on the old file, and the only symptom is something missing
-    # from the output (design lead, 21/08/2026: the presentation-space
-    # rectangle). Saying it here is what turns that into a visible fact.
-    def _frame_label(p) -> str:
-        frame = (p.get("frame") or "").replace("_", " ")
-        stored = p.get("master_stored")
-        bits = [f"{p['layouts']} layouts"]
-        if stored:
-            bits.append(f"stored {stored}")
-        if frame:
-            bits.append(f"frame from {frame}")
-        return " &middot; ".join(bits)
-
-    cards = "".join(
-        f"""<label class="radio-card"><input type="radio" name="profile"
-        value="{esc(p['id'])}"{' checked' if i == 0 else ''}>
-        <span><b>{esc(p['name'])}</b><small>{_frame_label(p)}</small></span></label>"""
-        for i, p in enumerate(usable))
-
-    if not usable:
-        cards = ('<p class="note">No profile carries a master yet. Read a '
-                 'master on the <a href="/master">Read a master</a> page and '
-                 'save it as a profile; the master is stored with it and this '
-                 'page can then apply it.</p>')
-
-    others = ""
-    if unusable:
-        names = ", ".join(esc(p["name"]) for p in unusable)
-        others = (f'<p class="note">Not listed, because they carry no master '
-                  f'file to apply: {names}. A profile only gains one when it '
-                  f'is created from a master.</p>')
-
-    blocker = ""
-    if not com_ready:
-        blocker = _warn(
-            "Desktop PowerPoint is not reachable on this machine, and applying "
-            "a master needs it: PowerPoint's own placeholder matching is what "
-            "moves each slide's content into the new layout. Run this on the "
-            "Windows box.")
-
-    disabled = " disabled" if (not usable or not com_ready) else ""
-
-    body = f"""
-<h1>Apply a master to a deck.</h1>
-<p class="sub">Rebuilds every slide on the chosen master's layouts. Each slide is
-copied, the master's layout is applied to the copy, and the original is deleted,
-one slide at a time. Your upload is never modified; you get a new file back.</p>
-{_warn(message)}{blocker}
-<form action="/format" method="post" enctype="multipart/form-data" id="f">
-  <div class="drop" id="drop" tabindex="0" role="button"
-       aria-label="Drop the deck to format here or press Enter to browse">
-    <strong>Drop the deck to format here</strong> or click to browse
-    <div class="hint">Processed on this machine. The upload is deleted after
-    processing and the rebuilt deck is held in memory for download.</div>
-    <div class="file" id="fname" aria-live="polite"></div>
-    <input type="file" name="deck" id="deck" accept=".pptx" required hidden>
-  </div>
-  <div class="config">
-    <fieldset><legend>Master to apply</legend>{cards}{others}</fieldset>
-  </div>
-  <div class="actions">
-    <button class="btn primary" id="go" type="submit"{disabled}>Apply the master</button>
-  </div>
-</form>
-<script>
-const drop = document.getElementById('drop'), input = document.getElementById('deck'),
-      fname = document.getElementById('fname'), go = document.getElementById('go');
-const blocked = {str(bool(disabled)).lower()};
-function arm() {{
-  if (input.files.length) {{ fname.textContent = input.files[0].name; }}
-  go.disabled = blocked || !input.files.length;
-}}
-drop.addEventListener('click', () => input.click());
-drop.addEventListener('keydown', e => {{ if (e.key === 'Enter' || e.key === ' ') input.click(); }});
-input.addEventListener('change', arm);
-document.getElementById('f').addEventListener('submit', () => {{
-  go.disabled = true;
-  showBusy('Applying the master to ' + (input.files[0] ? input.files[0].name : 'the deck'),
-           'Rebuilding one slide at a time through PowerPoint. Expect roughly a second per slide.');
-}});
-['dragover', 'dragenter'].forEach(ev => drop.addEventListener(ev, e => {{
-  e.preventDefault(); drop.classList.add('armed'); }}));
-['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => {{
-  e.preventDefault(); drop.classList.remove('armed'); }}));
-drop.addEventListener('drop', e => {{
-  if (e.dataTransfer.files.length) {{ input.files = e.dataTransfer.files; arm(); }} }});
-arm();
-</script>"""
-    return _shell("Apply a master", body)
 
 
 def _slide_rows(plans: list, errors: dict) -> str:
@@ -145,7 +58,7 @@ def _slide_rows(plans: list, errors: dict) -> str:
             state = f'<span class="pill error">failed</span>'
             detail = esc(err)
         else:
-            label = _RULE_LABEL.get(p.match_rule, (p.match_rule, ""))[0]
+            label = RULE_LABEL.get(p.match_rule, (p.match_rule, ""))[0]
             cls = {"name": "ok", "archetype": "ok",
                    "fallback": "warn"}.get(p.match_rule, "err")
             state = f'<span class="pill {cls}">{esc(label)}</span>'
@@ -159,6 +72,64 @@ def _slide_rows(plans: list, errors: dict) -> str:
     return "".join(rows)
 
 
+def _proposed_block(changes: list, job_id: str, removed: list,
+                    remove_error: str | None = None) -> str:
+    """What the pass found that it would take out, each with a tick.
+
+    Nothing here has happened yet, and that is the point (design lead,
+    26/08/2026): the migration used to remove these and offer them back, so a
+    designer's first sight of the rebuilt deck was already missing things. The
+    wording is deliberately in the present tense - "is a second copy", not "was
+    removed" - because every one of these is still on the slide.
+    """
+    proposals = [c for c in changes if getattr(c, "remove_op", None)]
+    if not proposals:
+        return ""
+    done = set(removed or [])
+    pending = [c for c in proposals if c.remove_id not in done]
+
+    rows = []
+    for c in proposals:
+        what = esc(c.removed_text or c.action)
+        label = f"Slide {c.slide_index + 1}: <b>{what}</b>"
+        if c.remove_id in done:
+            rows.append(f'<li>{label} &mdash; '
+                        f'<span class="pill ok">taken out</span> '
+                        f'<span class="note">undo it on the review page</span>'
+                        f'</li>')
+        else:
+            rows.append(
+                f'<li><label><input type="checkbox" name="remove_ids" '
+                f'value="{esc(c.remove_id)}"> {label}</label>'
+                f'<div class="note" style="margin-left:1.4rem">'
+                f'{esc(c.detail)}</div></li>')
+
+    action = ""
+    if pending:
+        action = """
+  <div class="actions" style="margin-top:0.7rem">
+    <button class="btn ghost" type="submit"
+            data-busy="Taking out the ticked pieces">Remove the ticked
+    pieces</button>
+    <span class="note">Each comes out with an Undo beside it on the review page,
+    so this is reversible. Nothing else on the slide moves.</span>
+  </div>"""
+    err = (f'<p class="note">The removal failed: {esc(remove_error)}</p>'
+           if remove_error else "")
+
+    return f"""
+<form method="post" action="/format/{esc(job_id)}/remove">
+<div class="banner warn">
+  <b>&#33; {len(pending)} piece(s) this pass would take out, and did not.</b>
+  Nothing leaves a slide unless you say so, so they are all still in the deck.
+  Tick anything the master now supplies or that is a leftover, and it comes out
+  with an Undo attached.
+  <ul style="margin:0.5rem 0 0 1.1rem;list-style:none;padding-left:0">{''.join(rows)}</ul>
+  {action}{err}
+</div>
+</form>"""
+
+
 def _removed_block(changes: list, job_id: str, restored: list,
                    restore_error: str | None, notes: dict | None = None) -> str:
     """The removals, each with a tick to put it back.
@@ -167,7 +138,11 @@ def _removed_block(changes: list, job_id: str, restored: list,
     to retype it and place it by eye. Each piece is kept with its own XML, so
     ticking it returns the same words in the same box (design lead,
     20/08/2026)."""
-    removed = [c for c in changes if getattr(c, "removed_text", None)]
+    # Only pieces that really have gone. A proposal carries removed_text too -
+    # it is what the piece SAYS, and the page shows it either way - so keying
+    # off that alone put every proposal in a block headed "were removed".
+    removed = [c for c in changes if getattr(c, "removed_text", None)
+               and not getattr(c, "remove_op", None)]
     if not removed:
         return ""
     done = set(restored or [])
@@ -218,7 +193,9 @@ def _removed_block(changes: list, job_id: str, restored: list,
 
 def _content_section(changes: list, job_id: str = "", restored: list = (),
                      restore_error: str | None = None,
-                     restored_notes: dict | None = None) -> str:
+                     restored_notes: dict | None = None,
+                     removed: list = (),
+                     remove_error: str | None = None) -> str:
     """What moved, grouped by kind and then listed per slide. Applying the
     layout and migrating the content are separate operations with separate
     failure modes, so they get separate sections rather than one blurred
@@ -239,7 +216,9 @@ def _content_section(changes: list, job_id: str = "", restored: list = (),
         # Not all alerts are removals: a heading left sitting past the margin is
         # an alert too, and labelling every one "content was removed" would send
         # a designer hunting for text that never left the deck.
-        why = ("Content was removed" if getattr(c, "removed_text", None)
+        why = ("Left in place; you decide whether it goes"
+               if getattr(c, "remove_op", None)
+               else "Content was removed" if getattr(c, "removed_text", None)
                else "Needs a designer's decision")
         mark = (f'<span class="pill err" title="{why}">'
                 '&#33;</span> ' if alert else "")
@@ -256,6 +235,10 @@ def _content_section(changes: list, job_id: str = "", restored: list = (),
         key=lambda c: (getattr(c, "severity", "info") != "alert",
                        c.slide_index, c.action)))
 
+    # Proposals first: they are the only rows that ask the designer for
+    # something, and a deck they have not looked at yet is a deck still carrying
+    # everything this pass found.
+    proposed_block = _proposed_block(changes, job_id, removed, remove_error)
     removed_block = _removed_block(changes, job_id, restored, restore_error,
                                    restored_notes)
 
@@ -268,7 +251,7 @@ def _content_section(changes: list, job_id: str = "", restored: list = (),
     ) if misfits else ""
 
     return f"""
-{removed_block}{warn}
+{proposed_block}{removed_block}{warn}
 <div class="card">
   <div class="tag">Content</div>
   <h2 style="margin-top:0">What moved into the master</h2>
@@ -305,113 +288,3 @@ def _masters_note(masters: int, stragglers: list, plans: list) -> str:
         f"rectangle: that master is the leftover, not the applied one. Audit "
         f"the deck to see those slides as 'foreign master' findings, which the "
         f"fix engine can move onto the applied master.")
-
-
-def render_format_result(*, deck_name: str, profile_name: str, job_id: str,
-                         plans: list, errors: dict, applied: int,
-                         content_changes: list | None = None,
-                         restored: list | None = None,
-                         restored_notes: dict | None = None,
-                         restore_error: str | None = None,
-                         masters: int = 1,
-                         stragglers: list | None = None,
-                         space_notes: list | None = None) -> str:
-    counts = {}
-    for p in plans:
-        key = "failed" if p.slide_index in errors else p.match_rule
-        counts[key] = counts.get(key, 0) + 1
-
-    chips = []
-    for rule in _RULE_ORDER:
-        if counts.get(rule):
-            label, why = _RULE_LABEL[rule]
-            chips.append(f'<span class="fchip" title="{esc(why)}">'
-                         f'<b>{counts[rule]}</b> {esc(label)}</span>')
-    if counts.get("failed"):
-        chips.append(f'<span class="fchip"><b>{counts["failed"]}</b> failed</span>')
-
-    reviewed_note = ""
-    unsure = counts.get("reviewed (uncertain)", 0)
-    if counts.get("reviewed") or unsure:
-        reviewed_note = _warn(
-            f"{counts.get('reviewed', 0) + unsure} slide(s) had no layout "
-            f"matching by name or archetype and were placed by looking at the "
-            f"slide against the master's layouts, rather than falling back to "
-            f"a default. The choice is a judgment, not a fact the file states, "
-            f"so the before/after review below is where it gets confirmed"
-            + (f"; {unsure} of them are marked unsure and are the ones to open "
-               f"first." if unsure else "."))
-
-    fallback_note = ""
-    if counts.get("fallback"):
-        fallback_note = _warn(
-            f"{counts['fallback']} slide(s) had no matching layout in the "
-            f"master and fell back to a content layout. Those are the slides "
-            f"to open first: PowerPoint keeps unmatched content but leaves it "
-            f"orphaned in place rather than in a placeholder.")
-
-    restored_note = ""
-    if restored:
-        notes = list((restored_notes or {}).values())
-        over = sum(1 for d in notes if "printing over" in d)
-        restored_note = _warn(
-            f"{len(restored)} removed piece(s) are back in the deck, each at the "
-            f"exact position it was removed from and on top of its slide. "
-            + (f"{over} print over something the master has since put in that "
-               f"spot; they are named 'RESTORED ...' in PowerPoint's selection "
-               f"pane, and each row below says what it covers. " if over else "")
-            + "Download again to get the version with them: this puts content "
-              "back, it does not lay it out.")
-
-    failed_note = ""
-    if errors:
-        failed_note = _warn(
-            f"{len(errors)} slide(s) could not be rebuilt and were left exactly "
-            f"as they were. The deck is still usable; those slides simply did "
-            f"not change.")
-
-    # Whether the frame came across, stated rather than left to be discovered
-    # in master view: a marker the designer drew on one layout serves only that
-    # layout, and "the presentation space was not copied" is how that reads.
-    space_note = ""
-    if space_notes:
-        space_note = ("<div class='card'><div class='tag'>Presentation space</div>"
-                      "<ul style='margin:0.4rem 0 0 1.1rem'>"
-                      + "".join(f"<li>{esc(n)}</li>" for n in space_notes)
-                      + "</ul></div>")
-
-    body = f"""
-<h1>{esc(deck_name)}</h1>
-<p class="sub">Rebuilt <b>{applied}</b> of <b>{len(plans)}</b> slides on
-<b>{esc(profile_name)}</b>. Each slide was copied, given the master's layout,
-and the original deleted.</p>
-<div class="actions" style="gap:0.6rem">
-  <a class="btn primary" href="/format/{esc(job_id)}/review?view=master">Review before / after</a>
-  <a class="btn ghost" href="/format/{esc(job_id)}/download">Download the rebuilt deck</a>
-  <a class="btn ghost" href="/format">Format another deck</a>
-</div>
-<p class="note">The review shows the master's layouts before and after, and the
-deck slide by slide, with an Undo on every change. Look before you download:
-undoing after the file has gone out means doing it twice.</p>
-{reviewed_note}{fallback_note}{failed_note}{_masters_note(masters, stragglers or [], plans)}{restored_note}
-<div class="kpis">{''.join(chips)}</div>
-{space_note}
-{_content_section(content_changes or [], job_id, restored or [], restore_error,
-                  restored_notes or {})}
-<div class="card">
-  <div class="tag">Per slide</div>
-  <h3 style="margin:0 0 0.2rem">Layout assignment</h3>
-  <h2 style="margin-top:0">What happened to each slide</h2>
-  <p class="sub">Layout matching runs by name first, then by archetype, then
-  falls back. Every row says which rule chose its target, so a surprising
-  result is traceable rather than mysterious.</p>
-  <table class="w3">
-    <thead><tr><th>#</th><th>Was on</th><th>Now on</th><th>How</th>
-    <th>Notes</th></tr></thead>
-    <tbody>{_slide_rows(plans, errors)}</tbody>
-  </table>
-</div>
-<p class="note">Open the result in PowerPoint before sending it anywhere. This
-step hands each slide to PowerPoint's placeholder matching, which preserves
-content but can move it; that is exactly the judgment a designer signs off.</p>"""
-    return _shell(f"Applied: {deck_name}", body)

@@ -19,6 +19,7 @@ the same index in the drawing order.
 
 import io
 
+import pytest
 from fastapi.testclient import TestClient
 from pptx import Presentation
 from pptx.dml.color import RGBColor
@@ -98,7 +99,7 @@ def test_grey_on_grey_is_found_with_the_real_ratio():
     assert f.evidence["text"] == "999999"
     assert f.evidence["ground"] == "888888", \
         "the ground must be the panel behind the text, not the white slide"
-    assert f.evidence["need"] == 4.5      # 12pt is body copy
+    assert f.evidence["need"] == 7.0      # 12pt is body copy, WCAG AAA
     assert f.severity == "error"          # under 3:1 is unreadable, not merely poor
     assert abs(f.evidence["ratio"] - contrast_ratio((0x99,) * 3, (0x88,) * 3)) < 0.02
 
@@ -109,22 +110,28 @@ def test_black_on_white_is_not_a_finding():
     assert not [f for f in scan(_bytes(prs), PALETTE) if f.kind == "contrast"]
 
 
-def test_large_display_type_is_held_to_three_to_one():
-    """Without the large-text allowance every cover headline is a finding, and a
-    check that fires on every cover is a check that gets switched off."""
+def test_large_display_type_keeps_its_allowance_at_the_higher_bar():
+    """The bar moved to AAA (7:1 body, 4.5:1 display) but the allowance is part
+    of the standard, not generosity. Without it every deck's cover headline is a
+    finding, and a check that fires on every cover gets switched off.
+
+    #B4C6DA on the navy is 6.65:1: it clears 4.5 as display type and fails 7.0
+    as body copy, so one fixture proves both halves."""
     prs = _deck()
     slide = prs.slides[0]
     _box(slide, 0, 0, 13, 7, fill=0x1F3864)
-    # 3.9:1 against the navy: fails 4.5 as body copy, passes 3.0 as display type
-    _text(slide, 1, 1, 8, 1.4, "Big", 40, 0x7E97B8)
+    _text(slide, 1, 1, 8, 1.4, "Big", 40, 0xB4C6DA)
     assert not [f for f in scan(_bytes(prs), PALETTE) if f.kind == "contrast"]
 
     small = _deck()
     s2 = small.slides[0]
     _box(s2, 0, 0, 13, 7, fill=0x1F3864)
-    _text(s2, 1, 1, 8, 0.4, "Small", 10, 0x7E97B8)
+    _text(s2, 1, 1, 8, 0.4, "Small", 10, 0xB4C6DA)
     hits = [f for f in scan(_bytes(small), PALETTE) if f.kind == "contrast"]
-    assert len(hits) == 1 and hits[0].evidence["need"] == 4.5
+    assert len(hits) == 1 and hits[0].evidence["need"] == 7.0
+    assert hits[0].severity == "warning", (
+        "6.65:1 is hard to read on a projector, not unreadable; severity is a "
+        "claim about legibility and not about which standard applies")
 
 
 def test_contrast_is_not_judged_over_a_gradient():
@@ -385,8 +392,21 @@ def test_text_that_does_not_fit_its_box_is_found():
     assert f.evidence["over_in"] > 0.1
     assert f.evidence["box_in"] == 0.4
     ids = [o.remedy_id for o in f.options]
-    assert ids[0] == "autofit", "the fix that keeps working after an edit is first"
-    assert "grow" in ids and "leave" in ids
+    # Cheapest first, where the cost is to the DESIGN (design lead,
+    # 26/08/2026). Shrinking type is the most expensive fix on the list: it
+    # breaks the deck's type scale and it is the change a reader notices. With
+    # room below the box, taking that room is free, so it comes first - and
+    # because auto_choice takes the first option, this ordering is also what
+    # the tool does when a designer hands the decision over.
+    assert ids[0] == "grow", "room below the box is the cheapest fix there is"
+    assert ids.index("grow") < ids.index("autofit"), (
+        "every fix that keeps the type size comes before the ones that do "
+        "not")
+    # No explicit shrink on this one: the overflow is too big for a type
+    # tweak to absorb (MIN_SHRINK), which the finding says in its own
+    # detail. When it IS offered it sits behind autofit.
+    assert "shrink" not in ids or ids.index("autofit") < ids.index("shrink")
+    assert "leave" in ids
 
 
 def test_text_that_fits_is_not_a_finding():
@@ -785,10 +805,15 @@ def _mixed_deck():
 def test_recolouring_text_and_undoing_it_restores_the_exact_hex():
     data = _mixed_deck()
     findings = scan(data, PALETTE)
-    fixed, applied = apply_remedies(
-        data, [_pick(_one(findings, "contrast"), "ink")])
+    pick = _pick(_one(findings, "contrast"), "ink")
+    # The hex comes from the remedy, not from this test. Which colour the ink
+    # option lands on is a calibration question - it moved when the bar went to
+    # AAA - and what is under test here is that undo puts back exactly what was
+    # there, whatever was written.
+    chosen = pick[1].params["hex"]
+    fixed, applied = apply_remedies(data, [pick])
     assert applied[0].done
-    assert _run_colors(fixed)["Hard to read"] == "1A1A1A"
+    assert _run_colors(fixed)["Hard to read"] == chosen
 
     back, outcomes = apply_undo(fixed, undo_items(applied))
     assert outcomes[0]["done"]
@@ -1144,6 +1169,49 @@ def test_a_clean_slide_says_so_and_still_shows_its_audit_rows(monkeypatch):
     assert 'name="pick_' not in three
 
 
+def test_a_slide_covered_only_by_deck_wide_decisions_is_not_called_clean():
+    """The page used to contradict itself (design lead, 27/08/2026).
+
+    A finding that spans slides is shown on the deck-wide tab, so a slide with
+    none of its OWN got "Nothing to decide on this slide. No color conflict, no
+    unreadable text, nothing overflowing its box, nothing hidden" - while the
+    strip directly above it drew a dot for every deck-wide finding touching
+    that same slide. A designer looking at an obviously broken slide reads the
+    sentence, not the dot.
+    """
+    from qc.design import DesignFinding, Remedy
+    from qc.ui_design import render_design
+
+    def _f(fid, kind, slides):
+        return DesignFinding(
+            finding_id=fid, kind=kind, severity="warning",
+            headline=f"{kind} across slides", detail="d", slides=list(slides),
+            options=[Remedy("a", "Do it", "n", op="x"),
+                     Remedy("leave", "Leave it", "n")])
+
+    deck_wide = [_f("d1", "palette", [0, 1, 5]), _f("d2", "overlap", [1, 7]),
+                 _f("d3", "palette", [1, 2, 3])]
+    covered = render_design(deck_name="d.pptx", profile_name="P", job_id="j1",
+                            current=1, total_slides=26, findings=[],
+                            deck_findings=deck_wide, audit_records=[])
+
+    assert "Nothing to decide on this slide" not in covered
+    assert "covered by <b>3</b>" in covered
+    assert "2 palette, 1 overlap" in covered, "say what kind of decisions"
+    assert "/design/j1?view=deck" in covered, "and give a way to reach them"
+    # The pager has to agree with the card; two answers to "is this slide ok"
+    # is how the contradiction happened in the first place.
+    assert "nothing to decide here" not in covered
+    assert "3 deck-wide decisions cover it" in covered
+
+    # A slide no deck-wide finding touches still reads as genuinely clean.
+    clean = render_design(deck_name="d.pptx", profile_name="P", job_id="j1",
+                          current=9, total_slides=26, findings=[],
+                          deck_findings=deck_wide, audit_records=[])
+    assert "Nothing to decide on this slide" in clean
+    assert "nothing to decide here" in clean
+
+
 def test_the_page_carries_filters_for_severity_and_type(monkeypatch):
     client = _client(monkeypatch)
     job = _audit_job(client, _four_slide_deck())
@@ -1353,12 +1421,55 @@ def test_ticking_nothing_leaves_the_deck_alone(monkeypatch):
     assert web._jobs[job]["deck"] == before
 
 
-def test_a_row_with_no_automatic_fix_says_so_rather_than_showing_nothing(
-        monkeypatch):
-    """"No box here" and "nothing wrong here" look identical otherwise."""
-    client = _client(monkeypatch)
-    job = _audit_job(client, _four_slide_deck())
-    assert "no automatic fix" in client.get(f"/design/{job}?n=1").text
+def test_a_row_with_no_automatic_fix_says_so_and_says_why(monkeypatch):
+    """"No box here" and "nothing wrong here" look identical otherwise - and
+    "no automatic fix" with no reason beside it looks like an unfinished tool,
+    which is the complaint that put the reason there (31/08/2026).
+
+    Asserted over the whole deck rather than one slide: which findings land on
+    slide 1 depends on the fixture, and a test pinned to that breaks every time
+    a check becomes fixable rather than when the behaviour under test breaks."""
+    from qc.fixer import no_fix_reason
+
+    from qc.records import make_record
+    from qc.ui_design import render_design
+
+    # A finding that genuinely has no fix, built here rather than fished out of
+    # a fixture: which checks fire on a sample deck changes whenever a check
+    # becomes fixable, and this test is about the ROW, not about the deck.
+    unfixable = make_record(
+        slide_index=0, shape_id="5", module="margin_alignment",
+        issue_type="margin_alignment.outside_safe_zone",
+        severity="warning", confidence="deterministic",
+        message="shape breaches safe zone edges: bottom").to_dict()
+
+    html = render_design(deck_name="d.pptx", profile_name="Prezlab EN",
+                         job_id="j1", current=0, total_slides=1,
+                         audit_records=[unfixable], can_fix=True)
+    assert "no automatic fix" in html
+    # Matched mid-sentence: the row sentence-cases the reason, so the first
+    # word is not a stable thing to assert on.
+    assert "could push it onto its neighbour" in html, (
+        "the row has to say WHY, not just that there is no tick")
+
+    # and every phrasing the reason table can produce is a real sentence
+    for issue in ("margin_alignment.outside_safe_zone", "header_footer.missing",
+                  "margin_alignment.heading_past_margin"):
+        why = no_fix_reason({"issue_type": issue, "arabic_flag": False,
+                             "action": "flagged", "confidence": "high",
+                             "new_value": None})
+        assert why and not why.endswith("."), (
+            f"{issue}: the UI adds the full stop, so the reason must not")
+
+
+def test_a_fixable_row_offers_no_excuse(monkeypatch):
+    """The reason line is for rows that cannot be ticked. Printing one next to
+    a tick would be the page arguing with itself."""
+    from qc.fixer import no_fix_reason
+
+    assert no_fix_reason({"issue_type": "font.size_off_role",
+                          "arabic_flag": False, "action": "flagged",
+                          "confidence": "high", "new_value": 44.0}) == ""
 
 
 def test_the_stale_render_is_dropped_when_a_fix_is_ticked_here(monkeypatch):
@@ -1728,3 +1839,265 @@ def test_a_fix_that_asks_for_approval_is_not_taken_by_the_auto_pass(monkeypatch)
                 data={"scope": "deck", "n": 0, "include_holds": "1"})
     assert web._jobs[job]["applied_records"], \
         "saying yes to the held fixes did not release them"
+
+
+# ----------------------------------------- the cheap ways out of an overflow
+#
+# Design lead, 26/08/2026: when text does not fit, the answers are the box's
+# internal margins, its width, its height, and only then the type size. The card
+# offered two of the four and led with the type size, which is the one a reader
+# notices and the one that breaks the deck's scale.
+
+_TIGHT_COPY = ("Sharia medicine services, tax return submission and rather "
+               "more copy than this card was ever drawn to hold on a single "
+               "slide")
+
+
+def _narrow(x=1, y=1, w=2.2, h=0.6, pad=None):
+    """A box too small for its copy, with the slide's whole width to its right.
+    Calibrated against the estimator rather than guessed: at 2.2in by 0.6in this
+    copy overflows by 0.4in."""
+    prs = _deck()
+    box = _text(prs.slides[0], x, y, w, h, _TIGHT_COPY, 12)
+    box.text_frame.word_wrap = True
+    if pad is not None:
+        for edge in ("left", "right", "top", "bottom"):
+            setattr(box.text_frame, f"margin_{edge}", Emu(int(pad * IN)))
+    return prs, box
+
+
+def _overflow_of(data):
+    return next(f for f in scan(data, PALETTE)
+                if f.kind == "fit" and "more text" in f.headline)
+
+
+def test_a_hand_padded_box_is_offered_its_padding_back_first():
+    """Padding is the only dimension of a fit problem that costs nothing: it is
+    invisible on the slide, so returning it moves nothing and changes no type
+    size. A card that leads with a shrink is recommending the most expensive fix
+    on its own list."""
+    prs, _box = _narrow(w=2.2, h=0.8, pad=0.45)
+    f = _overflow_of(_bytes(prs))
+    ids = [o.remedy_id for o in f.options]
+    assert ids[0] == "insets", ids
+    assert ids.index("insets") < ids.index("autofit")
+
+    reset = next(o for o in f.options if o.remedy_id == "insets")
+    assert reset.params["left"] == 91440 and reset.params["top"] == 45720, \
+        "it resets to PowerPoint's default, not to zero"
+
+
+def test_a_box_at_default_padding_is_not_offered_its_padding_back():
+    """There is nothing to return. An option that changes nothing is a button
+    that does nothing, and a card carrying one teaches a designer to stop
+    reading the cards."""
+    prs, _box = _narrow(w=2.2, h=0.8)
+    ids = [o.remedy_id for o in _overflow_of(_bytes(prs)).options]
+    assert "insets" not in ids
+
+
+def test_returning_the_padding_is_reversible():
+    prs, _box = _narrow(w=2.2, h=0.8, pad=0.45)
+    data = _bytes(prs)
+    fixed, applied = apply_remedies(data, [_pick(_overflow_of(data), "insets")])
+    assert applied[0].done
+
+    after = Presentation(io.BytesIO(fixed)).slides[0].shapes[0].text_frame
+    assert (after.margin_top, after.margin_left) == (45720, 91440)
+
+    back, _o = apply_undo(fixed, undo_items(applied))
+    before = Presentation(io.BytesIO(back)).slides[0].shapes[0].text_frame
+    assert before.margin_top == Emu(int(0.45 * IN)), "exactly back, not near"
+
+
+def test_a_box_with_room_beside_it_is_offered_a_width_that_really_fits():
+    """The widening is measured, not solved for. Line count is a step function
+    of width - a box gets no shorter until it gains enough to pull one more word
+    up - so a width computed as if height moved continuously with width would
+    name one the text does not actually fit in."""
+    from qc.design import natural_text_height
+
+    prs, _box = _narrow()
+    data = _bytes(prs)
+    widen = next((o for o in _overflow_of(data).options
+                  if o.remedy_id == "widen"), None)
+    assert widen is not None, "there is most of a slide of room to the right"
+
+    reopened = Presentation(io.BytesIO(data))
+    placed = next(p for p in placed_shapes(reopened.slides[0])
+                  if p.shape.has_text_frame)
+    left, top, right, bottom = placed.box
+    after = natural_text_height(
+        placed.shape, (left, top, right + widen.params["dw"], bottom),
+        reopened.slides[0], reopened)
+    assert after is not None and after <= bottom - top, \
+        "the width offered has to be one the text fits in"
+
+
+def test_widening_holds_the_left_edge_and_is_reversible():
+    """Growing a box rightwards is a different fix from growing it leftwards,
+    and a resize that picks one silently moves something the designer placed."""
+    prs, _box = _narrow()
+    data = _bytes(prs)
+    fixed, applied = apply_remedies(data, [_pick(_overflow_of(data), "widen")])
+    assert applied[0].done
+
+    after = Presentation(io.BytesIO(fixed)).slides[0].shapes[0]
+    assert after.left == Emu(IN), "the left edge stays where it was put"
+    assert after.width > Emu(int(2.2 * IN))
+
+    back, _o = apply_undo(fixed, undo_items(applied))
+    original = Presentation(io.BytesIO(back)).slides[0].shapes[0]
+    assert (original.left, original.width) == (Emu(IN), Emu(int(2.2 * IN)))
+
+
+def test_a_box_with_nowhere_to_grow_is_offered_no_growth():
+    """The cheap fixes are offered only when they would work. A box in the
+    bottom-right corner has no room in either direction, and inventing a grow
+    that runs off the slide would be worse than offering the type options."""
+    prs, _box = _narrow(x=13.333 - 2.05, y=7.5 - 0.55, w=2.0, h=0.5)
+    ids = [o.remedy_id for o in _overflow_of(_bytes(prs)).options]
+    assert ids[0] == "autofit", ids
+    assert "grow" not in ids and "widen" not in ids and "insets" not in ids
+    assert "leave" in ids
+
+
+# --------------------------------------- when nothing can clear the bar
+#
+# The bar is WCAG AAA (design lead, 26/08/2026). At 7:1 a mid-grey ground admits
+# NO text colour at all: black itself reaches about 5.9 on #888888. That case
+# barely existed at AA and is common at AAA, so the card has to handle it.
+
+
+def _grey_on_grey():
+    prs = _deck()
+    slide = prs.slides[0]
+    _box(slide, 1, 1, 5, 2, fill=0x888888)
+    _text(slide, 1.2, 1.2, 4, 0.6, "Hard to read", 12, 0x999999)
+    return prs
+
+
+def test_the_closest_reading_is_offered_when_nothing_clears_the_bar():
+    """A card with nothing on it but "leave it as it is" reads as a tool with no
+    idea, when in fact it knows exactly what the best available reading is and
+    how far short it falls. Both facts go on the card."""
+    f = _one(scan(_bytes(_grey_on_grey()), PALETTE), "contrast")
+    ink = next(o for o in f.options if o.remedy_id == "ink")
+    assert "still under" in ink.note.lower()
+    assert "7.0:1" in ink.note, "the bar it falls short of has to be named"
+
+    # and it still has to be an improvement worth clicking
+    from qc.design import contrast_ratio, parse_hex
+
+    got = contrast_ratio(parse_hex(ink.params["hex"]), (0x88,) * 3)
+    assert got > f.evidence["ratio"] + 0.1
+
+
+def test_the_fix_that_clears_the_bar_is_offered_before_the_one_that_does_not():
+    """Recolouring the text is cheaper than repainting the panel and is normally
+    the recommendation. On this ground it cannot clear 7:1 and repainting can, so
+    it cannot be the recommendation here - auto_choice takes the first option,
+    and the tool must not hand over a fix that leaves the finding standing."""
+    f = _one(scan(_bytes(_grey_on_grey()), PALETTE), "contrast")
+    ids = [o.remedy_id for o in f.options]
+    assert ids[0] == "ground", ids
+    assert ids.index("ground") < ids.index("ink")
+    assert ids[-1] == "leave", "leaving it is always last and always available"
+
+
+def test_answering_with_the_first_option_really_clears_it():
+    """The end of the auto path: take the tool's own recommendation and the
+    finding is gone, not merely improved."""
+    from qc.design import auto_choice
+
+    data = _bytes(_grey_on_grey())
+    f = _one(scan(data, PALETTE), "contrast")
+    fixed, applied = apply_remedies(data, [(f, auto_choice(f))])
+    assert applied[0].done
+    assert not [x for x in scan(fixed, PALETTE) if x.kind == "contrast"]
+
+
+def test_an_unreadable_ratio_is_an_error_and_a_short_one_is_a_warning():
+    """Severity is a claim about legibility, not about which standard applies.
+    Raising the bar to AAA must not promote every AA-passing warning to an
+    error."""
+    from qc.design import UNREADABLE_RATIO
+
+    assert UNREADABLE_RATIO == 3.0
+    assert _one(scan(_bytes(_grey_on_grey()), PALETTE),
+                "contrast").severity == "error"     # 1.2:1
+
+    prs = _deck()
+    slide = prs.slides[0]
+    _box(slide, 0, 0, 13, 7, fill=0x1F3864)
+    _text(slide, 1, 1, 8, 0.4, "Small", 10, 0xB4C6DA)   # 6.65:1
+    assert _one(scan(_bytes(prs), PALETTE), "contrast").severity == "warning"
+
+
+# ------------------------------------------------- the geometry fast paths
+#
+# qc.design reads placeholder geometry and caches the slide walk itself rather
+# than going through python-pptx's inheritance machinery on every read, because
+# that machinery is a linear scan with an lxml xpath per candidate and it ran
+# four times per slide (30/08/2026: 96,760 xpath calls, 7.7s of a 19s scan).
+# Both shortcuts are only worth having while they are INVISIBLE, so what these
+# pin is that the answer did not change and that the cache cannot outlive the
+# scan that opened it.
+
+
+def test_inherited_placeholder_geometry_matches_python_pptx_exactly():
+    """A placeholder that states no position of its own inherits it from the
+    layout. _dimensions resolves that itself; it must agree with the library on
+    every shape, or every box in the audit moves."""
+    from qc.design import _dimensions
+    from qc.util import iter_shapes_deep
+
+    prs = Presentation()                      # its layouts are full of these
+    for layout in list(prs.slide_layouts)[:6]:
+        prs.slides.add_slide(layout)
+
+    checked = inheriting = 0
+    for slide in prs.slides:
+        for shape, _path in iter_shapes_deep(slide.shapes):
+            checked += 1
+            el = shape._element
+            if None in (el.x, el.y, el.cx, el.cy):
+                inheriting += 1
+            assert _dimensions(shape) == (shape.left, shape.top,
+                                          shape.width, shape.height), (
+                f"{shape.name!r} disagrees with python-pptx")
+    assert inheriting, "this fixture is meant to exercise the inherited path"
+
+
+def test_the_slide_walk_cache_does_not_outlive_the_scan():
+    """A cache of BOXES is not a cache of identities: qc.remedy and qc.fixer
+    move shapes, so a box that survived its scan would be a wrong answer waiting
+    to be given. It is scoped to the scan and closed even when one raises."""
+    from qc import design
+
+    assert design._PLACED_MEMO is None, "nothing cached before a scan"
+    scan(_bytes(_deck(2)))
+    assert design._PLACED_MEMO is None, "and nothing left behind after one"
+
+    with pytest.raises(RuntimeError):
+        with design._placed_cache():
+            assert design._PLACED_MEMO is not None
+            raise RuntimeError("a check blew up mid-scan")
+    assert design._PLACED_MEMO is None, "a failed scan still closes its cache"
+
+
+def test_the_cached_walk_is_the_same_walk():
+    """Inside the cache the second call must be the first call's answer, and it
+    must equal what the uncached function returns."""
+    from qc import design
+
+    prs = _deck(1)
+    slide = prs.slides[0]
+    _box(slide, 1, 1, 2, 2, fill=0x123456)
+    uncached = [(p.z, p.top, p.box, p.grouped) for p in placed_shapes(slide)]
+
+    with design._placed_cache():
+        first = placed_shapes(slide)
+        second = placed_shapes(slide)
+    assert first is second, "the second call inside a scan is not a second walk"
+    assert [(p.z, p.top, p.box, p.grouped) for p in first] == uncached

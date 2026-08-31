@@ -29,7 +29,8 @@ _SIZE_RE = re.compile(r"^(\d+)x(\d+)$")
 _LOC_RE = re.compile(r"^p(\d+)/r(\d+)$")
 _TABLE_LOC_RE = re.compile(r"^t(\d+),(\d+)/p(\d+)/r(\d+)$")
 
-FIXABLE_ISSUES = ("font.family_out_of_set", "master_slide.placeholder_geometry_off",
+FIXABLE_ISSUES = ("font.family_out_of_set", "font.size_off_role",
+                  "master_slide.placeholder_geometry_off",
                   "shape_size.size_mismatch", "header_footer.text_mismatch",
                   "margin_alignment.edge_misaligned",
                   "margin_alignment.uneven_spacing",
@@ -49,7 +50,11 @@ FIXABLE_ISSUES = ("font.family_out_of_set", "master_slide.placeholder_geometry_o
                   "margin_alignment.body_below_band",
                   "color_palette.off_palette_rgb",
                   "margin_alignment.space_edge_misaligned",
-                  "margin_alignment.component_edge_misaligned")
+                  "margin_alignment.component_edge_misaligned",
+                  # Changes the shape TREE, which is the most invasive thing
+                  # this tool does to a slide, so it is never pre-ticked
+                  # (_MODEL_JUDGED).
+                  "margin_alignment.should_be_grouped")
 
 # Deliberately absent from the list above, and to stay absent:
 # margin_alignment.heading_past_margin. A title or standfirst running past a
@@ -77,10 +82,17 @@ _POSITIONAL_ISSUES = {"margin_alignment.edge_misaligned",
 # Heuristic detections are still tickable (a designer's tick IS per-change
 # validation) but carry lower confidence than the default floor.
 _MIN_CONFIDENCE = {
+    # medium = a judgment about what belongs together, checked against the
+    # geometry but not derived from it. Tickable, never pre-ticked.
+    "margin_alignment.should_be_grouped": ("deterministic", "high", "medium"),
     "margin_alignment.edge_misaligned": ("deterministic", "high", "medium"),
     "margin_alignment.uneven_spacing": ("deterministic", "high", "medium", "low"),
     "margin_alignment.cluster_rhythm": ("deterministic", "high", "medium"),
     "typography.size_inconsistent": ("deterministic", "high", "medium"),
+    # medium = the run is not a placeholder, so which ROLE it plays was
+    # inferred rather than read off the layout. Tickable: the target is the
+    # profile's own number either way, and a wrong role is visible at a glance.
+    "font.size_off_role": ("deterministic", "high", "medium"),
     # deterministic = clone-master repoint (visual no-op); medium = PowerPoint
     # re-applies the layout via COM behind designer approval
     "master_slide.foreign_master": ("deterministic", "high", "medium"),
@@ -92,7 +104,7 @@ _MIN_CONFIDENCE = {
     # because a designer's tick IS the per-change validation, and never
     # pre-ticked (_COLOR_TICK_IS_APPROVAL).
     "color_palette.off_palette_rgb": ("deterministic", "high", "medium"),
-    # medium by construction: a component review is a judgment Claude made
+    # medium by construction: a component review is a judgment the model made
     # about the design, re-verified against the geometry but never promoted
     # to deterministic. Tickable, never pre-ticked.
     "margin_alignment.component_edge_misaligned": ("high", "medium"),
@@ -154,18 +166,23 @@ _COLOR_TICK_IS_APPROVAL = {"color_palette.off_palette_rgb"}
 
 
 # Anything a language model judged. The geometry is re-verified by code before
-# the record exists, so the NUMBERS are the tool's; what came from Claude is the
+# the record exists, so the NUMBERS are the tool's; what came from the model is the
 # claim that these shapes are one component and that this line is the intended
 # one. That is a design judgment, and a design judgment is the designer's to
 # confirm - so it is offered, never pre-selected, whatever its confidence.
-_MODEL_JUDGED = {"margin_alignment.component_edge_misaligned"}
+_MODEL_JUDGED = {"margin_alignment.component_edge_misaligned",
+                 "margin_alignment.should_be_grouped"}
 
 
 def tick_reason(record: dict) -> str | None:
     """Why this fix is never pre-selected, in the words the UI shows, or None
     when it may be pre-ticked on the usual evidence."""
+    if record["issue_type"] == "margin_alignment.should_be_grouped":
+        return ("the model judged these shapes to be one object and this writes "
+                "that into the file; grouping is easy to undo and easy to miss, "
+                "so ticking it is your approval")
     if record["issue_type"] in _MODEL_JUDGED:
-        return ("Claude grouped these shapes and chose the line; the geometry "
+        return ("The model grouped these shapes and chose the line; the geometry "
                 "was checked but the judgment is yours to confirm")
     if record["issue_type"] in _BLOCK_MOVE_IS_APPROVAL:
         return ("moves every element on the slide down together: ticking it "
@@ -178,6 +195,93 @@ def tick_reason(record: dict) -> str | None:
             and record["issue_type"] in _ARABIC_TICK_IS_APPROVAL:
         return "Arabic font substitution: ticking it is your explicit approval"
     return None
+
+
+# Why a whole ISSUE TYPE has no automatic fix. Keyed by type, because the answer
+# is a property of the check rather than of the slide it fired on.
+#
+# WRITTEN DOWN BECAUSE THE UI WAS SAYING NOTHING. A row that reads "no automatic
+# fix" and stops invites exactly one conclusion - the tool is half-finished -
+# and on a slide where three rows say it in a column, that conclusion is
+# unavoidable (design lead, 31/08/2026). Every one of these has a reason, and
+# most of the reasons are that the tool would have to make a decision that is
+# not its to make.
+_NO_FIX_REASON = {
+    "margin_alignment.outside_safe_zone":
+        "the breach is measured, the correction is not: moving the shape in "
+        "could push it onto its neighbour, and shrinking it changes the "
+        "composition. Nudge it in PowerPoint",
+    "margin_alignment.heading_past_margin":
+        "a heading running wide is a house-style question for the client, not "
+        "a defect to correct",
+    "header_footer.missing":
+        "adding a placeholder means inserting a shape the slide does not have. "
+        "Apply the layout that carries it, or add it on the master",
+    "header_footer.position_mismatch":
+        "the master states where this belongs and the slide disagrees; moving "
+        "it slide-by-slide hides that rather than fixing it",
+    "header_footer.font_mismatch":
+        "the footer's type comes from the master, so correcting it here would "
+        "pin one slide out of step with the rest",
+    "font.mixed_weight":
+        "which weight was intended is a design decision - the tool can see "
+        "that a paragraph mixes them, not which one is right",
+    "font.theme_ref_disallowed":
+        "the profile asks for stated families and this run resolves through "
+        "the theme; changing that is a master decision",
+    "color_palette.disallowed_theme_slot":
+        "the slot is wrong at the theme level, so every deck on this master "
+        "has it. Fixing one shape leaves the cause in place",
+    "master_slide.layout_outlier":
+        "a layout used once is worth a look, not a change",
+    "master_slide.no_usable_master":
+        "there is nothing to correct against until the deck has a master",
+    "margin_alignment.squeezed_text":
+        "the box is too small for its text and both are the designer's: "
+        "resizing changes the layout, re-typing changes the copy",
+    "margin_alignment.text_overlap":
+        "two text blocks overlap and which one should move is a composition "
+        "decision",
+    "margin_alignment.text_anchor_mismatch":
+        "vertical anchoring is a deliberate choice as often as it is a slip",
+    "margin_alignment.overlap_check_capped":
+        "a note about the run, not a finding on the slide",
+    "shape_size.off_grid":
+        "the grid is advisory in this profile; snapping to it would resize "
+        "shapes nobody asked to resize",
+    "preflight.unmodifiable_content":
+        "the tool could not open this content, so it cannot change it either",
+}
+
+
+def no_fix_reason(record: dict) -> str:
+    """Why this row has no tick, in the words the UI shows. "" when it has one.
+
+    Answers in the order the checks actually run, because a designer reads the
+    FIRST reason as the reason: an Arabic block outranks a missing target, which
+    outranks the type having no fix at all.
+    """
+    if record.get("action") == "changed":
+        return ""
+    if is_fixable(record):
+        return ""
+    issue = record.get("issue_type", "")
+    if issue in FIXABLE_ISSUES:
+        # The type has a fix; THIS record cannot use it.
+        if record.get("arabic_flag"):
+            return ("Arabic content: this correction edits runs, and the tool "
+                    "never re-types Arabic without a designer")
+        if record.get("action") != "flagged":
+            return "already handled during the run"
+        allowed = _MIN_CONFIDENCE.get(issue, ("deterministic", "high"))
+        if record.get("confidence") not in allowed:
+            return (f"read with {record.get('confidence')} confidence, which is "
+                    f"below the bar for changing a client's file automatically")
+        return ("the check found no safe target to correct this to on this "
+                "slide")
+    return _NO_FIX_REASON.get(
+        issue, "this check reports what it sees and does not compute a "
+               "correction")
 
 
 def needs_explicit_tick(record: dict) -> bool:
@@ -800,6 +904,43 @@ def _fix_set_run_sizes(shape, record) -> str | None:
     return None
 
 
+def _fix_role_size(shape, record) -> str | None:
+    """Set every run in the shape to the role's target size, in POINTS.
+
+    Not _fix_set_run_sizes: that one reads new_value as an OOXML `sz`
+    (hundredths of a point) because it comes from a sibling run's own
+    attribute, where this reads a profile value that is stated in points.
+    Sharing the function would have set a 44pt title to 0.44pt.
+
+    WHAT THIS HARD-CODES. When the size was inherited - from the layout, the
+    master or the theme - writing it onto the run pins it, so a later change to
+    the master's title size stops reaching this slide. That is the same trade
+    the family fix already makes (_fix_font_family), and it is why the record
+    keeps its source in the message: a designer reading "source
+    layout.placeholder" is being told the value is currently tracking the
+    master, and ticking the fix is choosing the deck over the master for this
+    run (design lead, 31/08/2026).
+    """
+    from pptx.util import Pt
+
+    try:
+        points = float(record["new_value"])
+    except (TypeError, ValueError):
+        return "new_value is not a point size"
+    if points <= 0:
+        return "target size is not a positive point value"
+    if not getattr(shape, "has_text_frame", False):
+        return "shape has no text frame"
+    touched = 0
+    for para in shape.text_frame.paragraphs:
+        for run in para.runs:
+            run.font.size = Pt(points)
+            touched += 1
+    if not touched:
+        return "no runs to resize"
+    return None
+
+
 def _fix_stop_autofit(shape, record) -> str | None:
     """'Stop Fitting Text to This Placeholder': replace the shrink-on-overflow
     autofit with noAutofit so the title renders at its intended size. The
@@ -961,6 +1102,70 @@ def _fix_space_edge(shape, record, slide=None) -> str | None:
     return None
 
 
+def _fix_group(shape, record, slide=None) -> str | None:
+    """Wrap a component's shapes in a real group.
+
+    The group's own extent is the members' bounding box, and its CHILD extent is
+    set to the same rectangle. That is what keeps the members exactly where they
+    are: a child's offset is in the group's child space, so a child space equal
+    to the parent space is an identity transform - the same two rectangles
+    qc.design._group_transform reads from the other end.
+
+    Inserted at the position of the member that was FIRST in the drawing order,
+    so the group sits where its topmost part sat and nothing changes what covers
+    what.
+    """
+    from lxml import etree
+
+    if slide is None:
+        return "grouping needs the slide"
+    wanted = [i for i in str(record.get("new_value") or "").split(",") if i]
+    if len(wanted) < 2:
+        return "a group needs at least two shapes"
+
+    spTree = slide.shapes._spTree
+    by_id = {str(s.shape_id): s for s in slide.shapes}
+    members = [by_id[i] for i in wanted if i in by_id]
+    if len(members) != len(wanted):
+        # The slide moved on since the review. Grouping what is left would be a
+        # guess at what the component was.
+        return "some of those shapes are no longer on the slide"
+
+    boxes = [(s.left, s.top, s.width, s.height) for s in members]
+    if any(v is None for b in boxes for v in b):
+        return "one of those shapes states no size of its own"
+    left = min(b[0] for b in boxes)
+    top = min(b[1] for b in boxes)
+    right = max(b[0] + b[2] for b in boxes)
+    bottom = max(b[1] + b[3] for b in boxes)
+    if right <= left or bottom <= top:
+        return "those shapes have no extent between them"
+
+    order = list(spTree)
+    first = min(members, key=lambda s: order.index(s._element))
+    next_id = max(int(i) for i in by_id if i.isdigit()) + 1
+
+    P = "http://schemas.openxmlformats.org/presentationml/2006/main"
+    A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    name = f"Group {next_id}"
+    grp = etree.fromstring(
+        f'<p:grpSp xmlns:p="{P}" xmlns:a="{A}">'
+        f'<p:nvGrpSpPr>'
+        f'<p:cNvPr id="{next_id}" name="{name}"/><p:cNvGrpSpPr/><p:nvPr/>'
+        f'</p:nvGrpSpPr>'
+        f'<p:grpSpPr><a:xfrm>'
+        f'<a:off x="{int(left)}" y="{int(top)}"/>'
+        f'<a:ext cx="{int(right - left)}" cy="{int(bottom - top)}"/>'
+        f'<a:chOff x="{int(left)}" y="{int(top)}"/>'
+        f'<a:chExt cx="{int(right - left)}" cy="{int(bottom - top)}"/>'
+        f'</a:xfrm></p:grpSpPr></p:grpSp>')
+
+    first._element.addprevious(grp)
+    for member in members:
+        grp.append(member._element)
+    return None
+
+
 def _fix_component_edge(shape, record, slide=None) -> str | None:
     """Move a whole component onto a stated line.
 
@@ -1114,6 +1319,7 @@ _FIXERS = {
     "typography.case_inconsistent": _fix_retype_upper,
     "typography.redundant_size_override": _fix_strip_size_overrides,
     "typography.size_inconsistent": _fix_set_run_sizes,
+    "font.size_off_role": _fix_role_size,
     "margin_alignment.content_overflow": _fix_rescale,
     "font.cs_typeface_missing": _fix_font_family,
     "margin_alignment.recurring_off_position": _fix_pin,
@@ -1125,6 +1331,7 @@ _FIXERS = {
     # uses, because the only difference is where the target came from
     "margin_alignment.space_edge_misaligned": _fix_space_edge,
     "margin_alignment.component_edge_misaligned": _fix_component_edge,
+    "margin_alignment.should_be_grouped": _fix_group,
 }
 
 
@@ -1280,7 +1487,7 @@ def apply_fixes(deck_bytes: bytes, records: list[dict], record_ids: set[str]) ->
         fixer = _FIXERS[rec["issue_type"]]
         if fixer in (_fix_uneven_spacing, _fix_edge, _fix_fake_slide_number,
                      _fix_lift, _fix_rescale, _fix_pin, _fix_body_band,
-                     _fix_space_edge, _fix_component_edge):
+                     _fix_space_edge, _fix_component_edge, _fix_group):
             error = fixer(shape, rec, slide=slide)
         else:
             error = fixer(shape, rec)

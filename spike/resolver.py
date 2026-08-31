@@ -119,27 +119,77 @@ def _lstStyle_defRPr(txBody, level: int):
     return find(find(lst, f"a:lvl{level + 1}pPr"), "a:defRPr")
 
 
+# Both lookups below are a LINEAR SCAN of a placeholder collection, and
+# iterating one runs an lxml xpath per shape it passes (CT_Shape.ph). rpr_layers
+# does both on EVERY RUN - so a deck's fonts and colours are resolved by
+# re-deriving the same two small maps thousands of times.
+#
+# Measured on fixtures/large_200.pptx (30/08/2026): after the equivalent fix in
+# qc.design._dimensions, these were still 70,423 xpath calls and about a third
+# of a design scan. The layout and the master do not gain or lose placeholders
+# while a deck is being read, so the maps are built once each.
+#
+# Memoized on the container, identity-checked on read - the same rule as
+# _THEME_FONT_MEMO above: CPython reuses id() once an object is collected, and a
+# bare id key would hand one layout's placeholders to another.
+_LAYOUT_PH_MEMO: dict[int, tuple] = {}
+_MASTER_PH_MEMO: dict[int, tuple] = {}
+
+
+def layout_ph_index(layout) -> dict:
+    """{ph idx: placeholder} for one layout.
+
+    Public because qc.design resolves inherited GEOMETRY through the same map
+    and a second copy of it would be a second thing to keep in step."""
+    hit = _LAYOUT_PH_MEMO.get(id(layout))
+    if hit is not None and hit[0] is layout:
+        return hit[1]
+    index = {}
+    for ph in layout.placeholders:
+        try:
+            index[ph.element.ph_idx] = ph
+        except (ValueError, AttributeError):
+            continue
+    _LAYOUT_PH_MEMO[id(layout)] = (layout, index)
+    return index
+
+
+def _master_ph_pair(master) -> tuple:
+    """(title placeholder, body placeholder) for one master, first of each.
+
+    The same two the scan below would have found, in the same order - the first
+    title-ish placeholder and the first BODY one."""
+    hit = _MASTER_PH_MEMO.get(id(master))
+    if hit is not None and hit[0] is master:
+        return hit[1]
+    title = body = None
+    for ph in master.placeholders:
+        try:
+            kind = ph.placeholder_format.type
+        except (ValueError, AttributeError):
+            continue
+        if title is None and kind in _TITLE_TYPES:
+            title = ph
+        if body is None and kind == PP_PLACEHOLDER.BODY:
+            body = ph
+        if title is not None and body is not None:
+            break
+    _MASTER_PH_MEMO[id(master)] = (master, (title, body))
+    return title, body
+
+
 def _layout_placeholder(shape, slide):
     if not shape.is_placeholder:
         return None
-    idx = shape.placeholder_format.idx
-    for ph in slide.slide_layout.placeholders:
-        if ph.placeholder_format.idx == idx:
-            return ph
-    return None
+    return layout_ph_index(slide.slide_layout).get(
+        shape.placeholder_format.idx)
 
 
 def _master_placeholder(shape, master):
     if not shape.is_placeholder:
         return None
-    want_title = shape.placeholder_format.type in _TITLE_TYPES
-    for ph in master.placeholders:
-        is_title = ph.placeholder_format.type in _TITLE_TYPES
-        if want_title and is_title:
-            return ph
-        if not want_title and ph.placeholder_format.type == PP_PLACEHOLDER.BODY:
-            return ph
-    return None
+    title, body = _master_ph_pair(master)
+    return title if shape.placeholder_format.type in _TITLE_TYPES else body
 
 
 def _master_txstyle_defRPr(shape, master, level: int):

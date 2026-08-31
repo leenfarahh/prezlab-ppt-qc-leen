@@ -96,6 +96,78 @@ def frame_in(deck_bytes: bytes):
     return None, None
 
 
+def stamp_master(master_bytes: bytes, box_emu) -> tuple[bytes, str]:
+    """A COPY of this master carrying the presentation-space marker.
+
+    The other half of ensure_presentation_space. That one writes the marker into
+    a deck this tool just built, where the frame is already known; this writes it
+    into the MASTER, which is where the frame should have been stated in the
+    first place and where stating it ends the guessing for every deck formatted
+    against it afterwards.
+
+    A COPY, and never in place. A client's master is not a file this tool edits
+    on a hunch - the same rule qc.layoutsuggest keeps by proposing layouts rather
+    than building them. What comes back is bytes for a designer to look at, open
+    in PowerPoint, and decide to keep. Nothing is written to the template store
+    by this function.
+
+    Why it is safe to write when a whole LAYOUT is not: a presentation space is
+    an invisible rectangle that states a decision the designer has already made.
+    It carries no type styles, no brand furniture and no design opinion, it
+    prints nothing, and deleting it returns the file exactly to where it was.
+
+    Raises ValueError when the box is not a usable rectangle inside the slide,
+    because a frame stamped outside the canvas would be read back as the frame
+    and seat every deck against it.
+    """
+    prs = Presentation(io.BytesIO(master_bytes))
+    sw, sh = prs.slide_width, prs.slide_height
+    try:
+        left, top, right, bottom = (int(v) for v in box_emu)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("the presentation space needs four numbers: left, "
+                         "top, right and bottom") from exc
+    if right <= left or bottom <= top:
+        raise ValueError("the presentation space has no area: its right edge "
+                         "must be past its left, and its bottom past its top")
+    if left < 0 or top < 0 or right > sw or bottom > sh:
+        raise ValueError(
+            f"the presentation space falls outside the slide "
+            f"({sw / 914400:.2f}in by {sh / 914400:.2f}in). Every edge has to "
+            f"sit on the canvas, or every deck formatted against this master "
+            f"would be seated on a frame that is not on the page")
+
+    masters = list(prs.slide_masters)
+    already = [m for m in masters if _space_from(m, sw, sh) is not None]
+    stamped = 0
+    for master in masters:
+        if _space_from(master, sw, sh) is not None:
+            continue
+        _insert_marker(master, (left, top, right, bottom))
+        stamped += 1
+
+    if not stamped:
+        return master_bytes, (
+            f"Every slide master in this file already states a presentation "
+            f"space, so nothing was added. Delete the existing rectangle first "
+            f"if you meant to replace it.")
+
+    out = io.BytesIO()
+    prs.save(out)
+    note = (f"Presentation space stamped onto {stamped} slide master(s): an "
+            f"invisible rectangle with the alt text {PS_ALT}, "
+            f"{(right - left) / 914400:.2f}in by {(bottom - top) / 914400:.2f}in "
+            f"at {left / 914400:.2f}in from the left and "
+            f"{top / 914400:.2f}in from the top. Open it in PowerPoint to check "
+            f"it, then use it in place of the original: every deck formatted "
+            f"against it is seated on a stated frame rather than on an "
+            f"inference, and ToolsToo can align to it.")
+    if already:
+        note += (f" {len(already)} master(s) already had one and were left "
+                 f"alone.")
+    return out.getvalue(), note
+
+
 def ensure_presentation_space(deck_bytes: bytes, fallback_box=None,
                               fallback_size=None) -> tuple[bytes, list[str]]:
     """Give every slide master in the deck a presentation-space marker.

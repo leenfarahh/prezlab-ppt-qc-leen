@@ -37,8 +37,26 @@ def _theme_element(master):
     return None
 
 
+# A master's theme scheme and its clrMap do not change while a deck is being
+# read, and resolve_color_element asks for BOTH on every schemeClr it resolves -
+# every shape fill, every rule, every run of text, every background. Each miss
+# walked the master part's relationships to find theme1.xml, parsed it, and
+# re-read twelve slots.
+#
+# The same memo spike.resolver._THEME_FONT_MEMO already keeps for the fonts, and
+# for the same reason; colours are simply asked for far more often than fonts.
+# Identity-checked on read so a recycled id() cannot answer for a different
+# master.
+_SCHEME_MEMO: dict[int, tuple] = {}
+_CLRMAP_MEMO: dict[int, tuple] = {}
+
+
 def color_scheme(master) -> dict[str, tuple[int, int, int]]:
     """{'accent1': (r,g,b), ...} from theme1.xml a:clrScheme."""
+    part = getattr(master, "part", None)
+    hit = _SCHEME_MEMO.get(id(part)) if part is not None else None
+    if hit is not None and hit[0] is part:
+        return hit[1]
     theme = _theme_element(master)
     scheme = find(theme, ".//a:clrScheme")
     out = {}
@@ -52,15 +70,22 @@ def color_scheme(master) -> dict[str, tuple[int, int, int]]:
             sys.get("lastClr") if sys is not None else None)
         if hexval:
             out[slot] = tuple(int(hexval[i:i + 2], 16) for i in (0, 2, 4))
+    if part is not None:
+        _SCHEME_MEMO[id(part)] = (part, out)
     return out
 
 
 def clr_map(master) -> dict[str, str]:
     """p:clrMap on the master maps bg1/tx1/bg2/tx2 to theme slots."""
+    part = getattr(master, "part", None)
+    hit = _CLRMAP_MEMO.get(id(part)) if part is not None else None
+    if hit is not None and hit[0] is part:
+        return hit[1]
     cm = find(master.element, "p:clrMap")
-    if cm is None:
-        return {}
-    return dict(cm.attrib)
+    out = dict(cm.attrib) if cm is not None else {}
+    if part is not None:
+        _CLRMAP_MEMO[id(part)] = (part, out)
+    return out
 
 
 # --- transforms ------------------------------------------------------------

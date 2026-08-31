@@ -42,6 +42,7 @@ import hashlib
 import io
 import json
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from pptx import Presentation
@@ -51,6 +52,7 @@ from pptx.oxml.ns import qn
 from spike.color_resolver import (ciede2000, clr_map, color_scheme,
                                   resolve_color_element)
 from spike.ns import find
+from spike.resolver import layout_ph_index
 
 EMU_IN = 914400
 
@@ -85,14 +87,32 @@ OFF_PALETTE_DELTA_E = 10.0
 # palette question, and it is the case this whole check exists for.
 NEUTRAL_CHROMA = 6.0
 
-# WCAG 2.1 AA. The large-text allowance is not generosity, it is the standard:
-# display type at 18pt (or 14pt bold) is legible at 3:1 where body copy needs
-# 4.5:1. Without it every deck's cover headline is a finding, and a check that
-# fires on every cover gets switched off.
-CONTRAST_BODY = 4.5
-CONTRAST_LARGE = 3.0
+# WCAG 2.1 AAA (design lead, 26/08/2026). AA - 4.5:1 body, 3:1 display - is
+# written for a screen a reader controls: their room, their brightness, their
+# distance. This work gets projected in a lit room onto a wall, at the back of
+# which somebody is reading 11pt legal type, and AA passes plenty of pairings
+# that fail there. AAA is the published next tier, so it is the bar to move to
+# rather than a number invented here that nobody could look up.
+#
+# The large-text allowance stays, because it is part of the standard rather
+# than generosity: display type at 18pt (or 14pt bold) clears at 4.5:1 where
+# body copy needs 7:1. Without it every deck's cover headline is a finding, and
+# a check that fires on every cover is a check that gets switched off.
+#
+# This does fire on brand pairings a client signed off under AA. That is the
+# point of raising it, and every finding still ends in "leave it as it is",
+# recorded as a decision.
+CONTRAST_BODY = 7.0
+CONTRAST_LARGE = 4.5
 LARGE_PT = 18.0
 LARGE_BOLD_PT = 14.0
+
+# Where text stops being hard to read and starts being unreadable. Held at 3:1
+# and NOT tied to CONTRAST_LARGE, which it used to be: with the bar at AA the
+# two numbers happened to be equal, and raising the bar would have promoted
+# every AA-passing warning to an error by accident. Severity is a claim about
+# legibility, not about which standard is being applied.
+UNREADABLE_RATIO = 3.0
 
 # A fill this transparent is a scrim, not a ground: the colour under it shows
 # through and no single background colour exists. Contrast is not judged there
@@ -460,8 +480,57 @@ class Placed:
     grouped: bool = False
 
 
+def _dimensions(shape):
+    """(left, top, width, height), resolving placeholder inheritance ourselves.
+
+    THE HOTTEST PATH IN THE PACKAGE. Reading .left on a placeholder that states
+    no position of its own sends python-pptx up the inheritance chain:
+    _effective_value -> _inherited_value -> _base_placeholder ->
+    layout.placeholders.get(idx) - and that get() is a LINEAR SCAN which runs an
+    lxml xpath ("./*[1]/p:nvPr/p:ph") on every candidate it passes. Four reads
+    per box, every box, every pass. Measured on fixtures/large_200.pptx
+    (30/08/2026): 96,760 xpath calls, 7.7s of a 19s design scan.
+
+    Same answer python-pptx gives - a directly-applied value wins, otherwise the
+    layout placeholder's - reached through the index spike.resolver already
+    keeps for the font cascade. ONE index, shared, because this and the font
+    cascade are asking the identical question ("which layout placeholder does
+    this shape inherit from") and two maps would be two things to keep in step.
+    A shape that states its own geometry never touches it at all, which is the
+    common case; only an inheriting placeholder looks anything up.
+
+    THE FIRST READ MUST BE OFF THE ELEMENT, not off the shape. `shape.left` is
+    the very property that walks the inheritance chain, so asking it first and
+    checking for None afterwards would pay the whole cost before deciding not
+    to. `_element.x` is what BaseShape.left returns for an ordinary shape and is
+    the directly-applied value for a placeholder: no inheritance, no xpath.
+    """
+    el = shape._element
+    try:
+        l, t, w, h = el.x, el.y, el.cx, el.cy
+    except AttributeError:
+        # A connector or graphic frame that does not carry the usual xfrm.
+        return shape.left, shape.top, shape.width, shape.height
+    if not (l is None or t is None or w is None or h is None):
+        return l, t, w, h
+    if not getattr(shape, "is_placeholder", False):
+        return l, t, w, h
+    try:
+        base = layout_ph_index(shape.part.slide_layout).get(el.ph_idx)
+    except (AttributeError, ValueError):
+        return l, t, w, h
+    if base is None:
+        return l, t, w, h
+    # getattr on the LAYOUT placeholder, so layout-to-master inheritance is
+    # still python-pptx's to resolve. Only the slide-to-layout scan is ours.
+    return (l if l is not None else base.left,
+            t if t is not None else base.top,
+            w if w is not None else base.width,
+            h if h is not None else base.height)
+
+
 def _raw_box(shape):
-    l, t, w, h = shape.left, shape.top, shape.width, shape.height
+    l, t, w, h = _dimensions(shape)
     if None in (l, t, w, h) or w <= 0 or h <= 0:
         return None
     return (l, t, l + w, t + h)
@@ -520,7 +589,15 @@ def _mapped(box, xf):
 def placed_shapes(slide) -> list[Placed]:
     """Every shape on a slide, in paint order, with its box in slide
     coordinates. Group children are included and transformed; the group itself
-    is listed too, because a group is what a designer selects and moves."""
+    is listed too, because a group is what a designer selects and moves.
+
+    Memoized only inside _placed_cache() - see the note on _PLACED_MEMO for why
+    a cache of boxes has to be scoped rather than ambient. The identity check on
+    read is the usual one: id() is reused once an object is collected."""
+    if _PLACED_MEMO is not None:
+        hit = _PLACED_MEMO.get(id(slide))
+        if hit is not None and hit[0] is slide:
+            return hit[1]
     out: list[Placed] = []
 
     def walk(shapes, xf, top, grouped):
@@ -533,7 +610,37 @@ def placed_shapes(slide) -> list[Placed]:
 
     for i, shape in enumerate(slide.shapes):
         walk([shape], (0, 0, 1.0, 1.0), i, False)
+    if _PLACED_MEMO is not None:
+        _PLACED_MEMO[id(slide)] = (slide, out)
     return out
+
+
+# Set to a dict for the duration of ONE scan, and None the rest of the time.
+#
+# scan() runs five checks and four of them walk every slide, so the same
+# traversal happens four times over a deck nothing is mutating. Caching it is
+# worth about a third of the run - but a cache of BOXES is not the same animal
+# as _MARKER_MEMO's cache of identities: a box goes stale the moment anything
+# moves a shape, and qc.remedy and qc.fixer both move shapes.
+#
+# So it is not ambient. It exists only inside _placed_cache(), which scan holds
+# open and closes in a finally, and every other caller of placed_shapes gets the
+# uncached function. That is not a loss: qc.extract and qc.layoutgap ask once per
+# slide and would never have hit the cache anyway. It also means nothing pins a
+# Presentation in memory after the scan that opened it has returned.
+_PLACED_MEMO: dict | None = None
+
+
+@contextmanager
+def _placed_cache():
+    """Memoize placed_shapes per slide for the body of one scan."""
+    global _PLACED_MEMO
+    outer = _PLACED_MEMO           # nested scans keep the outer one honest
+    _PLACED_MEMO = {}
+    try:
+        yield
+    finally:
+        _PLACED_MEMO = outer
 
 
 def _cover(inner, outer) -> float:
@@ -1205,84 +1312,217 @@ def _passing(against, palette, need, prefer=None) -> list[tuple]:
     return [(name, rgb, ratio) for name, rgb, ratio, _d in out]
 
 
+def _best_available(against, palette, prefer=None) -> list[tuple]:
+    """(label, rgb, ratio) for palette colours ranked by contrast against
+    `against`, best first, whether or not they clear any bar.
+
+    The counterpart to _passing, for the case _passing returns nothing. Ranked
+    by ratio here rather than by hue, because this list is only ever consulted
+    when nothing clears the bar and the question has narrowed from "which colour
+    belongs here" to "how close can this get".
+    """
+    rank = {name: i for i, name in enumerate(palette or {})}
+    out = [(name, rgb, contrast_ratio(rgb, against))
+           for name, rgb in (palette or {}).items()]
+    # Best contrast first; on a tie the palette's own order, which puts a
+    # profile's named colours ahead of theme slots (_passing's preference, and
+    # for the same reason).
+    out.sort(key=lambda t: (-t[2], rank.get(t[0], 999)))
+    return out
+
+
+def _text_target(s_idx, shape, locator, rgb):
+    return {"hex": hex_of(rgb),
+            "targets": [{"slide_index": s_idx, "shape_id": str(shape.shape_id),
+                         "surface": "text", "locator": locator}]}
+
+
 def _contrast_finding(s_idx, shape, worst, where, palette, owner):
+    """The card for one unreadable piece of text: recolour the words, repaint
+    what they sit on, or decide to live with it.
+
+    BOTH KINDS OF DECISION ARE ALWAYS OFFERED when they would change anything,
+    and that took a second pass to get right. Every option used to be gated on
+    clearing the bar, which was invisible at AA and wrong at AAA (design lead,
+    26/08/2026): against a mid grey nothing in any palette reaches 7:1 and black
+    itself only reaches about 5.3, so a grey-on-grey card came back offering to
+    paint the panel black and nothing else. "Recolour the text" and "repaint the
+    panel" change different things on the slide and only the designer can say
+    which is right here, so a card that drops one of them has made the decision
+    for them.
+
+    A short option is still an option, as long as it says so: 1.2:1 becoming
+    5.3:1 is most of the way, and a designer who can read "still under the 7:1
+    the standard asks for" can weigh that against repainting a panel. What is
+    never offered is an option that changes nothing.
+    """
     text_hex, ground_hex = hex_of(worst["rgb"]), hex_of(worst["ground"])
     ratio, need = worst["ratio"], worst["need"]
     size_note = (f"{worst['size']:.0f}pt{' bold' if worst['bold'] else ''}")
-    options = []
+    # Two lists, joined at the end: everything that CLEARS the bar, then
+    # everything that only gets closer. Within each, cheapest first. A short
+    # option ahead of a clearing one would leave the finding standing, and
+    # auto_choice takes the first option.
+    clears: list = []
+    closer: list = []
+    # Enough of a gain to be worth a click and worth a re-render.
+    floor = ratio + 0.1
 
-    # Recolour the text. Offered first because it changes the smallest thing on
-    # the slide that can fix the problem.
+    # --- recolour the text ------------------------------------------------
+    #
+    # First because it changes the smallest thing on the slide that can fix the
+    # problem.
     ink = _passing(worst["ground"], palette, need, prefer=worst["rgb"])
+    ink_clears = bool(ink)
+    short = ""
+    if not ink:
+        # Nothing clears the bar on this ground. Rank by contrast instead of by
+        # hue, because the question has narrowed from "which colour belongs
+        # here" to "how close can this get".
+        ink = [(name, rgb, got)
+               for name, rgb, got in _best_available(worst["ground"], palette)
+               if got > floor]
+        short = (f" Still under the {need:.1f}:1 the standard asks for: nothing "
+                 f"in the palette clears it on this ground, which is a fact "
+                 f"about the ground rather than about the text.")
     if ink:
         name, rgb, got = ink[0]
-        options.append(Remedy(
+        (clears if ink_clears else closer).append(Remedy(
             "ink", f"Set the text to {name} (#{hex_of(rgb)})",
-            f"Takes the ratio from {ratio:.1f}:1 to {got:.1f}:1. Recolors "
-            f"only the runs that fail, so any deliberate accent color in this "
-            f"box survives.",
+            f"Takes the ratio from {ratio:.1f}:1 to {got:.1f}:1. Recolors only "
+            f"the runs that fail, so any deliberate accent color in this box "
+            f"survives.{short}",
             op="set_color",
-            params={"hex": hex_of(rgb),
-                    "targets": [{"slide_index": s_idx,
-                                 "shape_id": str(shape.shape_id),
-                                 "surface": "text",
-                                 "locator": worst["locator"]}]}))
+            params=_text_target(s_idx, shape, worst["locator"], rgb)))
+
     mono = max(((255, 255, 255), (0, 0, 0)),
                key=lambda c: contrast_ratio(c, worst["ground"]))
-    if contrast_ratio(mono, worst["ground"]) >= need \
-            and (not ink or mono != ink[0][1]):
-        options.append(Remedy(
+    mono_ratio = contrast_ratio(mono, worst["ground"])
+    if mono_ratio > floor and (not ink or mono != ink[0][1]):
+        mono_clears = mono_ratio >= need
+        (clears if mono_clears else closer).append(Remedy(
             "mono", f"Set the text to #{hex_of(mono)}",
-            f"{contrast_ratio(mono, worst['ground']):.1f}:1, the safest "
-            f"available reading. Not a palette color"
+            f"{mono_ratio:.1f}:1, "
+            + ("the safest available reading" if mono_clears
+               else "the most any colour gets on this ground, and still under "
+                    f"the {need:.1f}:1 bar")
+            + ". Not a palette color"
             + (", and the palette has nothing here that passes."
-               if not ink else "."),
+               if not _passing(worst["ground"], palette, need) else "."),
             op="set_color",
-            params={"hex": hex_of(mono),
-                    "targets": [{"slide_index": s_idx,
-                                 "shape_id": str(shape.shape_id),
-                                 "surface": "text",
-                                 "locator": worst["locator"]}]}))
+            params=_text_target(s_idx, shape, worst["locator"], mono)))
 
-    # Recolour the ground. Only offered when a shape owns it: repainting a
-    # slide background to fix one label is not a fix, it is a new deck.
+    # --- repaint the ground ----------------------------------------------
+    #
+    # Only when a shape owns it: repainting a slide background to fix one label
+    # is not a fix, it is a new deck.
     if owner is not None:
         grounds = _passing(worst["rgb"], palette, need, prefer=worst["ground"])
+        ground_clears = bool(grounds)
+        ground_short = ""
+        if not grounds:
+            grounds = [(name, rgb, got)
+                       for name, rgb, got in _best_available(worst["rgb"],
+                                                             palette)
+                       if got > floor]
+            ground_short = (f" Still under {need:.1f}:1; nothing in the palette "
+                            f"clears it behind this text.")
         if grounds:
             name, rgb, got = grounds[0]
-            options.append(Remedy(
+            (clears if ground_clears else closer).append(Remedy(
                 "ground", f"Set {_label(owner)!r} to {name} (#{hex_of(rgb)})",
                 f"Keeps the text color and repaints what it sits on: "
                 f"{got:.1f}:1. Everything else in that shape changes ground "
-                f"too, so check what else is on it.",
+                f"too, so check what else is on it.{ground_short}",
                 op="set_color",
                 params={"hex": hex_of(rgb),
                         "targets": [{"slide_index": s_idx,
                                      "shape_id": str(owner.shape_id),
                                      "surface": "fill", "locator": None}]}))
 
-    options.append(Remedy("leave", "Leave it as it is",
-                          "Recorded as a decision. Brand colors sometimes "
-                          "fail WCAG on purpose and that is the client's call, "
-                          "not this tool's."))
+    options = clears + closer + [
+        Remedy("leave", "Leave it as it is",
+               "Recorded as a decision. Brand colors sometimes fail WCAG on "
+               "purpose and that is the client's call, not this tool's.")]
 
     return DesignFinding(
         finding_id=_finding_id("contrast", [s_idx, str(shape.shape_id),
                                             text_hex, ground_hex]),
         kind="contrast",
-        severity="error" if ratio < CONTRAST_LARGE else "warning",
+        severity="error" if ratio < UNREADABLE_RATIO else "warning",
         headline=f"{_label(shape)!r} reads at {ratio:.1f}:1",
         detail=(f"#{text_hex} on #{ground_hex} ({where}) is {ratio:.1f}:1, "
                 f"under the {need:.1f}:1 that {size_note} text needs. "
                 + ("Below 3:1 text stops being readable rather than merely "
-                   "being hard to read." if ratio < CONTRAST_LARGE else
+                   "being hard to read." if ratio < UNREADABLE_RATIO else
                    "Legible on a good screen in a dark room; not on a "
-                   "projector.")),
+                   "projector in a lit one.")),
         slides=[s_idx],
         evidence={"ratio": round(ratio, 2), "need": need, "text": text_hex,
                   "ground": ground_hex, "pair": f"{text_hex}>{ground_hex}",
                   "size_pt": worst["size"], "places": 1, "where": where},
         options=options)
+
+
+# --- what a render will not show ------------------------------------------
+#
+# Text this close in colour to the thing it sits on does not appear in a render
+# AT ALL. Every vision pass in this tool is shown pictures, so a box of white
+# text on a white ground is an EMPTY BOX to it, and every judgment about that
+# slide is then made without the words: a layout question decides the slide has
+# one block where it has two, a component question leaves a card's label out of
+# the card, and both answers look reasonable.
+#
+# A model cannot be asked to read what is not in the image. It can be handed the
+# fact, which is what qc.components.inventory does with this.
+#
+# 1.5:1 rather than the contrast check's bar, because this is a different
+# question. The contrast check asks whether a reader can read it; this asks
+# whether it is in the picture at all.
+INVISIBLE_RATIO = 1.5
+
+
+def invisible_text(slide, prs, master=None) -> dict:
+    """{shape_id: ratio} for every text shape a render will not show.
+
+    Resolved through exactly the same cascade the contrast check uses - the
+    run's effective colour, the ground actually under it, highlights included -
+    so the two passes cannot disagree about what colour a word is. The worst run
+    in a shape decides it: a heading in white over a white panel is invisible
+    even if the caption under it is not.
+    """
+    if master is None:
+        master = slide.slide_layout.slide_master
+    stack = placed_shapes(slide)
+    bg = slide_ground(slide, master)
+    out = {}
+    for item in stack:
+        shape = item.shape
+        if not getattr(shape, "has_text_frame", False):
+            continue
+        if not _text_of(shape) or _is_frame_marker(shape):
+            continue
+        words = _text_extent(shape, item.box, slide, prs)
+        ground, _where = _ground_under(item, stack, slide, master, bg, words)
+        if ground is None:
+            # No single ground colour - a photograph or a gradient. Whether the
+            # words show against it is not a question this can answer, and
+            # guessing "invisible" would tell the model a box is empty when it
+            # may be perfectly legible.
+            continue
+        worst = None
+        for para in shape.text_frame.paragraphs:
+            for run in para.runs:
+                if not run.text.strip():
+                    continue
+                behind = _run_highlight(run, master) or ground
+                rgb, _src = _run_color(run, para, shape, slide, prs, master)
+                ratio = contrast_ratio(rgb, behind)
+                if worst is None or ratio < worst:
+                    worst = ratio
+        if worst is not None and worst < INVISIBLE_RATIO:
+            out[str(shape.shape_id)] = round(worst, 2)
+    return out
 
 
 # --- overlap -------------------------------------------------------------
@@ -1521,6 +1761,79 @@ GROUND_SPAN = 0.80
 # problem, and the honest options are autofit, a bigger box, or shorter text.
 MIN_SHRINK = 0.70
 
+# PowerPoint's own defaults for a text box's internal padding. A box stating
+# more than this was padded by hand, and that padding is room the text is not
+# getting. Read from python-pptx, which resolves the default when a box states
+# none: 0.1in left and right, 0.05in top and bottom.
+DEFAULT_INSETS = {"left": 91440, "right": 91440, "top": 45720, "bottom": 45720}
+
+
+def _stated_insets(shape) -> dict | None:
+    try:
+        frame = shape.text_frame
+        return {"left": int(frame.margin_left), "right": int(frame.margin_right),
+                "top": int(frame.margin_top),
+                "bottom": int(frame.margin_bottom)}
+    except Exception:
+        return None
+
+
+def _inset_relief(shape, box, slide, prs):
+    """What resetting a hand-padded box's internal margins would give the text.
+
+    (extra_width, extra_height, natural_after) in EMU, or None when the box's
+    padding is already the default.
+
+    Padding is the one dimension of a fit problem that costs nothing: it is
+    invisible on the slide, so returning it changes neither the type size nor
+    the shape the designer positioned. That is why it is offered before either.
+
+    The overflow estimate does not count vertical padding at all - it compares
+    the text's natural height against the whole box - so the height returned
+    here is room the finding never charged for, and the remedy says so rather
+    than quietly claiming a fix the number cannot show.
+    """
+    insets = _stated_insets(shape)
+    if insets is None or box is None:
+        return None
+    extra_w = max(0, (insets["left"] + insets["right"])
+                  - (DEFAULT_INSETS["left"] + DEFAULT_INSETS["right"]))
+    extra_h = max(0, (insets["top"] + insets["bottom"])
+                  - (DEFAULT_INSETS["top"] + DEFAULT_INSETS["bottom"]))
+    if not extra_w and not extra_h:
+        return None
+    after = natural_text_height(shape, (box[0], box[1], box[2] + extra_w,
+                                       box[3]), slide, prs)
+    return extra_w, extra_h, after
+
+
+def _widen_to_fit(shape, box, slide, prs, slide_w):
+    """(dw, room) - the smallest widening that makes the text fit, and how much
+    room there is beside the box. dw is None when nothing within that room fits
+    it.
+
+    Searched rather than solved. Line count is a step function of width: a box
+    gets no shorter until it gains enough width to pull one more word up, so the
+    honest answer is the first step that clears the box, found by walking the
+    room in tenths. Solving it as if height were continuous in width would name
+    a width that does not actually fit.
+    """
+    height = box[3] - box[1]
+    room = max(0, int(slide_w) - box[2])
+    if room <= 0:
+        return None, 0
+    step = max(EMU_IN // 10, room // 10)
+    grown = step
+    while grown <= room:
+        after = natural_text_height(shape, (box[0], box[1], box[2] + grown,
+                                           box[3]), slide, prs)
+        if after is not None and after <= height:
+            return int(grown), room
+        grown += step
+    return None, room
+
+
+
 
 def _shrinks_to_fit(shape) -> bool:
     """Whether PowerPoint is already handling the overflow itself.
@@ -1587,7 +1900,8 @@ def _fit_findings(prs) -> list[DesignFinding]:
                 over = natural - height
                 if over > max(OVERFLOW_MIN_EMU, OVERFLOW_SHARE * height):
                     findings.append(_overflow_finding(
-                        s_idx, shape, box, natural, over, slide_h))
+                        s_idx, shape, box, natural, over, slide, prs,
+                        slide_w, slide_h))
 
             # 2. The box does not fit the card it sits in.
             card, card_box = _container_of(item, stack, slide, master,
@@ -1609,17 +1923,91 @@ def _fit_findings(prs) -> list[DesignFinding]:
     return findings
 
 
-def _overflow_finding(s_idx, shape, box, natural, over, slide_h):
+def _overflow_finding(s_idx, shape, box, natural, over, slide, prs,
+                      slide_w, slide_h):
+    """Every way out of a box that will not hold its text, cheapest first.
+
+    The order is the answer to "what does this cost the design", and it was
+    wrong until 26/08/2026: autofit came first, so the tool's own
+    recommendation - and the "let the tool decide" path, which takes the first
+    option - was to make the type smaller. Shrinking type is the most expensive
+    fix on the list. It breaks the deck's type scale, it is the one change a
+    reader notices, and on a slide with an inch of white space beside the box it
+    is unnecessary (design lead, 26/08/2026).
+
+    So, cheapest first:
+
+        1. the box's own internal padding, when it was set by hand. Invisible
+           on the slide, so returning it costs nothing at all.
+        2. more height, when there is room below. Keeps the measure - the line
+           length the designer chose - and keeps the type.
+        3. more width, when there is room beside and it actually fits. Keeps
+           the type, but changes the measure and can break a column.
+        4. autofit, which keeps working when the copy is edited later.
+        5. an explicit shrink, when even autofit would be too much.
+
+    Each is offered only when it would work, so the first option on the card is
+    always the cheapest one that fixes THIS box.
+    """
     height = box[3] - box[1]
     scale = height / natural
     room = slide_h - box[3]
-    options = [Remedy(
+    options = []
+
+    relief = _inset_relief(shape, box, slide, prs)
+    if relief is not None:
+        extra_w, extra_h, after = relief
+        if after is not None and after <= height + extra_h:
+            options.append(Remedy(
+                "insets",
+                "Reset the box's internal margins to the default",
+                f"This box pads its text by "
+                f"{(extra_w + DEFAULT_INSETS['left'] + DEFAULT_INSETS['right']) / EMU_IN:.2f}in "
+                f"across and "
+                f"{(extra_h + DEFAULT_INSETS['top'] + DEFAULT_INSETS['bottom']) / EMU_IN:.2f}in "
+                f"down, where PowerPoint's default is 0.20in and 0.10in. "
+                f"Resetting returns {extra_w / EMU_IN:.2f}in of width and "
+                f"{extra_h / EMU_IN:.2f}in of height to the words. Nothing "
+                f"moves, nothing changes size on screen, and the type scale is "
+                f"untouched, which is why it is first. The overflow figure "
+                f"above does not count padding, so this fix is worth more than "
+                f"that number suggests.",
+                op="set_insets",
+                params={"slide_index": s_idx,
+                        "shape_id": str(shape.shape_id),
+                        **DEFAULT_INSETS}))
+
+    if room > over:
+        options.append(Remedy(
+            "grow", f"Make the box {over / EMU_IN:.2f}in taller",
+            f"Keeps the type size and the line length, and takes the space "
+            f"below, of which there is {room / EMU_IN:.2f}in before the slide "
+            f"edge. Check what is under it first: growing a box does not move "
+            f"its neighbours.",
+            op="resize", params={"slide_index": s_idx,
+                                 "shape_id": str(shape.shape_id),
+                                 "dh": int(over)}))
+
+    dw, side_room = _widen_to_fit(shape, box, slide, prs, slide_w)
+    if dw:
+        options.append(Remedy(
+            "widen", f"Make the box {dw / EMU_IN:.2f}in wider",
+            f"Keeps the type size and pulls the copy up into fewer lines: "
+            f"measured, not assumed, so this width is one the text really fits "
+            f"in. There is {side_room / EMU_IN:.2f}in to the slide edge. It "
+            f"changes the line length, so on a column grid check the column "
+            f"beside it before taking this one.",
+            op="resize", params={"slide_index": s_idx,
+                                 "shape_id": str(shape.shape_id),
+                                 "dw": int(dw), "anchor": "left"}))
+
+    options.append(Remedy(
         "autofit", "Let PowerPoint shrink the text to fit",
         "Writes the shrink-on-overflow setting, so the type scales down in the "
-        "box and keeps scaling if the copy is edited later. Nothing moves and "
-        "no size is hard-coded, which is why it is first.",
+        "box and keeps scaling if the copy is edited later. It makes the type "
+        "smaller, which is why it comes after the fixes that do not.",
         op="autofit", params={"slide_index": s_idx,
-                              "shape_id": str(shape.shape_id)})]
+                              "shape_id": str(shape.shape_id)}))
     if scale >= MIN_SHRINK:
         options.append(Remedy(
             "shrink", f"Shrink the type to {scale * 100:.0f}% of its size",
@@ -1629,15 +2017,6 @@ def _overflow_finding(s_idx, shape, box, natural, over, slide_h):
             op="scale_text", params={"slide_index": s_idx,
                                      "shape_id": str(shape.shape_id),
                                      "scale": round(scale, 3)}))
-    if room > over:
-        options.append(Remedy(
-            "grow", f"Make the box {over / EMU_IN:.2f}in taller",
-            f"Keeps the type size and takes the space below, of which there is "
-            f"{room / EMU_IN:.2f}in before the slide edge. Check what is under "
-            f"it first: growing a box does not move its neighbours.",
-            op="resize", params={"slide_index": s_idx,
-                                 "shape_id": str(shape.shape_id),
-                                 "dh": int(over)}))
     options.append(Remedy(
         "leave", "Leave it as it is",
         "Recorded as a decision. The estimate here is a calculation, not a "
@@ -1876,24 +2255,29 @@ def scan(deck_bytes: bytes, profile_cfg: dict | None = None) -> list[DesignFindi
     palette = palette_of(profile_cfg, master) if master is not None else {}
 
     findings: list[DesignFinding] = []
-    for step in (lambda: _palette_findings(prs, palette),
-                 lambda: _contrast_findings(prs, palette),
-                 lambda: _overlap_findings(prs),
-                 lambda: _fit_findings(prs),
-                 lambda: _frame_findings(prs)):
-        try:
-            findings.extend(step())
-        except Exception as exc:
-            # One check failing must not take the other three with it. A page
-            # that shows three of four answers and says which one is missing is
-            # usable; a 500 is not.
-            findings.append(DesignFinding(
-                finding_id=_finding_id("error", [str(exc)]),
-                kind="error", severity="info",
-                headline="One of the design checks could not run",
-                detail=f"{type(exc).__name__}: {exc}. The other checks on this "
-                       f"page ran normally.",
-                slides=[], options=[], evidence={"places": 0}))
+    # Four of the five checks below walk every slide, and nothing here mutates
+    # the deck, so the walk is done once per slide and shared (_PLACED_MEMO).
+    # The cache closes with this block: no box outlives the scan that measured
+    # it, and no Presentation is pinned by it.
+    with _placed_cache():
+        for step in (lambda: _palette_findings(prs, palette),
+                     lambda: _contrast_findings(prs, palette),
+                     lambda: _overlap_findings(prs),
+                     lambda: _fit_findings(prs),
+                     lambda: _frame_findings(prs)):
+            try:
+                findings.extend(step())
+            except Exception as exc:
+                # One check failing must not take the other three with it. A
+                # page that shows three of four answers and says which one is
+                # missing is usable; a 500 is not.
+                findings.append(DesignFinding(
+                    finding_id=_finding_id("error", [str(exc)]),
+                    kind="error", severity="info",
+                    headline="One of the design checks could not run",
+                    detail=f"{type(exc).__name__}: {exc}. The other checks on "
+                           f"this page ran normally.",
+                    slides=[], options=[], evidence={"places": 0}))
 
     findings.sort(key=lambda f: (_ORDER.get(f.severity, 3), -f.places,
                                  f.finding_id))
@@ -1926,10 +2310,14 @@ def auto_choice(finding):
     The FIRST option with something to perform, every time. Not a new ranking:
     each check already puts its own recommendation first and says why in the
     note the designer reads ("offered first because it changes the smallest
-    thing on the slide that can fix the problem"; "nothing moves and no size is
-    hard-coded, which is why it is first"). A second opinion computed here would
-    be free to disagree with the page, and then the tool would be recommending
-    one thing and doing another.
+    thing on the slide that can fix the problem"; "nothing moves, nothing
+    changes size on screen, and the type scale is untouched, which is why it is
+    first"). A second opinion computed here would be free to disagree with the
+    page, and then the tool would be recommending one thing and doing another.
+
+    This is why the fit check's ordering matters as much as its option list: it
+    IS the recommendation, and it is what the tool does when a designer hands
+    the decision over.
     """
     if finding.kind in UNDECIDABLE_KINDS:
         return None

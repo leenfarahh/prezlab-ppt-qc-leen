@@ -7,8 +7,10 @@ export-tool deck actually looks like, and it is the case that made an applied
 master look like nothing had happened.
 """
 
+import functools
 import io
 
+import pytest
 from pptx import Presentation
 from pptx.util import Emu, Pt
 
@@ -27,6 +29,25 @@ IN = 914400
 # the content never overlapped a placeholder that sat in the middle.
 _TITLE_BOX = (0.48, 0.42, 12.40, 0.92)
 _SUBTITLE_BOX = (0.48, 1.40, 12.40, 0.35)
+
+
+@pytest.fixture()
+def removals_performed(monkeypatch):
+    """Run this test's migration WITH its removals performed.
+
+    Removal is opt-in as of 26/08/2026 (design lead: nothing leaves a slide
+    unless a designer asks for it), so a default run only PROPOSES: the piece
+    stays on the slide and the change carries a remove_op the page can offer.
+
+    The tests that take this fixture are about which pieces the pass identifies
+    and what taking one out does. Whether it does it unasked is a different
+    question, and it has its own tests.
+
+    Patched at this module's own name, so every helper here follows without each
+    one growing a flag it would then have to thread.
+    """
+    monkeypatch.setitem(globals(), "migrate_deck",
+                        functools.partial(migrate_deck, remove=True))
 
 
 def _deck(*, with_furniture=False, tall_content=False):
@@ -198,7 +219,7 @@ def test_oversized_content_is_reported_not_scaled():
 # ------------------------------------------------------------ housekeeping
 
 
-def test_a_bare_page_number_duplicate_is_removed():
+def test_a_bare_page_number_duplicate_is_removed(removals_performed):
     """The slide's own hand-typed page number, where the master stamps one."""
     slide, changes = _run(with_furniture=True)
     removed = [c for c in changes if c.action == "removed duplicate furniture"]
@@ -231,7 +252,7 @@ def test_no_empty_placeholder_survives():
         assert ph.text_frame.text.strip(), "an empty placeholder was left behind"
 
 
-def test_an_unfillable_placeholder_is_removed_and_reported():
+def test_an_unfillable_placeholder_is_removed_and_reported(removals_performed):
     """A layout offering more placeholders than the slide has content for."""
     prs = Presentation()
     prs.slide_width, prs.slide_height = Emu(12192000), Emu(6858000)
@@ -355,24 +376,56 @@ def _overlaps(slide):
     return hits
 
 
-def test_nothing_is_left_printing_over_a_filled_placeholder():
+def _filled_placeholders(slide):
+    """An EMPTY placeholder is a box waiting for content: it draws nothing, so
+    nothing can print over it and it cannot print over anything. This pass used
+    to delete them, which hid the distinction; they are proposed now (design
+    lead, 26/08/2026), so the question has to name what it always meant."""
+    return [s for s in slide.shapes if s.is_placeholder
+            and s.has_text_frame and s.text_frame.text.strip()]
+
+
+def test_removing_the_stray_clears_the_filled_placeholder():
     """The defect from the client deck: the heading went into the title
-    placeholder and the eyebrow stayed on top of it."""
+    placeholder and the eyebrow stayed on top of it. Taking the eyebrow out
+    clears it, and this is what taking it out is FOR."""
+    out, changes = migrate_deck(_header_deck(), remove=True)
+    slide = Presentation(io.BytesIO(out)).slides[0]
+
+    assert _ph_text(slide, "TITLE", "CENTER_TITLE") == "Under the hood"
+    placeholders = _filled_placeholders(slide)
+    for a, b in _overlaps(slide):
+        assert not (a in placeholders or b in placeholders), \
+            "a shape is still printing over a filled placeholder"
+    # The guarantee is that nothing overlaps a placeholder, not that a NUDGE
+    # achieved it: header remnants are placed under the header band by the block
+    # pass, so a nudge is the fallback, not the norm.
+    assert not any(c.action == "migration skipped" for c in changes)
+
+
+def test_a_collision_it_cannot_clear_without_removing_is_reported_instead():
+    """A default run does not remove, and it cannot nudge this one clear either:
+    the eyebrow was in the header band before the pass ran, and the collision
+    pass only cleans up collisions it caused. So the overlap stands - and the
+    change says so, names the piece, and carries the way out.
+
+    Shipping a deck with a known overlap and no mention of it would be the worst
+    of both policies."""
     out, changes = migrate_deck(_header_deck())
     slide = Presentation(io.BytesIO(out)).slides[0]
 
     assert _ph_text(slide, "TITLE", "CENTER_TITLE") == "Under the hood"
-    placeholders = [s for s in slide.shapes if s.is_placeholder]
-    for a, b in _overlaps(slide):
-        assert not (a in placeholders or b in placeholders), \
-            "a shape is still printing over a placeholder"
-    # The guarantee is that nothing overlaps a placeholder, not that a
-    # NUDGE achieved it: header remnants are now placed under the header
-    # band by the block pass, so a nudge is the fallback, not the norm.
-    assert not any(c.action == "migration skipped" for c in changes)
+    kept = [c for c in changes if c.action == "unplaced text left in place"]
+    assert kept, [c.action for c in changes]
+    assert all(c.severity == "alert" for c in kept)
+    assert all(c.remove_op and c.remove_id for c in kept), \
+        "a proposal with no way to perform it is just a complaint"
+    # and the piece really is still there, which is the point of the policy
+    assert any(kept[0].removed_text == s.text_frame.text.strip()
+               for s in slide.shapes if s.has_text_frame)
 
 
-def test_a_nudge_clears_the_whole_header_band_not_just_one_placeholder():
+def test_a_nudge_clears_the_whole_header_band_not_just_one_placeholder(removals_performed):
     """Shifting past the title alone dropped the eyebrow onto the subtitle,
     trading one collision for another."""
     out, changes = migrate_deck(_header_deck())
@@ -421,7 +474,7 @@ def test_with_no_explicit_sizes_the_higher_line_becomes_the_title():
     assert _ph_text(slide, "TITLE", "CENTER_TITLE") == "TECHNICAL ARCHITECTURE"
 
 
-def test_duplicated_text_over_a_placeholder_is_removed():
+def test_duplicated_text_over_a_placeholder_is_removed(removals_performed):
     prs = Presentation()
     prs.slide_width, prs.slide_height = Emu(12192000), Emu(6858000)
     slide = prs.slides.add_slide(prs.slide_layouts[0])
@@ -496,7 +549,7 @@ def _has_own_bg(container) -> bool:
     return bool(cSld is not None and cSld.findall(f"{_P}bg"))
 
 
-def test_a_slide_background_override_is_dropped_so_the_master_shows():
+def test_a_slide_background_override_is_dropped_so_the_master_shows(removals_performed):
     """An exported deck stamps a white background on every slide, and a
     slide-level background beats the master's. That is how a deck adopts
     every other part of a master and still comes out the wrong colour."""
@@ -678,7 +731,7 @@ def test_relative_arrangement_inside_the_body_still_holds():
     assert after_gap == before_gap
 
 
-def test_an_unplaced_header_line_is_swept_rather_than_parked_in_the_body():
+def test_an_unplaced_header_line_is_swept_rather_than_parked_in_the_body(removals_performed):
     """Stacking a remnant above the body was the earlier behaviour; it is now
     removed and reported, so it can never end up sitting inside the content."""
     out, changes = migrate_deck(_margin_deck(eyebrow_top=0.30, body_top=3.30))
@@ -853,7 +906,7 @@ def test_a_row_of_labels_beside_content_is_not_swept_as_unplaced_text():
     assert not [c for c in changes if c.action == "removed unplaced text"]
 
 
-def test_header_text_with_nothing_beside_it_is_still_swept():
+def test_header_text_with_nothing_beside_it_is_still_swept(removals_performed):
     """The sparing above is not a licence to keep everything: a stray note
     alone in the header band has no row to belong to and still goes, with its
     own XML kept so a designer can put it back."""
@@ -978,7 +1031,7 @@ def test_nothing_is_seated_when_the_only_content_is_in_the_bottom_strip():
     assert not [c for c in changes if c.action == "content block moved"]
 
 
-def test_a_stray_is_swept_even_when_this_pass_placed_nothing():
+def test_a_stray_is_swept_even_when_this_pass_placed_nothing(removals_performed):
     """Whether this pass filled a placeholder is not the question. Gating the
     sweep on it kept every stray on a slide PowerPoint had already matched, and
     the strays then travelled INTO the body with the block - a working note
@@ -1004,7 +1057,7 @@ def test_a_stray_is_swept_even_when_this_pass_placed_nothing():
         "the flag should say what test it failed"
 
 
-def test_a_stray_is_removed_rather_than_carried_into_the_body():
+def test_a_stray_is_removed_rather_than_carried_into_the_body(removals_performed):
     """The specific thing that was wrong: not that it survived, but WHERE it
     survived. Travelling with the block put it inside the content area."""
     source = _stated_deck([(0.6, 0.05, 3.1, 0.28, "To be translated"),
@@ -1056,7 +1109,7 @@ def _texts(deck_bytes, idx):
     return [s.text_frame.text for s in slide.shapes if s.has_text_frame]
 
 
-def test_a_stray_is_judged_over_the_whole_deck_not_one_slide():
+def test_a_stray_is_judged_over_the_whole_deck_not_one_slide(removals_performed):
     """"To be translated" sat alone at the top of most slides and, on the ones
     where it happened to share a band with a numbered badge, looked exactly like
     a row member. Judged per slide it came off five slides and stayed on seven,
@@ -1100,7 +1153,7 @@ def test_a_row_wholly_above_the_body_line_is_kept():
     assert not [c for c in changes if c.action == "removed unplaced text"]
 
 
-def test_a_stray_cannot_vouch_for_another_stray():
+def test_a_stray_cannot_vouch_for_another_stray(removals_performed):
     """Two working notes stamped side by side each make the other look like a
     row. Once either is known to be a stray from somewhere else in the deck, it
     stops vouching and the second is unmasked - which is why the set is iterated
@@ -1145,7 +1198,7 @@ def test_a_collision_that_predates_the_pass_is_reported_not_nudged():
     assert moves == {_top_of(out, "The table") - _top_of(source, "The table")}
 
 
-def test_a_displaced_rival_is_still_swept():
+def test_a_displaced_rival_is_still_swept(removals_performed):
     """The gate above is not a licence to keep everything: where this pass DID
     fill a placeholder from the header band, the text it beat still has nowhere
     to go and still goes, with its XML kept."""
@@ -1209,6 +1262,18 @@ def _header_slide(entries):
     return buf.getvalue()
 
 
+def _placed_removing(deck_bytes):
+    """_placed with the removals performed. See the removals_performed fixture:
+    removal is opt-in, and a test about what a REMOVED piece looks like has to
+    ask for one."""
+    from qc.migrate import migrate_deck as _migrate
+
+    out, changes = _migrate(deck_bytes, remove=True)
+    slide = Presentation(io.BytesIO(out)).slides[0]
+    return (_ph_text(slide, "TITLE", "CENTER_TITLE"),
+            _ph_text(slide, "SUBTITLE"), out, changes)
+
+
 def _placed(deck_bytes):
     out, changes = migrate_deck(deck_bytes)
     slide = Presentation(io.BytesIO(out)).slides[0]
@@ -1263,7 +1328,7 @@ def test_a_chart_figure_lower_down_never_becomes_the_title():
 # --------------------------------------- unplaced text is removed and flagged
 
 
-def test_unplaced_header_text_is_removed_and_flagged_with_its_full_text():
+def test_unplaced_header_text_is_removed_and_flagged_with_its_full_text(removals_performed):
     """Rule: text the master has no placeholder for is removed, but reported
     loudly and in full so a designer can put it back."""
     full = "CORE FEATURES / STRATEGY AND OPERATIONS"
@@ -1300,21 +1365,48 @@ def test_body_content_is_never_removed_as_unplaced():
     assert "Body paragraph one" in kept and "Body paragraph two" in kept
 
 
-def test_the_report_surfaces_removals_before_routine_moves():
-    from qc.ui_format import render_format_result
+def _report_html(changes):
+    """The "what the rebuild did" section of the prepared-deck page. It is a
+    fragment now: there is no format result page, only step 3 of Prepare a
+    deck."""
+    from qc.ui_format import _content_section
 
+    return _content_section(changes, job_id="j")
+
+
+def test_the_report_surfaces_proposals_before_routine_moves():
+    """A default run proposes, so the rows that ask the designer for something
+    are the proposals - and they come first, for the same reason removals used
+    to: burying them in slide order among routine moves is how a deck ships with
+    something nobody looked at."""
     _t, _s, _out, changes = _placed(_header_slide([
         (0.45, 0.28, "AN EYEBROW", 11),
         (0.62, 0.60, "The Heading", 28),
         (1.20, 0.35, "The standfirst", 16),
         (2.60, 3.00, "CARDS", 12),
     ]))
-    html = render_format_result(deck_name="d.pptx", profile_name="p",
-                                job_id="j", plans=[], errors={}, applied=1,
-                                content_changes=changes)
+    html = _report_html(changes)
+    assert "would take out, and did not" in html
+    assert "AN EYEBROW" in html
+    assert "still in the deck" in html, "the wording has to say nothing happened"
+    assert html.index("would take out") < html.index("What moved into the master")
+    # and it offers the way out, on the route that performs it
+    assert 'action="/format/j/remove"' in html
+    assert 'name="remove_ids"' in html
+
+
+def test_the_report_still_surfaces_a_performed_removal():
+    """Once a designer has taken something out, the deck really is missing it,
+    and the page says so in the past tense with a way back."""
+    _t, _s, _out, changes = _placed_removing(_header_slide([
+        (0.45, 0.28, "AN EYEBROW", 11),
+        (0.62, 0.60, "The Heading", 28),
+        (1.20, 0.35, "The standfirst", 16),
+        (2.60, 3.00, "CARDS", 12),
+    ]))
+    html = _report_html(changes)
     assert "were removed" in html
     assert "AN EYEBROW" in html
-    # the alert banner must appear before the per-change table
     assert html.index("were removed") < html.index("What moved into the master")
 
 
@@ -1557,3 +1649,245 @@ def test_content_wider_than_the_margins_is_reported_not_narrowed():
     assert "cannot sit inside both margins" in alerts[0].detail
     before, after = _card_bounds(_guided_deck(card_left=0.6, card_width=4.6)), _card_bounds(out)
     assert (after[1] - after[0]) == (before[1] - before[0]), "must not be narrowed"
+
+
+# ================================================ nothing leaves unasked
+#
+# Design lead, 26/08/2026. The migration removed five classes of thing on its
+# own and offered them back afterwards, so the deck a designer downloaded had
+# already lost things and the restore was a repair rather than a decision. It
+# proposes now, and qc.migrate.apply_removals performs what was ticked.
+#
+# Detection is unchanged, and that is the point: every one of the five is still
+# found and still reported as an alert. What changed is who acts on it.
+
+
+def _every_removal_class():
+    """A deck that trips the removal classes at once: hand-typed page
+    furniture the master supplies, an empty placeholder, and a slide-level
+    background override that beats the master's."""
+    prs = Presentation(io.BytesIO(_deck(with_furniture=True)))
+    _set_solid_bg(prs.slides[0], "0B1F2A")
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+def test_a_default_run_loses_no_words():
+    """The policy in one assertion, stated over WORDS rather than shapes.
+
+    The shape count does legitimately fall: putting a title into its
+    placeholder is implemented as copy-then-delete, and leaving the source
+    behind would print the line twice. That is a move, and every word
+    survives it. What must never happen on a default run is that a string a
+    designer wrote is not in the output at all."""
+    data = _every_removal_class()
+
+    def words(deck_bytes):
+        prs = Presentation(io.BytesIO(deck_bytes))
+        return {t for slide in prs.slides
+                for shape in slide.shapes
+                if shape.has_text_frame
+                for t in [shape.text_frame.text.strip()] if t}
+
+    out, changes = migrate_deck(data)
+    missing = words(data) - words(out)
+    assert not missing, f"a default run lost {sorted(missing)}"
+    assert not [c for c in changes if c.action.startswith("removed ")], (
+        [c.action for c in changes])
+
+
+def test_every_removal_it_finds_comes_back_as_a_proposal():
+    """A proposal with no way to perform it is just a complaint. Each one
+    carries the op, a handle for the page to tick, and what the piece says."""
+    _out, changes = migrate_deck(_every_removal_class())
+    proposals = [c for c in changes if c.remove_op]
+    assert proposals, [c.action for c in changes]
+    for c in proposals:
+        assert c.severity == "alert", c.action
+        assert c.remove_id, c.action
+        assert c.remove_op.get("kind") in ("shape", "background")
+        assert c.remove_op.get("slide_index") == c.slide_index
+        if c.remove_op["kind"] == "shape":
+            assert c.remove_op.get("shape_id")
+
+
+def test_the_same_pass_still_finds_the_same_pieces():
+    """Detection did not change - only who acts on it. What a removing run takes
+    out is exactly what a default run proposes."""
+    data = _every_removal_class()
+    _out, proposed = migrate_deck(data)
+    _out2, performed = migrate_deck(data, remove=True)
+
+    def _slides(changes, pred):
+        return sorted(c.slide_index for c in changes if pred(c))
+
+    assert _slides(proposed, lambda c: bool(c.remove_op)) == \
+        _slides(performed, lambda c: c.action.startswith(("removed ",
+                                                          "dropped ")))
+
+
+def test_a_ticked_proposal_is_performed_and_nothing_else_is():
+    """One tick, one removal. A pass that took out the neighbours of what was
+    ticked would be worse than one that removed everything, because nobody would
+    be looking."""
+    from qc.migrate import apply_removals
+
+    data = _every_removal_class()
+    out, changes = migrate_deck(data)
+    shapes = [c for c in changes if (c.remove_op or {}).get("kind") == "shape"]
+    assert shapes
+
+    before = len(Presentation(io.BytesIO(out)).slides[0].shapes)
+    after_bytes, performed = apply_removals(out, [shapes[0].remove_op])
+    after = len(Presentation(io.BytesIO(after_bytes)).slides[0].shapes)
+
+    assert after == before - 1
+    assert len(performed) == 1 and performed[0].action == "removed on request"
+    assert performed[0].undo, "a removal without an undo is not reversible"
+
+
+def test_a_performed_removal_undoes_exactly():
+    from qc.migrate import apply_removals
+    from qc.undo import apply_undo
+
+    data = _every_removal_class()
+    out, changes = migrate_deck(data)
+    op = next(c.remove_op for c in changes
+              if (c.remove_op or {}).get("kind") == "shape")
+    gone, performed = apply_removals(out, [op])
+    back, outcomes = apply_undo(gone, [{"change_id": "c0", "slide_index": 0,
+                                        "action": "removed on request",
+                                        "ops": performed[0].undo}])
+    assert outcomes[0]["done"]
+    assert _texts(back, 0) == _texts(out, 0)
+
+
+def test_removing_the_background_override_lets_the_master_through():
+    from qc.migrate import apply_removals
+
+    data = _every_removal_class()
+    out, changes = migrate_deck(data)
+    op = next((c.remove_op for c in changes
+               if (c.remove_op or {}).get("kind") == "background"), None)
+    assert op is not None, "the fixture states its own background"
+    assert _has_own_bg(Presentation(io.BytesIO(out)).slides[0])
+
+    gone, performed = apply_removals(out, [op])
+    assert not _has_own_bg(Presentation(io.BytesIO(gone)).slides[0])
+    assert performed[0].undo, "and it goes back"
+
+
+def test_a_proposal_for_a_shape_that_has_gone_is_skipped_not_guessed():
+    """The deck can move on between the proposal and the tick. Guessing which
+    shape was meant is exactly the guess that loses content."""
+    from qc.migrate import apply_removals
+
+    data = _every_removal_class()
+    out, _changes = migrate_deck(data)
+    gone, performed = apply_removals(out, [{"kind": "shape", "slide_index": 0,
+                                            "shape_id": "999999"}])
+    assert len(performed) == 1
+    assert performed[0].action == "removal skipped"
+    assert _texts(gone, 0) == _texts(out, 0), "and nothing else was touched"
+
+
+def test_a_proposal_for_a_slide_that_has_gone_is_skipped():
+    from qc.migrate import apply_removals
+
+    data = _every_removal_class()
+    out, _changes = migrate_deck(data)
+    _gone, performed = apply_removals(out, [{"kind": "shape",
+                                             "slide_index": 99,
+                                             "shape_id": "2"}])
+    assert performed[0].action == "removal skipped"
+    assert "no longer in the deck" in performed[0].detail
+
+
+# ------------------------------- seating must not push content off the page
+#
+# dx is chosen from the START edge alone: seat the leftmost shape on the left
+# margin. That is right while the block fits and harmful when it does not - a
+# block already spanning the canvas gets shifted by the whole left margin, so
+# its far edge lands that far PAST the slide edge. Content that printed before
+# this pass ran does not print after it.
+#
+# Reproduced 30/08/2026 against a master with no presentation space and a
+# 0.92in inferred margin: a 13.33in block on a 13.33in slide was moved to
+# 0.92-14.25in, and the report graded it "info" because the overflow was
+# measured from the block's BOTTOM only.
+
+
+def _full_width_deck(*, left_at=0.0, right_edge=13.33):
+    """Two columns whose bounding box spans (nearly) the whole canvas, on a
+    master stating no presentation space."""
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Emu(12192000), Emu(6858000)
+    slide = prs.slides.add_slide(prs.slide_layouts[6])   # blank
+
+    def tb(x, y, w, h, text):
+        shape = slide.shapes.add_textbox(Emu(int(x * IN)), Emu(int(y * IN)),
+                                         Emu(int(w * IN)), Emu(int(h * IN)))
+        run = shape.text_frame.paragraphs[0].add_run()
+        run.text = text
+        run.font.size = Pt(12)
+        return shape
+
+    half = (right_edge - left_at) / 2 - 0.4
+    tb(left_at, 2.6, half, 2.0, "Left column body copy. " * 8)
+    tb(right_edge - half, 3.0, half, 2.0, "Right column body copy. " * 8)
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+def _right_edges(deck_bytes):
+    slide = Presentation(io.BytesIO(deck_bytes)).slides[0]
+    return [s.left + s.width for s in slide.shapes
+            if s.left is not None and s.width is not None
+            and s.has_text_frame and "column" in s.text_frame.text]
+
+
+def test_seating_never_pushes_content_off_the_slide():
+    source = _full_width_deck()
+    slide_w = Presentation(io.BytesIO(source)).slide_width
+
+    before = _right_edges(source)
+    assert before and max(before) <= slide_w, "the fixture starts on the page"
+
+    out, _changes = migrate_deck(source)
+    after = _right_edges(out)
+    assert after, "the columns survived the migration"
+    assert max(after) <= slide_w, (
+        f"seating the left edge pushed content "
+        f"{(max(after) - slide_w) / IN:.2f}in off the right of the page; it "
+        f"printed before this pass ran")
+
+
+def test_a_block_with_slack_is_still_seated_exactly():
+    """The clamp must only bite when seating would spill. A block that fits
+    keeps the behaviour it had - this is not a retreat from seating."""
+    source = _full_width_deck(left_at=0.0, right_edge=10.0)
+    out, changes = migrate_deck(source)
+    lefts = sorted(s.left for s in Presentation(io.BytesIO(out)).slides[0].shapes
+                   if s.left is not None and s.has_text_frame
+                   and "column" in s.text_frame.text)
+    assert lefts, "the columns survived"
+    moved = [c for c in changes if c.action == "content block moved"]
+    assert moved, "a block with room to move is still seated on the margin"
+    assert lefts[0] > 0, "and it actually moved off the slide edge"
+
+
+def test_a_block_off_the_page_sideways_is_an_alert_that_says_so():
+    """Both spill measurements came off the block's bottom, so a block hanging
+    off the SIDE reported an empty spill and severity 'info' - the one grade
+    that says there is nothing to look at."""
+    source = _full_width_deck()
+    _out, changes = migrate_deck(source)
+    fit = [c for c in changes if c.action == "content does not fit"]
+    if not fit:
+        return                      # nothing overflowed; nothing to report
+    detail = fit[0].detail
+    assert "margin" in detail, (
+        f"the block is wider than the content area and the report says "
+        f"nothing about where it went: {detail}")

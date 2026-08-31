@@ -1,7 +1,8 @@
-"""Stage 1 pages: submit a finished master, review the Style Spec it yields.
+"""Step 1 of Prepare a deck: the Style Spec a finished master yields.
 
-Rendering only; route logic lives in qc/web.py. Reuses the Prezlab brand
-shell from qc/ui.py so this reads as one product with the audit flow.
+Rendering only; route logic lives in qc/web.py. This module exports ONE
+thing, `spec_review`, and it is a fragment rather than a page: the master is
+read in place on Prepare a deck, under the form that read it.
 
 The review surface exists because a Style Spec is only trustworthy if a
 design lead can check it against the master they built, and nobody checks
@@ -11,10 +12,14 @@ whoever needs to debug a number. Where a value was INFERRED rather than
 declared, the page says so, because those are the values worth doubting.
 """
 
-from .ui import _shell, esc
+from .ui import esc
 
 EMU_PER_IN = 914400
 EMU_PER_PT = 12700
+
+_FIELD = ("border:1px solid var(--line);border-radius:10px;"
+          "padding:0.42rem 0.75rem;background:#fff;color:var(--teal);"
+          "font-size:0.88rem;")
 
 
 def _in(emu) -> str:
@@ -27,54 +32,6 @@ def _in(emu) -> str:
 def _warn(message: str) -> str:
     return f'<div class="banner warn">{esc(message)}</div>' if message else ""
 
-
-# ------------------------------------------------------------------ intake
-
-
-def render_master_intake(message: str = "") -> str:
-    body = f"""
-<h1>Read a master.</h1>
-<p class="sub">Upload the finished master slide. This reads the slide master, its
-layouts, and the theme, and returns the visual system they declare: theme colours
-and fonts, placeholder geometry per layout, page furniture, and the grid.
-Slide content is never read, so a master with no slides is exactly what this
-expects.</p>
-{_warn(message)}
-<form action="/master" method="post" enctype="multipart/form-data" id="f">
-  <div class="drop" id="drop" tabindex="0" role="button"
-       aria-label="Drop a .pptx master here or press Enter to browse">
-    <strong>Drop the master .pptx here</strong> or click to browse
-    <div class="hint">Read locally and deleted straight after. The extracted
-    spec stays in memory on this machine.</div>
-    <div class="file" id="fname" aria-live="polite"></div>
-    <input type="file" name="master" id="master" accept=".pptx" required hidden>
-  </div>
-  <div class="actions">
-    <button class="btn primary" id="go" type="submit" disabled>Read the master</button>
-  </div>
-</form>
-<script>
-const drop = document.getElementById('drop'), input = document.getElementById('master'),
-      fname = document.getElementById('fname'), go = document.getElementById('go');
-function arm() {{
-  if (input.files.length) {{ fname.textContent = input.files[0].name; go.disabled = false; }}
-}}
-drop.addEventListener('click', () => input.click());
-drop.addEventListener('keydown', e => {{ if (e.key === 'Enter' || e.key === ' ') input.click(); }});
-input.addEventListener('change', arm);
-document.getElementById('f').addEventListener('submit', () => {{
-  go.disabled = true;
-  showBusy('Reading ' + (input.files[0] ? input.files[0].name : 'master'),
-           'Walking the slide master, every layout, and the theme part.');
-}});
-['dragover', 'dragenter'].forEach(ev => drop.addEventListener(ev, e => {{
-  e.preventDefault(); drop.classList.add('armed'); }}));
-['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => {{
-  e.preventDefault(); drop.classList.remove('armed'); }}));
-drop.addEventListener('drop', e => {{
-  if (e.dataTransfer.files.length) {{ input.files = e.dataTransfer.files; arm(); }} }});
-</script>"""
-    return _shell("Read a master", body)
 
 
 # ------------------------------------------------------------------- review
@@ -231,6 +188,58 @@ def _grid_block(grid: dict) -> str:
     {len(g['horizontal_emu'])} horizontal</td></tr>
 </tbody></table>
 <p class="note">{_GRID_SOURCE_NOTE.get(grid['source'], '')}</p>"""
+
+
+def _stamp_block(grid: dict, spec_id: str, size) -> str:
+    """The offer to write a presentation space into this master.
+
+    Shown only when the master does not already state one, because that is the
+    only case where it helps: with a rectangle on the file every number above is
+    read rather than inferred, and every deck formatted against it is seated on
+    a stated frame (qc.stylespec.infer_grid ranks the sources).
+
+    Pre-filled with what was inferred, in inches, because those are the numbers
+    a designer is deciding whether to accept - typing four edges from scratch is
+    a worse question than correcting four that are already close.
+
+    It hands back a COPY to download. Nothing here changes the stored master or
+    the file the designer uploaded (qc.pspace.stamp_master).
+    """
+    if not grid or not grid.get("source"):
+        return ""
+    if grid.get("presentation_space"):
+        return ""
+    m = grid.get("margins_emu") or {}
+    if not m:
+        return ""
+    # meta["slide_size_emu"] is {"width", "height"}, not a pair.
+    sw, sh = int(size.get("width") or 0), int(size.get("height") or 0)
+    if not sw or not sh:
+        return ""
+    # The margins are insets; the marker is a BOX, so the far edges are the
+    # canvas less the inset.
+    edges = {"left": int(m.get("left") or 0), "top": int(m.get("top") or 0),
+             "right": sw - int(m.get("right") or 0),
+             "bottom": sh - int(m.get("bottom") or 0)}
+    fields = "".join(
+        f'<label style="display:inline-block;margin:0 0.8rem 0.5rem 0">'
+        f'{name.title()}<br><input type="number" step="0.01" name="{name}" '
+        f'value="{edges[name] / 914400:.2f}" '
+        f'style="width:6rem;padding:0.3rem"> in</label>'
+        for name in ("left", "top", "right", "bottom"))
+    return f"""
+<div style="margin-top:0.9rem;padding-top:0.8rem;border-top:1px solid var(--line)">
+  <h3 style="margin:0 0 0.3rem">Write these margins into the master</h3>
+  <p class="note" style="margin:0 0 0.6rem">The numbers above were inferred.
+  Drawing them onto the master as a presentation space makes them stated, so
+  every deck formatted against it is seated on a frame a designer chose rather
+  than on where the placeholders happen to sit. You get a copy to check and
+  keep; this file and the stored profile are not changed.</p>
+  <form method="post" action="/spec/{esc(spec_id)}/pspace">
+    {fields}
+    <div><button type="submit">Download a copy with the presentation space</button></div>
+  </form>
+</div>"""
 
 
 def _background_cell(bg: dict | None) -> str:
@@ -514,8 +523,19 @@ def _layout_rows(layouts: list) -> str:
     return "".join(rows)
 
 
-def render_style_spec(spec: dict, spec_id: str, can_save: bool = True,
-                      message: str = "") -> str:
+def spec_review(spec: dict, spec_id: str, can_save: bool = True,
+                message: str = "", profiles: list[dict] | None = None) -> str:
+    """The read master, as a BLOCK rather than a page.
+
+    It used to be its own page and that was the seam in the flow: a designer
+    dropped a master, was taken somewhere else to look at it, saved a profile,
+    and was taken back to apply it. Three destinations for one decision. The
+    block renders in place under step 1 of Prepare a deck, so the master, the
+    profile it becomes, and the deck it gets applied to are on one page in the
+    order they happen (design lead, 31/08/2026).
+
+    Returns a fragment: no <h1> and no shell, because the page it lands on
+    already has both."""
     meta = spec["meta"]
     theme = spec.get("theme") or {}
     master = spec.get("master") or {}
@@ -537,27 +557,61 @@ def render_style_spec(spec: dict, spec_id: str, can_save: bool = True,
 
     save_form = ""
     if can_save:
+        # Replacing beats creating a near-duplicate. A designer who revises a
+        # master and reads it again wants THAT profile pointed at the new file,
+        # not a second profile called "Client X 2" that half the team will pick
+        # by accident. Replacing re-reads only what the master STATES - frame,
+        # bands, grid, layout names - and leaves hand-edited fonts, palette and
+        # tolerances alone, because those are decisions about the client rather
+        # than readings of the file.
+        options = "".join(
+            f'<option value="{esc(p["id"])}">{esc(p["name"])}</option>'
+            for p in (profiles or []))
+        replace = ""
+        if options:
+            replace = f"""
+  <hr style="border:0;border-top:1px solid var(--line-soft);margin:1rem 0">
+  <h3 style="margin:0 0 0.2rem">Or point an existing profile at this master</h3>
+  <p class="sub" style="margin:0 0 0.6rem">Replaces the stored file, so every
+  deck prepared against that profile is rebuilt on this master from now on.
+  Re-reads the frame, the reserved bands, the grid and the layout names;
+  leaves its fonts, palette and tolerances exactly as they are.</p>
+  <form action="/spec/{esc(spec_id)}/profile" method="post" class="actions"
+        style="gap:0.6rem;align-items:center">
+    <select name="target" aria-label="Profile to replace the master on"
+      style="{_FIELD}">{options}</select>
+    <button class="btn ghost" type="submit"
+      data-busy="Replacing the master">Replace its master</button>
+  </form>"""
         save_form = f"""
 <div class="card">
   <div class="tag">Use it</div>
   <h2 style="margin-top:0">Save as a formatting profile</h2>
-  <p class="sub">Turns this spec into a profile the audit engine reads, so decks
-  can be checked against this master. The spec stays the source of truth; the
-  profile is a view of it.</p>
+  <p class="sub">Writes a JSON profile plus the master file, so a messy deck can
+  be rebuilt onto this master and audited against it. The spec stays the source
+  of truth; the profile is a view of it. Saved profiles appear in step 2 below.</p>
   <form action="/spec/{esc(spec_id)}/profile" method="post" class="actions"
         style="gap:0.6rem;align-items:center">
     <input name="name" required placeholder="Profile name, e.g. Client X master"
-      style="border:1px solid var(--line);border-radius:10px;padding:0.42rem 0.75rem;
-             background:#fff;color:var(--teal);font-size:0.88rem;min-width:18rem">
+      style="{_FIELD}min-width:18rem">
     <button class="btn primary" type="submit">Save profile</button>
-  </form>
+  </form>{replace}
+</div>"""
+    else:
+        save_form = """
+<div class="card">
+  <div class="tag">Use it</div>
+  <p class="sub">Sign in as a lead or admin to save this as a profile JSON.
+  Without that, the spec is held in memory only and cannot be applied to
+  another deck.</p>
 </div>"""
 
-    body = f"""
-<h1>{esc(meta.get('source_file') or 'Style Spec')}</h1>
-<p class="sub">{provenance} Canvas {_in(size['width'])} &times; {_in(size['height'])},
-{len(spec['layouts'])} layouts. <a href="/spec/{esc(spec_id)}.json">Download the
-Style Spec JSON</a> &middot; <a href="/master">read another master</a></p>
+    return f"""
+<div class="specread">
+<h3 style="margin:1.4rem 0 0.2rem">{esc(meta.get('source_file') or 'Style Spec')}</h3>
+<p class="sub" style="margin:0 0 0.8rem">{provenance} Canvas {_in(size['width'])}
+&times; {_in(size['height'])}, {len(spec['layouts'])} layouts.
+<a href="/spec/{esc(spec_id)}.json">Download the Style Spec JSON</a></p>
 {_warn(message)}{multi_master}
 
 <div class="card">
@@ -577,6 +631,7 @@ Style Spec JSON</a> &middot; <a href="/master">read another master</a></p>
   <h2 style="margin-top:0">Margins and columns</h2>
   {_grid_block(spec.get('grid') or {})}
   {_space_agreement_note(spec.get('grid') or {}, spec['layouts'])}
+  {_stamp_block(spec.get('grid') or {}, spec_id, size)}
 </div>
 
 <div class="card">
@@ -606,5 +661,5 @@ Style Spec JSON</a> &middot; <a href="/master">read another master</a></p>
     <tbody>{_layout_rows(spec['layouts'])}</tbody>
   </table>
 </div>
-{save_form}"""
-    return _shell(f"Style Spec: {meta.get('source_file') or spec_id}", body)
+{save_form}
+</div>"""

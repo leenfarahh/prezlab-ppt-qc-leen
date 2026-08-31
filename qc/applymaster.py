@@ -55,6 +55,21 @@ class SlidePlan:
     target_layout: str | None
     match_rule: str           # how the target was chosen, for the report
     note: str = ""
+    # Whether a PERSON decided about this slide: "" for nobody has, or
+    # "chosen by the designer" (qc.layoutpick.apply_picks).
+    #
+    # This used to hold a vision model's verdict from a vocabulary of eight
+    # ("placed", "confirmed", "no fit", "no fit (partial sheet)", ...), because
+    # the slides the file could not place were placed by a model mid-run. The
+    # layout step replaced that with a person, and the eight collapsed to two:
+    # there is no "uncertain" and no "unanswerable" when a designer is the one
+    # answering (31/08/2026).
+    #
+    # Kept separate from match_rule because the deck-level report is built on
+    # the difference. A slide nobody has decided about is not evidence that the
+    # master is missing a layout; it is evidence that nobody has looked
+    # (qc.layoutgap.Coverage.not_reviewed).
+    review: str = ""
 
 
 @dataclass

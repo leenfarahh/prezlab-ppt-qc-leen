@@ -22,7 +22,7 @@ from pptx import Presentation
 
 from qc.stylespec import (MAX_EMBEDDED_ASSET_BYTES, extract_style_spec,
                           spec_to_profile)
-from qc.ui_master import render_style_spec
+from qc.ui_master import spec_review
 from tests.conftest import job_id_of
 
 P_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
@@ -178,7 +178,7 @@ def test_page_previews_the_background_image():
     prs = Presentation()
     _set_picture_background(prs.slide_masters[0], _png(), alpha=40)
     spec = extract_style_spec(prs)
-    html = render_style_spec(spec, "sid")
+    html = spec_review(spec, "sid")
 
     assert "picture background" in html
     assert "40% opacity" in html
@@ -190,7 +190,7 @@ def test_page_marks_a_layout_that_overrides_the_background():
     prs = Presentation()
     layout = list(prs.slide_masters[0].slide_layouts)[0]
     _set_picture_background(layout, _png())
-    html = render_style_spec(extract_style_spec(prs), "sid")
+    html = spec_review(extract_style_spec(prs), "sid")
 
     assert "<th>Background</th>" in html
     assert "inherits" in html          # the layouts that declare nothing

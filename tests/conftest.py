@@ -88,13 +88,31 @@ def save_and_ctx(prs, tmp_path: Path, profile: Profile, name: str = "case.pptx")
 
 @pytest.fixture(autouse=True)
 def _isolate_local_data(monkeypatch, tmp_path):
-    """No test may inherit this machine's state.
+    """No test may inherit this machine's state, and none may leave a mark on it.
 
-    History, users, and triage redirect to the test's tmp dir unless a test
-    re-patches. Feature switches are pinned to their REPO defaults, not to
-    whatever the developer's gitignored .env says: a local QC_AI=0 must not
-    silently turn the assistant and copilot tests green-by-absence. Tests
-    that exercise the off state patch the switch themselves."""
+    History, users, triage and the PROFILE STORE redirect to the test's tmp dir
+    unless a test re-patches. Feature switches are pinned to their REPO
+    defaults, not to whatever the developer's gitignored .env says: a local
+    QC_AI=0 must not silently turn the assistant and copilot tests
+    green-by-absence. Tests that exercise the off state patch the switch
+    themselves.
+
+    Profiles were the gap. Every test that saved a master through the web tier
+    wrote a real JSON into qc/profiles/, and the ones that forgot to unlink it
+    in a finally left it there - so a developer who ran the suite got
+    "Frame Client", "Gap Client 2" and thirty more in the profile picker on
+    Prepare a deck, mixed in with the client profiles (31/08/2026).
+
+    PROFILES_DIR is patched in THREE places because two modules bound the value
+    at import time. Patching only qc.profile leaves qc.web writing to the repo,
+    which is the same trap qc/templates.py documents for DATA_DIR - and it
+    fails silently, because the test asserting on the profile can read it back
+    through the module it did patch.
+    """
+    import shutil
+
+    import qc.bootstrap as _bootstrap
+    import qc.profile as _profile
     import qc.store as _store
     import qc.triage as _triage
     import qc.web as _web
@@ -104,3 +122,14 @@ def _isolate_local_data(monkeypatch, tmp_path):
     monkeypatch.setattr(_triage, "DATA_DIR", tmp_path)
     monkeypatch.setattr(_triage, "TRIAGE_LOG", tmp_path / "triage-log.jsonl")
     monkeypatch.setattr(_web, "AI_ENABLED", True, raising=False)
+
+    # Not tmp_path/"profiles": test_admin and test_assist each build their own
+    # single-profile dir under that exact name and re-patch PROFILES_DIR to it.
+    # Those still win - they run after this one - and they no longer collide
+    # with it on mkdir.
+    profiles = tmp_path / "qc-profiles"
+    profiles.mkdir()
+    for seed in _profile.PROFILES_DIR.glob("*.json"):
+        shutil.copy(seed, profiles / seed.name)
+    for module in (_profile, _web, _bootstrap):
+        monkeypatch.setattr(module, "PROFILES_DIR", profiles, raising=False)

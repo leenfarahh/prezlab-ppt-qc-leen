@@ -21,6 +21,35 @@ python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 ```
 
+## Run the tool
+
+```powershell
+.venv\Scripts\python -m qc.web        # http://127.0.0.1:8000
+```
+
+Four destinations, in the header of every page.
+
+**Prepare a deck** is the main flow and it is three steps. Drop a finished
+master to save it as a profile; drop a messy client deck against that profile;
+then **choose the layouts** for the slides the file could not place with
+confidence, and only then is the master applied and the rebuilt deck audited.
+Nothing is rewritten until that second press.
+
+**Audit only** reads a deck against a profile and changes nothing.
+
+**Profiles** lists every saved profile and edits one: type, palette, margins and
+tolerances, in inches and points rather than EMU. Use it to change one number
+instead of re-reading a master.
+
+**Team** is the pilot roster; saving a profile needs a lead or admin.
+
+Applying a master is pure code - it asks no model and produces the same file
+from the same inputs every time. The passes that DO use a model are the visual
+ones: what a designer would adjust on the rebuilt slides, what the things on a
+slide are, the triage questions, the ask box, and proposing a layout for a gap.
+All of them go to Gemini (`GEMINI_API_KEY` in a gitignored `.env`), all of them
+are optional, and `QC_AI=0` turns the lot off at the source.
+
 ## Run the spike
 
 ```powershell

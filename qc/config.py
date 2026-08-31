@@ -11,7 +11,7 @@ from pathlib import Path
 
 def _load_dotenv():
     """Tiny .env loader (no dependency): KEY=VALUE lines from the project
-    root, for local secrets like ANTHROPIC_API_KEY. Real environment
+    root, for local secrets like GEMINI_API_KEY. Real environment
     variables always win; blank values and comments are skipped."""
     env_path = Path(__file__).resolve().parent.parent / ".env"
     if not env_path.exists():
@@ -59,44 +59,98 @@ def opt_out_flag(name: str) -> bool:
     return os.getenv(name, "1").strip().lower() not in ("0", "false", "no", "off")
 
 
-# Master switch for every Anthropic-backed feature (assistant triage and the
-# design copilot). QC_AI=0 turns them off at the source: the UI hides them and
-# the routes refuse, so no request leaves this machine even if a key is
-# configured. Defaults ON; set it in a gitignored .env to disable locally
-# without changing what anyone else gets.
+# Master switch for every model-backed feature (assistant triage, the design
+# copilot, component review, the chat box). QC_AI=0 turns them off at the
+# source: the UI hides them and the routes refuse, so no request leaves this
+# machine even if a key is configured. Defaults ON; set it in a gitignored .env
+# to disable locally without changing what anyone else gets.
 AI_ENABLED = opt_out_flag("QC_AI")
 
-# Assistant triage (qc/assist.py): Claude phrases the clarifying questions
-# when an Anthropic API key is configured (ANTHROPIC_API_KEY); without one
-# the same questions fall back to template phrasing, fully offline. Only
-# finding metadata is ever sent, never slide content. Haiku is the default
-# because the task is small (select and phrase a handful of questions,
-# ~$0.006 per click); set QC_ASSIST_MODEL to a bigger tier if selection
-# quality ever disappoints.
-ASSIST_MODEL = os.getenv("QC_ASSIST_MODEL", "claude-haiku-4-5").strip()
-
-# Design copilot (qc/copilot.py): Claude reviews rendered slide images and
-# proposes layout actions; code verifies and the designer approves. Vision
-# quality matters here, so the strongest tier is the default. Unlike the
-# assistant, this sends slide IMAGES to the API - the UI discloses it.
-COPILOT_MODEL = os.getenv("QC_COPILOT_MODEL", "claude-opus-4-8").strip()
-
-# The judgment passes - component review (qc/components.py) and layout matching
-# when applying a master (qc/layoutmatch.py) - all go through qc.llm, and this
-# is the only place their provider and model are chosen. Gemini by default
-# (design lead, 24/08/2026); "anthropic" is still wired, so a provider switch is
-# not a one-way door.
+# GEMINI IS THE ONLY MODEL THIS BUILD TALKS TO (design lead, 31/08/2026).
 #
-# These send slide IMAGES, like the design copilot, and the UI discloses it.
+# There was a QC_LLM_PROVIDER switch here with an Anthropic branch behind it,
+# and a separate QC_ASSIST_MODEL naming a Claude tier for the triage questions.
+# Both are gone. The switch bought optionality nobody used and cost a second
+# schema dialect, a second refusal shape and a second key check that no real run
+# ever exercised; the assist model was the last thing in the tool reaching for a
+# different vendor than everything else. Everything that needs judgment now goes
+# through qc.llm to Gemini, and the passes that read a slide are the only ones
+# that send an image.
+#
 # Vision quality sets the ceiling on how good the fixes can be - a wrongly
 # grouped component means a fix that tears a card off its label - so the default
 # is the strongest vision tier rather than the cheapest.
-LLM_PROVIDER = os.getenv("QC_LLM_PROVIDER", "gemini").strip().lower()
-_DEFAULT_MODELS = {"gemini": "gemini-3-pro-preview",
-                   "anthropic": "claude-opus-5"}
-LLM_MODEL = os.getenv(
-    "QC_LLM_MODEL", _DEFAULT_MODELS.get(LLM_PROVIDER, "gemini-3-pro-preview")
-).strip()
+#
+# Gemini 3.1 Pro (design lead, 26/08/2026). Preview is the only id it answers
+# on, and a "-preview" id can be retired by Google without notice, so this is
+# the single line to change when it graduates or moves on; QC_LLM_MODEL
+# overrides it on a host without a deploy.
+DEFAULT_LLM_MODEL = "gemini-3.1-pro-preview"
+LLM_MODEL = os.getenv("QC_LLM_MODEL", DEFAULT_LLM_MODEL).strip()
+
+
+# A model id from a vendor this build no longer calls is the one settings
+# mistake that survives the provider removal: a host still carrying
+# QC_LLM_MODEL=claude-opus-5 in its .env posts that id to Gemini and gets a 404
+# in every judgment pass at once, reported as "the model could not be reached"
+# with nothing naming the variable responsible.
+#
+# Caught here, where the value is in view. Not raised: this module is imported at
+# startup and a stale .env must not stop the server booting, since every page
+# that is not a judgment pass still works. The pass says so when it is asked, and
+# the routes print `model_note` beside the button.
+def _model_note() -> str:
+    """Why the configured model id will not answer, or "" when it looks fine."""
+    override = os.getenv("QC_LLM_MODEL", "").strip()
+    if not override or override.lower().startswith("gemini"):
+        return ""
+    return (f"QC_LLM_MODEL is {override!r}, which is not a Gemini model. This "
+            f"build only calls Gemini; unset it to use {DEFAULT_LLM_MODEL}.")
+
+
+LLM_MODEL_NOTE = _model_note()
+
+
+def _positive_int(name: str, default: int) -> int:
+    """An env-tunable count that refuses to be zero or junk. A 0 here would
+    mean "no timeout" or "no attempts", which are the two settings nobody
+    wants to reach by typo."""
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+# How long one judgment call may take before it is abandoned, in MILLISECONDS
+# (the unit google-genai's HttpOptions takes; passing seconds here would set a
+# two-minute budget to two milliseconds). Generous by default: these are vision
+# calls over dense slide images at MEDIA_RESOLUTION_HIGH with thinking on, and
+# a slow answer is still worth more than no answer. The point is that a hung
+# connection cannot pin a worker forever, not that slow calls are cut off.
+LLM_TIMEOUT_MS = _positive_int("QC_LLM_TIMEOUT_MS", 120_000)
+
+# Attempts INCLUDING the first, on the transient statuses only (408, 429, 5xx).
+# The SDK's own default is 5 with delays growing to 60s, which is tuned for
+# cheap calls; a run here makes one of these per distinct slide structure, so
+# five attempts on a bad afternoon is a designer watching a spinner. Three
+# attempts with a short ceiling retries the blip and gives up on the outage.
+LLM_ATTEMPTS = _positive_int("QC_LLM_ATTEMPTS", 3)
+LLM_RETRY_MAX_DELAY_SEC = 8.0
+
+# How many judgment calls may be in flight at once.
+#
+# These passes ask one question PER SLIDE (or per distinct slide structure), the
+# questions do not depend on each other, and each one is a vision call over a
+# dense image with thinking on - seconds, not milliseconds, and almost all of it
+# spent waiting on the network. Run in a row, a twenty-slide component review is
+# a designer watching a spinner for several minutes; the work is embarrassingly
+# parallel and was serial only because it was written a slide at a time.
+#
+# Four rather than twenty: the ceiling here is the provider's rate limit, and a
+# burst of twenty turns into 429s that the SDK then has to sit out, which is
+# slower than not having burst at all. Raise it on a host with a high quota.
+LLM_CONCURRENCY = _positive_int("QC_LLM_CONCURRENCY", 4)
 
 # Max upload size in MB. Raise on the desktop/LAN box for large image-heavy
 # client decks; keep modest on small-RAM cloud tiers (the whole file is held

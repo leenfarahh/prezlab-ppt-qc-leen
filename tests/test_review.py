@@ -9,7 +9,9 @@ near them.
 """
 
 import io
+from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 from pptx import Presentation
 from pptx.util import Emu, Pt
@@ -77,15 +79,35 @@ def _offsets(deck_bytes):
     return out
 
 
-def _job(monkeypatch, job_id="reviewjob"):
-    """A finished format job over _deck(), with the source kept as the page
-    keeps it."""
+def _migrated_with_removals(source):
+    """The migration with its removals performed.
+
+    Removal is opt-in (design lead, 26/08/2026: nothing leaves a slide unless a
+    designer asks), so a default run only proposes. The tests below are about
+    undoing a removal, which needs one to exist.
+    """
+    return migrate_deck(source, remove=True)
+
+
+def _job(monkeypatch, job_id="reviewjob", *,
+         remove: bool = False):
+    """A finished prepare job over _deck(), with the source kept as the page
+    keeps it.
+
+    It carries a Prep because every format job is a prepared deck: the remove
+    and restore routes answer on the prepared-deck page, which is drawn from
+    the run rather than from the job's loose keys."""
+    from qc.prep import Prep
+
     source = _deck()
-    deck, changes = migrate_deck(source)
+    deck, changes = migrate_deck(source, remove=remove)
+    prep = Prep(filename="d.pptx", source=source, deck=deck, applied=1,
+                changes=changes)
     web._format_jobs[job_id] = {
         "deck": deck, "source": source, "filename": "d.pptx",
         "profile": "prezlab_en", "plans": [], "errors": {}, "applied": 1,
         "changes": changes, "restored": [], "undone": [], "undo_notes": {},
+        "removed": [], "prep": prep, "manifest": None,
     }
     return job_id, source, changes
 
@@ -116,7 +138,7 @@ def test_undoing_the_block_move_puts_every_shape_back_exactly():
 
 def test_undoing_a_removal_brings_the_text_back():
     source = _deck()
-    deck, changes = migrate_deck(source)
+    deck, changes = _migrated_with_removals(source)
     swept = next(c for c in changes if c.action == "removed unplaced text")
     assert "FUTURE WORK" not in _offsets(deck)
 
@@ -160,7 +182,7 @@ def test_undoing_a_removal_also_takes_back_the_move_it_enabled():
     it (design lead, 23/08/2026, "the kept text should also go back to its place
     instead of overlapping them")."""
     source = _deck()
-    deck, changes = migrate_deck(source)
+    deck, changes = _migrated_with_removals(source)
     swept = next(c for c in changes if c.action == "removed unplaced text")
     move = next(c for c in changes if c.action == "content block moved")
 
@@ -563,7 +585,7 @@ def test_resubmitting_an_undo_does_not_apply_it_twice(monkeypatch):
     put a second copy of the returned shape on the slide."""
     monkeypatch.setattr("qc.render.RENDERER", "none")
     client = _client(monkeypatch)
-    job_id, _source, changes = _job(monkeypatch)
+    job_id, _source, changes = _job(monkeypatch, remove=True)
     swept = next(c for c in changes if c.action == "removed unplaced text")
     try:
         client.post(f"/format/{job_id}/undo",
@@ -635,11 +657,16 @@ def test_review_and_undo_on_an_unknown_job_are_clean_404s(monkeypatch):
 
 
 def test_the_result_page_points_at_the_review(monkeypatch):
-    from qc.ui_format import render_format_result
+    """The prepared deck's page is the result page now, and before/after is one
+    of the four things it hands off to."""
+    from qc.prep import Prep
+    from qc.ui_prep import render_prep_result
 
-    html = render_format_result(deck_name="d.pptx", profile_name="P",
-                                job_id="j1", plans=[], errors={}, applied=1)
+    prep = Prep(filename="d.pptx", source=b"", deck=b"", applied=1)
+    html = render_prep_result(prep=prep, job_id="j1", profile_name="P",
+                              headline="Rebuilt 1 of 1 slides on the master.")
     assert "/format/j1/review" in html
+    assert "/format/j1/download" in html
 
 
 def test_a_clean_host_costs_one_process_listing_not_two(monkeypatch):
@@ -674,3 +701,164 @@ def test_the_process_listing_prefers_wmi_but_survives_without_it(monkeypatch):
     fake = type("R", (), {"stdout": "33\n44\n"})()
     monkeypatch.setattr(unify.subprocess, "run", lambda *a, **k: fake)
     assert unify.automation_pids() == {33, 44}, "the fallback did not run"
+
+
+# ------------------------------------------- the button that performs a removal
+#
+# Removal is opt-in as of 26/08/2026, so the deck a designer downloads still has
+# everything the pass found. This is the other half of that: the tick, and what
+# happens when the same POST arrives twice.
+
+
+def _texts_of(deck_bytes, idx=0):
+    slide = Presentation(io.BytesIO(deck_bytes)).slides[idx]
+    return [s.text_frame.text.strip() for s in slide.shapes if s.has_text_frame]
+
+
+def test_ticking_a_proposal_takes_that_piece_out(monkeypatch):
+    monkeypatch.setattr("qc.render.RENDERER", "none")
+    client = _client(monkeypatch)
+    job_id, _source, changes = _job(monkeypatch, "removejob")
+    proposal = next(c for c in changes
+                    if (c.remove_op or {}).get("kind") == "shape")
+    piece = proposal.removed_text
+
+    assert piece in _texts_of(web._format_jobs[job_id]["deck"]), \
+        "the pass left it in place, which is the policy"
+
+    r = client.post(f"/format/{job_id}/remove",
+                    data={"remove_ids": proposal.remove_id})
+    assert r.status_code == 200
+    assert piece not in _texts_of(web._format_jobs[job_id]["deck"])
+    # and it is recorded as a change, with an undo, like everything else
+    performed = [c for c in web._format_jobs[job_id]["changes"]
+                 if c.action == "removed on request"]
+    assert len(performed) == 1 and performed[0].undo
+
+
+def test_an_unticked_proposal_is_left_alone(monkeypatch):
+    """One tick, one removal. A pass that took out the neighbours of what was
+    ticked would be worse than one that removed everything, because nobody would
+    be looking for it."""
+    monkeypatch.setattr("qc.render.RENDERER", "none")
+    client = _client(monkeypatch)
+    job_id, _source, changes = _job(monkeypatch, "removejob2")
+    proposals = [c for c in changes
+                 if (c.remove_op or {}).get("kind") == "shape"]
+    ticked = proposals[0]
+    others = [c.removed_text for c in proposals[1:] if c.removed_text]
+
+    r = client.post(f"/format/{job_id}/remove",
+                    data={"remove_ids": ticked.remove_id})
+    assert r.status_code == 200
+    assert ticked.removed_text not in _texts_of(web._format_jobs[job_id]["deck"])
+    left = _texts_of(web._format_jobs[job_id]["deck"])
+    for text in others:
+        assert text in left, f"{text!r} was not ticked and came out anyway"
+
+
+def test_resubmitting_the_removal_does_not_report_a_failure(monkeypatch):
+    """A refresh or a back button resends the POST. The second one must not
+    complain about a piece that is correctly gone."""
+    monkeypatch.setattr("qc.render.RENDERER", "none")
+    client = _client(monkeypatch)
+    job_id, _source, changes = _job(monkeypatch, "removejob3")
+    proposal = next(c for c in changes
+                    if (c.remove_op or {}).get("kind") == "shape")
+
+    client.post(f"/format/{job_id}/remove", data={"remove_ids": proposal.remove_id})
+    before = list(web._format_jobs[job_id]["changes"])
+    r = client.post(f"/format/{job_id}/remove",
+                    data={"remove_ids": proposal.remove_id})
+    assert r.status_code == 200
+    assert web._format_jobs[job_id]["changes"] == before, \
+        "the second submission changed something"
+    assert "removal skipped" not in r.text
+
+
+def test_removing_from_an_unknown_job_is_a_clean_404(monkeypatch):
+    client = _client(monkeypatch)
+    r = client.post("/format/deadbeef/remove", data={"remove_ids": "r0"})
+    assert r.status_code == 404
+
+
+# ---------------------------------------------- the LibreOffice page split
+#
+# The cloud renderer converts a deck to PDF once and then rasterises pages. It
+# used to launch one pdftoppm PER PAGE, each of which re-parses the whole PDF -
+# and _ensure_thumbs asks for every slide of the deck, so a 200-slide deck was
+# 200 process launches over the same document (30/08/2026).
+
+
+def test_consecutive_pages_are_rendered_in_one_pass():
+    from qc.render import _contiguous
+
+    assert _contiguous([0, 1, 2, 3]) == [(0, 3)], "one call, not four"
+    assert _contiguous(list(range(200))) == [(0, 199)]
+
+
+def test_gaps_split_into_runs_and_nothing_is_lost():
+    from qc.render import _contiguous
+
+    assert _contiguous([0, 1, 5, 6, 7, 9]) == [(0, 1), (5, 7), (9, 9)]
+    # Unsorted and duplicated input is what callers actually pass (a window of
+    # slides plus the one being viewed).
+    assert _contiguous([7, 5, 6, 5]) == [(5, 7)]
+    assert _contiguous([]) == []
+
+
+def test_every_wanted_page_comes_back_keyed_by_its_slide_index(tmp_path,
+                                                               monkeypatch):
+    """The multi-page branch matches files by sorted order, because pdftoppm
+    picks its own suffix width. What must hold is that slide 5 is keyed 5."""
+    import qc.render as R
+
+    def _fake_run(args, **kwargs):
+        first = int(args[args.index("-f") + 1])
+        last = int(args[args.index("-l") + 1])
+        stem = Path(args[-1])
+        if "-singlefile" in args:
+            stem.with_suffix(".png").write_bytes(b"page%d" % first)
+        else:
+            for n in range(first, last + 1):
+                (stem.parent / f"{stem.name}-{n:03d}.png").write_bytes(
+                    b"page%d" % n)
+        return None
+
+    monkeypatch.setattr(R.subprocess, "run", _fake_run)
+    out = R._pages_to_png("pdftoppm", tmp_path / "d.pdf", "deck",
+                          [3, 4, 5, 9], tmp_path, 1360)
+
+    assert sorted(out) == ["deck:3", "deck:4", "deck:5", "deck:9"]
+    assert out["deck:3"] == b"page4"     # 1-based page 4 is slide index 3
+    assert out["deck:9"] == b"page10"
+
+
+def test_a_shape_hanging_off_the_slide_is_highlighted_where_it_shows():
+    """Origin and size were clamped independently - max(0, left/w) alongside
+    min(1, width/w) - which is correct only while the shape is on the canvas. A
+    shape hanging off the left edge had its origin pulled to 0 and kept its full
+    width, so the highlight covered the wrong part of the slide: on exactly the
+    shapes an audit flags for sitting outside the frame (30/08/2026)."""
+    from qc.render import _fraction_box
+
+    W = H = 1000
+
+    # Half off the left edge: the visible half starts at 0 and is half as wide.
+    box = _fraction_box(-200, 100, 400, 200, W, H)
+    assert box["x"] == 0.0
+    assert box["w"] == pytest.approx(0.2), (
+        "the clamped origin kept the full 0.4 width and shifted the rectangle "
+        "over the wrong shapes")
+
+    # Fully on the slide: unchanged.
+    assert _fraction_box(100, 200, 300, 400, W, H) == pytest.approx(
+        {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4})
+
+    # Running off the right edge: clipped at the edge, never past 1.0.
+    box = _fraction_box(800, 0, 400, 100, W, H)
+    assert box["x"] == pytest.approx(0.8)
+    assert box["x"] + box["w"] <= 1.0
+
+    # Entirely off the canvas: no rectangle rather than a wrong one.
+    assert _fraction_box(-500, 0, 200, 100, W, H)["w"] == 0.0

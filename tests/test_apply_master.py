@@ -223,6 +223,18 @@ def test_each_slide_lands_on_its_planned_layout():
 # ----------------------------------------------------------------- the page
 
 
+def _saved_pid(response) -> str:
+    """The profile id out of the redirect a save lands on.
+
+    Saving used to drop the designer in a profile editor (/profiles/<pid>/edit);
+    it now returns them to Prepare a deck with that profile already picked."""
+    from urllib.parse import parse_qs, urlparse
+
+    parsed = urlparse(response.headers["location"])
+    assert parsed.path == "/prep", parsed.path
+    return parse_qs(parsed.query)["saved"][0]
+
+
 def _client(monkeypatch):
     monkeypatch.setattr(web, "AUTH_REQUIRED", False)
     web.app.state.auth_required = False
@@ -232,7 +244,7 @@ def _client(monkeypatch):
 def test_page_explains_profiles_that_cannot_be_applied(monkeypatch):
     """The seeded profiles carry no master. Hiding them would read as a bug;
     the page lists them with the reason instead."""
-    r = _client(monkeypatch).get("/format")
+    r = _client(monkeypatch).get("/prep")
     assert r.status_code == 200
     assert "carry no master file" in r.text
     assert "prezlab" in r.text.lower()
@@ -240,7 +252,7 @@ def test_page_explains_profiles_that_cannot_be_applied(monkeypatch):
 
 def test_profile_without_a_master_is_refused(monkeypatch):
     client = _client(monkeypatch)
-    r = client.post("/format", data={"profile": "prezlab_en"},
+    r = client.post("/prep", data={"profile": "prezlab_en"},
                     files={"deck": ("d.pptx", _bytes(_deck()), "app/x")})
     assert r.status_code == 400
     assert "carries no master" in r.text
@@ -248,7 +260,7 @@ def test_profile_without_a_master_is_refused(monkeypatch):
 
 def test_unknown_profile_is_refused(monkeypatch):
     client = _client(monkeypatch)
-    r = client.post("/format", data={"profile": "nope"},
+    r = client.post("/prep", data={"profile": "nope"},
                     files={"deck": ("d.pptx", _bytes(_deck()), "app/x")})
     assert r.status_code == 400
     assert "Unknown profile" in r.text
@@ -256,7 +268,7 @@ def test_unknown_profile_is_refused(monkeypatch):
 
 def test_non_pptx_is_refused(monkeypatch):
     client = _client(monkeypatch)
-    r = client.post("/format", data={"profile": "prezlab_en"},
+    r = client.post("/prep", data={"profile": "prezlab_en"},
                     files={"deck": ("notes.txt", b"x", "text/plain")})
     assert r.status_code == 400
     assert "Only .pptx" in r.text
@@ -298,12 +310,9 @@ def test_a_slide_that_cannot_be_rebuilt_leaves_a_second_master_and_says_so():
     out = Presentation(io.BytesIO(result.deck))
     assert len(list(out.slide_masters)) == 2
 
-    from qc.ui_format import render_format_result
+    from qc.ui_format import _masters_note
 
-    html = render_format_result(
-        deck_name="d.pptx", profile_name="p", job_id="j", plans=result.plans,
-        errors=result.errors, applied=result.applied, content_changes=[],
-        masters=result.masters, stragglers=result.stragglers)
+    html = _masters_note(result.masters, result.stragglers, result.plans)
     assert "carries 2 slide masters" in html
     assert "Slide(s) 2" in html
     assert "lists the ORIGINAL master first" in html
@@ -311,12 +320,9 @@ def test_a_slide_that_cannot_be_rebuilt_leaves_a_second_master_and_says_so():
 
 def test_a_clean_run_says_nothing_about_masters():
     """The note is for the case that misleads, not a permanent disclaimer."""
-    from qc.ui_format import render_format_result
+    from qc.ui_format import _masters_note
 
-    html = render_format_result(
-        deck_name="d.pptx", profile_name="p", job_id="j", plans=[], errors={},
-        applied=3, content_changes=[], masters=1, stragglers=[])
-    assert "slide masters" not in html
+    assert _masters_note(1, [], []) == ""
 
 
 # --------------------------------------------- putting removals back
@@ -345,14 +351,25 @@ def _job_with_a_removal(client):
             shape._element.getparent().remove(shape._element)
     assert xml, "the fixture must capture the removed element"
 
+    # A Prep, not a bare dict: every format job is a prepared deck now, and the
+    # page these routes answer on is drawn from the run rather than from the
+    # job's loose keys.
+    from qc.prep import Prep
+
+    changes = [ContentChange(0, "removed unplaced text",
+                             "'EYEBROW' had no slot", severity="alert",
+                             removed_text="EYEBROW", removed_xml=xml,
+                             restore_id="0-9")]
+    blob = _bytes(deck)
+    prep = Prep(filename="d.pptx", source=blob, deck=blob, applied=1,
+                changes=changes)
+
     job_id = "restorejob"
     web._format_jobs[job_id] = {
-        "deck": _bytes(deck), "filename": "d.pptx", "profile": "prezlab_en",
+        "deck": blob, "filename": "d.pptx", "profile": "prezlab_en",
         "plans": [], "errors": {}, "applied": 1, "restored": [],
-        "changes": [ContentChange(0, "removed unplaced text",
-                                  "'EYEBROW' had no slot", severity="alert",
-                                  removed_text="EYEBROW", removed_xml=xml,
-                                  restore_id="0-9")],
+        "changes": changes, "prep": prep, "manifest": None,
+        "removed": [], "undone": [], "undo_notes": {},
     }
     return job_id
 
@@ -424,11 +441,13 @@ def test_saving_a_profile_from_a_master_stores_the_master(monkeypatch):
 
     master_bytes = _bytes(Presentation())
     client.post("/master", files={"master": ("brand.pptx", master_bytes, "app/x")})
-    spec_id = next(iter(web._specs))
+    # The NEWEST spec. web._specs is module state shared by every test in the
+    # session, so the first entry is whatever some earlier test read.
+    spec_id = next(reversed(web._specs))
     r = client.post(f"/spec/{spec_id}/profile", data={"name": "Applied Client"},
                     follow_redirects=False)
     assert r.status_code == 303
-    pid = r.headers["location"].split("/")[2]
+    pid = _saved_pid(r)
     try:
         assert has_master(pid)
         assert load_master(pid) == master_bytes
@@ -446,15 +465,30 @@ def test_end_to_end_through_the_page(monkeypatch):
     client.post("/whoami", json={"name": "Lead"})
     client.post("/master", files={"master": ("brand.pptx",
                                              _bytes(Presentation()), "app/x")})
-    spec_id = next(iter(web._specs))
-    pid = client.post(f"/spec/{spec_id}/profile", data={"name": "E2E"},
-                      follow_redirects=False).headers["location"].split("/")[2]
+    # The NEWEST spec. web._specs is module state shared by every test in the
+    # session, so the first entry is whatever some earlier test read.
+    spec_id = next(reversed(web._specs))
+    pid = _saved_pid(client.post(f"/spec/{spec_id}/profile",
+                                 data={"name": "E2E"}, follow_redirects=False))
     try:
         deck = _deck([1, 1])
-        r = client.post("/format", data={"profile": pid},
+        # PRESS ONE: read the deck against the master. Nothing is rebuilt, and
+        # the page that comes back is the layout decision.
+        r = client.post("/prep", data={"profile": pid},
                         files={"deck": ("rough.pptx", _bytes(deck), "app/x")})
         assert r.status_code == 200
-        assert "Rebuilt <b>2</b> of <b>2</b> slides" in r.text
+        assert "Step 2 of 3" in r.text
+        assert "Rebuilt" not in r.text, "the rebuild ran before it was approved"
+
+        plan_id = next(reversed(web._plans))
+
+        # PRESS TWO: apply. No picks posted, which is the legitimate "use the
+        # suggestions as they stand" answer.
+        r = client.post(f"/prep/{plan_id}/layouts", data={})
+        assert r.status_code == 200
+        assert "Rebuilt 2 of 2 slides on the master" in r.text
+        assert plan_id not in web._plans, (
+            "the plan outlived the rebuild it produced")
 
         job_id = next(reversed(web._format_jobs))
         dl = client.get(f"/format/{job_id}/download")

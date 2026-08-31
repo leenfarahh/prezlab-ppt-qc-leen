@@ -57,6 +57,56 @@ def export_decks_png(decks: dict[str, bytes], slide_indices: list[int],
         raise
 
 
+def _contiguous(indices: list[int]) -> list[tuple[int, int]]:
+    """`indices` as (first, last) runs, sorted and deduped. One pdftoppm call
+    covers a run, so a whole-deck render is one call rather than two hundred."""
+    out: list[tuple[int, int]] = []
+    for idx in sorted(set(indices)):
+        if out and idx == out[-1][1] + 1:
+            out[-1] = (out[-1][0], idx)
+        else:
+            out.append((idx, idx))
+    return out
+
+
+def _pages_to_png(pdftoppm: str, pdf, name: str, slide_indices: list[int],
+                  tmp, width: int) -> dict[str, bytes]:
+    """The wanted pages of `pdf`, rendered to PNG.
+
+    ONE PROCESS PER RUN OF CONSECUTIVE PAGES, not one per page. pdftoppm parses
+    the whole PDF on startup, so rendering a 200-slide deck a page at a time
+    launched 200 processes and re-parsed the document 200 times - and the whole
+    deck is exactly what _ensure_thumbs asks for. A contiguous range is the
+    common case (a window of slides, or all of them), so this is usually a
+    single call.
+
+    Page numbers come back from pdftoppm as a fixed-width suffix it chooses
+    itself, so the files are matched by sorted order within the run rather than
+    by a name guessed here.
+    """
+    out: dict[str, bytes] = {}
+    for first, last in _contiguous(slide_indices):
+        stem = tmp / f"{name}-{first}"
+        args = [pdftoppm, "-png", "-scale-to-x", str(width), "-scale-to-y", "-1",
+                "-f", str(first + 1), "-l", str(last + 1)]
+        if first == last:
+            args.append("-singlefile")
+        subprocess.run(args + [str(pdf), str(stem)],
+                       check=True, capture_output=True, timeout=600)
+        if first == last:
+            png = stem.with_suffix(".png")
+            if png.exists():
+                out[f"{name}:{first}"] = png.read_bytes()
+            continue
+        # Multi-page: one file per page, suffixed -1, -01, -001 ... depending on
+        # the page count. Sorted order IS page order for a fixed-width suffix.
+        pages = sorted(tmp.glob(f"{stem.name}-*.png"))
+        for offset, png in enumerate(pages):
+            if first + offset <= last:
+                out[f"{name}:{first + offset}"] = png.read_bytes()
+    return out
+
+
 def _export_libreoffice(decks: dict[str, bytes], slide_indices: list[int],
                         width: int = RENDER_WIDTH) -> dict[str, bytes]:
     """Render via LibreOffice headless (pptx -> pdf) then poppler (pdf page ->
@@ -84,16 +134,8 @@ def _export_libreoffice(decks: dict[str, bytes], slide_indices: list[int],
                 pdf = tmp / f"{name}.pdf"
                 if not pdf.exists():
                     raise RuntimeError(f"LibreOffice did not produce a PDF for {name}")
-                for idx in slide_indices:
-                    prefix = tmp / f"{name}-{idx}"
-                    subprocess.run(
-                        [pdftoppm, "-png", "-scale-to-x", str(width),
-                         "-scale-to-y", "-1", "-f", str(idx + 1), "-l", str(idx + 1),
-                         "-singlefile", str(pdf), str(prefix)],
-                        check=True, capture_output=True, timeout=120)
-                    png = prefix.with_suffix(".png")
-                    if png.exists():
-                        out[f"{name}:{idx}"] = png.read_bytes()
+                out.update(_pages_to_png(pdftoppm, pdf, name, slide_indices,
+                                         tmp, width))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
     return out
@@ -206,10 +248,18 @@ def _export_com_once(decks: dict[str, bytes], slide_indices: list[int],
 # a hundred slides for one page view. A master carrying more than this is
 # truncated and the page says so; a silent cut reads as "the master has fewer
 # layouts than it does".
+#
+# THE ONLY CAP. qc.layoutmatch used to keep a second, smaller one of its own
+# (that module is gone; the cap it argued with is not),
+# so the sheet shown to the vision pass was 16 of the 24 rendered here - and a
+# slide whose real home was layout 20 came back "no layout in this master fits",
+# which qc.layoutgap reports as a MISSING LAYOUT and the page states as "checked
+# against every layout in the master". Two numbers for one idea turned a
+# truncation into a finding about the client's master (30/08/2026).
 MAX_LAYOUTS = 24
 
 
-def layout_catalogue(deck_bytes: bytes) -> tuple[bytes, list[dict]]:
+def layout_catalogue(deck_bytes: bytes) -> tuple[bytes, list[dict], int]:
     """A deck holding ONE blank slide per layout, and what each one is.
 
     This is how a layout gets rendered at all: PowerPoint exports SLIDES, not
@@ -306,6 +356,26 @@ def slide_previews(before: bytes, after: bytes, indices: list[int]) -> dict:
     return {"indices": list(indices), "images": images, "error": None}
 
 
+def _fraction_box(left, top, width, height, slide_w, slide_h) -> dict:
+    """A shape's box as fractions of the slide, CLIPPED to the slide.
+
+    The two callers below clamped the origin and the size independently -
+    max(0, left/w) with min(1, width/w) - which is right only while the shape is
+    on the canvas. A shape hanging off the left edge had its origin pulled to 0
+    and kept its full width, so the highlight came out shifted: it covered the
+    wrong part of the slide, on exactly the shapes an audit flags for being
+    outside the frame.
+
+    Clipping the far edge and deriving the size from the clipped corners keeps
+    the rectangle over the part of the shape a designer can actually see.
+    """
+    x0 = max(0.0, min(1.0, left / slide_w))
+    y0 = max(0.0, min(1.0, top / slide_h))
+    x1 = max(0.0, min(1.0, (left + width) / slide_w))
+    y1 = max(0.0, min(1.0, (top + height) / slide_h))
+    return {"x": x0, "y": y0, "w": max(0.0, x1 - x0), "h": max(0.0, y1 - y0)}
+
+
 def shape_rects(deck_bytes: bytes, wanted: dict[int, list[dict]]) -> dict[int, list[dict]]:
     """Normalized highlight rectangles for changed shapes, per slide.
 
@@ -333,10 +403,7 @@ def shape_rects(deck_bytes: bytes, wanted: dict[int, list[dict]]) -> dict[int, l
             if None in (left, top, width, height):
                 continue
             rects.append({
-                "x": max(0.0, left / slide_w),
-                "y": max(0.0, top / slide_h),
-                "w": min(1.0, width / slide_w),
-                "h": min(1.0, height / slide_h),
+                **_fraction_box(left, top, width, height, slide_w, slide_h),
                 "label": rec["issue_type"],
             })
         out[slide_idx] = rects
@@ -344,28 +411,49 @@ def shape_rects(deck_bytes: bytes, wanted: dict[int, list[dict]]) -> dict[int, l
 
 
 def build_diff(before: bytes, after: bytes, applied_records: list[dict]) -> dict:
-    """Render + overlay data for every slide that received a fix.
+    """Render + overlay data for EVERY slide in the deck, changed or not.
+
+    It used to build the list from the applied records alone, so a slide
+    nothing was fixed on simply was not there. A designer counting slides down
+    the review found 1, 2, 3, 5 and had no way to tell "slide 4 was fine" from
+    "slide 4 was skipped" - and those are opposite facts about a deck about to
+    go to a client (design lead, 31/08/2026).
+
+    So every slide is shown and the untouched ones carry `changes: 0`, which is
+    the page's cue to say so out loud. The cost is real and worth naming: this
+    exports both decks at every slide rather than at the handful that changed,
+    so a long deck takes proportionally longer on the first visit. The result
+    is cached on the job, so it is paid once.
 
     Returns {"slides": [{"index", "changes", "labels", "before_rects",
     "after_rects"}], "images": {"before:i": png, ...}}."""
     wanted: dict[int, list[dict]] = {}
     for rec in applied_records:
         wanted.setdefault(rec["slide_index"], []).append(rec)
-    indices = sorted(wanted)
+
+    try:
+        total = len(Presentation(io.BytesIO(after)).slides)
+    except Exception:
+        # A deck that cannot be reopened is not a reason to lose the review of
+        # the slides that were fixed; fall back to what the records name.
+        total = (max(wanted) + 1) if wanted else 0
+    indices = list(range(total)) or sorted(wanted)
     if not indices:
         return {"slides": [], "images": {}}
 
     images = export_decks_png({"before": before, "after": after}, indices)
+    # Rects are still only asked for where something changed: an untouched
+    # slide has nothing to outline, and highlighting it would be a lie.
     before_rects = shape_rects(before, wanted)
     after_rects = shape_rects(after, wanted)
 
     slides = []
     for idx in indices:
-        labels = sorted({r["issue_type"] for r in wanted[idx]})
+        records = wanted.get(idx) or []
         slides.append({
             "index": idx,
-            "changes": len(wanted[idx]),
-            "labels": labels,
+            "changes": len(records),
+            "labels": sorted({r["issue_type"] for r in records}),
             "before_rects": before_rects.get(idx, []),
             "after_rects": after_rects.get(idx, []),
         })
@@ -440,8 +528,7 @@ def audit_rects(deck_bytes: bytes, records: list[dict]) -> dict[int, list[dict]]
                 continue
             rects.append({
                 "pin": slot["pin"],
-                "x": max(0.0, left / slide_w), "y": max(0.0, top / slide_h),
-                "w": min(1.0, width / slide_w), "h": min(1.0, height / slide_h),
+                **_fraction_box(left, top, width, height, slide_w, slide_h),
                 "label": " · ".join(slot["labels"]),
                 "severity": slot["severity"],
                 "arabic": slot["arabic"],

@@ -164,11 +164,15 @@ def render_csv(manifest: dict) -> str:
 
 
 def render_diff_pdf(deck_name: str, diff: dict) -> bytes:
-    """Landscape PDF of the before/after review: one changed slide per page,
-    PowerPoint-rendered images side by side, with the same highlight
+    """Landscape PDF of the before/after review: one slide per page, changed
+    or not, PowerPoint-rendered images side by side, with the same highlight
     conventions as the web view (dashed orange = element before the fix,
     solid teal = the same element after). Consumes the cached diff dict
-    from qc.render.build_diff, so no slide rendering happens here."""
+    from qc.render.build_diff, so no slide rendering happens here.
+
+    The untouched slides are in it for the same reason they are on the page: a
+    review a client signs off has to cover the deck, and a slide missing from
+    it reads as a slide nobody looked at."""
     from reportlab.lib.colors import Color, HexColor
     from reportlab.lib.pagesizes import landscape
     from reportlab.lib.utils import ImageReader
@@ -214,9 +218,10 @@ def render_diff_pdf(deck_name: str, diff: dict) -> bytes:
             c.drawString(margin, y - 14, "Before / after review")
             c.setFont(fonts["base"], 10)
             c.setFillColor(slate)
+            n_changed = sum(1 for s in slides if s["changes"])
             c.drawString(margin, y - 30,
-                         f"{deck_name}  |  {len(slides)} slide"
-                         f"{'s' if len(slides) != 1 else ''} changed  |  "
+                         f"{deck_name}  |  every slide, all {len(slides)} of "
+                         f"them, {n_changed} changed  |  "
                          "rendered by PowerPoint, original file untouched")
             y -= 52
 
@@ -227,8 +232,10 @@ def render_diff_pdf(deck_name: str, diff: dict) -> bytes:
         c.setFont(fonts["base"], 9)
         c.setFillColor(slate)
         c.drawString(margin + 60, y - 12,
-                     f"{n} change{'s' if n != 1 else ''}  |  "
-                     + "  ".join(sl.get("labels", [])))
+                     (f"{n} change{'s' if n != 1 else ''}  |  "
+                      + "  ".join(sl.get("labels", [])))
+                     if n else
+                     "no changes were applied to this slide - check it anyway")
         y -= 30
 
         before_png = images.get(f"before:{idx}")

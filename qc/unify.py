@@ -61,7 +61,7 @@ def com_available() -> bool:
 
 
 # COM failures restated as something a designer can do. The raw tuple - what
-# the format page used to print, verbatim: "(-2147417856, 'System call
+# the rebuild used to print, verbatim: "(-2147417856, 'System call
 # failed.', None, None)" - names the HRESULT and nothing else, so the person
 # reading it has no next step (design lead, 23/08/2026).
 _COM_ADVICE = {

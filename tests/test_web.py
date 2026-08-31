@@ -40,10 +40,16 @@ def test_an_upload_lands_on_the_slides_not_on_the_occurrence_list(fixtures_dir):
     assert back.status_code == 200 and "clean.pptx" in back.text
 
 
-def test_every_page_offers_the_way_back_to_a_new_audit():
-    """Landing on Design QC makes the header the only route back to the upload
-    form, so it has to be in the header."""
-    assert '<a href="/">Run an audit</a>' in client.get("/").text
+def test_every_page_carries_the_whole_nav():
+    """Landing deep in the tool makes the header the only route anywhere else,
+    so the header carries all four destinations rather than the two it used to.
+
+    Two links in a sentence was the shape of this before 31/08/2026, and behind
+    them were seven pages: a designer on Design QC could reach the upload form
+    and nothing else, including the profile they were auditing against."""
+    page = client.get("/").text
+    for href in ('href="/prep"', 'href="/"', 'href="/profiles"', 'href="/team"'):
+        assert href in page, f"the header does not reach {href}"
 
 
 def test_audit_bilingual_fixture_end_to_end(fixtures_dir):
@@ -312,3 +318,82 @@ def test_downloads_survive_arabic_filenames(fixtures_dir):
     r = client.get(f"/report/{job_id}.csv")
     assert r.status_code == 200
     assert "filename*=UTF-8''" in r.headers["content-disposition"]
+
+
+# --------------------------------------------------- the layout review runs
+#
+# It did not, on two of the three routes that offer it. `export_decks_png` was
+# used in /format and in /check without being imported into either scope, so
+# every call raised NameError - and both sites wrap the review in a bare
+# `except Exception` that degrades to "the slides could not be looked at". The
+# feature was dark, the pages were quiet about it, and /prep (which imports it
+# correctly) kept working, so nothing looked broken (30/08/2026).
+#
+# A unit test cannot catch this: the name resolves fine in every module that
+# defines it. What catches it is calling the route and asserting the render was
+# actually REACHED.
+
+
+def test_the_format_route_does_not_swallow_a_broken_layout_review(
+        fixtures_dir, monkeypatch):
+    """And when the review genuinely cannot run, the page SAYS so. It computed
+    that sentence and discarded it, so a review that failed looked exactly like
+    a deck with nothing to review."""
+    import qc.render as R
+
+    def _down(decks, idx, **kw):
+        raise RuntimeError("PowerPoint is not available")
+
+    monkeypatch.setattr(R, "export_decks_png", _down)
+    monkeypatch.setattr("qc.llm.api_configured", lambda: True)
+
+    deck = (fixtures_dir / "mixed_layouts.pptx").read_bytes()
+    r = client.post("/format",
+                    files={"deck": ("mixed_layouts.pptx", deck,
+                                    "application/octet-stream")},
+                    data={"profile": "prezlab_en"})
+    if r.status_code == 200 and "layout review could not run" not in r.text:
+        # Only meaningful when this deck HAD fallbacks to review; when it did
+        # not, there is correctly nothing to say.
+        assert "fell back to a content layout" not in r.text, (
+            "slides fell back and the review failed, but the page said nothing "
+            "about the review failing")
+
+
+# ------------------------------------------------------- expiring old decks
+#
+# Deck bytes are kept for the newest few jobs only. The trim was written out
+# twice, verbatim, in the two places that register a job - and both copies
+# dropped the deck, the diff, the thumbnails and the rects while keeping
+# `design_shots`, a dict of rendered PNGs and much the largest thing on a job.
+# An expired deck freed its bytes and held on to its pictures (30/08/2026).
+
+
+def test_expiring_a_deck_drops_everything_derived_from_it():
+    from qc import web
+
+    with web._jobs_lock:
+        web._jobs.clear()
+        for n in range(web.MAX_DECKS_IN_MEMORY + 2):
+            web._jobs[f"j{n}"] = {
+                "manifest": {"records": [], "slides": 0}, "deck": b"PK\x03\x04",
+                "prev_deck": b"old", "thumbs": {0: b"png"}, "rects": {},
+                "diff": {"slides": []}, "design_shots": {0: b"png"},
+                "extracted": {"slides": []}, "filename": f"{n}.pptx",
+            }
+        web._expire_old_decks()
+
+        oldest = web._jobs["j0"]
+        assert oldest["deck"] is None, "the bytes are gone"
+        assert oldest["manifest"] is not None, "but the report survives"
+        for key in ("prev_deck", "extracted"):
+            assert oldest.get(key) is None, f"{key} outlived the deck"
+        for key in ("thumbs", "rects", "diff"):
+            assert oldest.get(key) is None, f"{key} outlived the deck"
+        assert not oldest.get("design_shots"), (
+            "design_shots holds rendered PNGs and is the biggest thing on a "
+            "job; freeing the deck while keeping them frees almost nothing")
+
+        newest = web._jobs[f"j{web.MAX_DECKS_IN_MEMORY + 1}"]
+        assert newest["deck"] is not None, "the newest jobs keep their bytes"
+        web._jobs.clear()

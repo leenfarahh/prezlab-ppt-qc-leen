@@ -55,23 +55,39 @@ _WHY_NOTHING = {
 def _tabs(job_id: str, view: str) -> str:
     def tab(key, label):
         on = " primary" if view == key else " ghost"
+        # Both tabs render through PowerPoint the first time they are opened -
+        # one empty slide per layout for Master, one page of slides for Deck -
+        # so both say what they are doing while they do it.
+        busy = ("Rendering every layout, before and after" if key == "master"
+                else "Rendering the slides, before and after")
         return (f'<a class="btn{on}" href="/format/{esc(job_id)}/review'
-                f'?view={key}">{label}</a>')
+                f'?view={key}" data-busy="{busy}">{label}</a>')
     return (f'<div class="actionbar no-print">{tab("master", "Master")}'
             f'{tab("deck", "Deck")}<span class="grow"></span>'
-            f'<a class="btn ghost" href="/format/{esc(job_id)}/download">'
-            f'Download the deck</a>'
-            f'<a class="btn ghost" href="/format">Format another deck</a></div>')
+            f'<a class="btn ghost" href="/format/{esc(job_id)}/download" '
+            f'data-busy="off">Download the deck</a>'
+            # Back to the run, not to a fresh upload. This used to offer
+            # "Format another deck", which threw away the job the designer was
+            # halfway through reviewing.
+            f'<a class="btn ghost" href="/prep/{esc(job_id)}">Back to the '
+            f'prepared deck</a></div>')
 
 
-def _shot(job_id: str, key: str, alt: str, available: bool) -> str:
+def _shot(job_id: str, key: str, alt: str, available: bool,
+          tag: str = "") -> str:
     """One picture, or an honest gap where it would be. `key` is the render's
-    own key (qc.web._url_keys), used verbatim in the URL."""
+    own key (qc.web._url_keys), used verbatim in the URL.
+
+    `tag` is the deck's own digest (qc.web._render_tag). An undo changes the
+    deck, so the AFTER picture has to change with it; without the tag the
+    browser served the cached one and the page showed a row marked undone next
+    to a picture of the slide with the change still in it."""
     if not available:
         return ('<div class="shot"><p class="note" style="padding:1.2rem">'
                 'Not rendered.</p></div>')
     return (f'<div class="shot"><img src="/review-img/{esc(job_id)}/'
-            f'{esc(key)}.png" alt="{esc(alt)}" loading="lazy"></div>')
+            f'{esc(key)}.png{f"?v={esc(tag)}" if tag else ""}" '
+            f'alt="{esc(alt)}" loading="lazy"></div>')
 
 
 def _render_note(error: str | None) -> str:
@@ -97,7 +113,7 @@ def _render_note(error: str | None) -> str:
 
 
 def _layout_cards(job_id: str, side: str, entries: list, used: dict,
-                  images: set) -> str:
+                  images: set, tag: str = "") -> str:
     if not entries:
         return '<p class="note">No layouts to show.</p>'
     cards = []
@@ -111,13 +127,14 @@ def _layout_cards(job_id: str, side: str, entries: list, used: dict,
         name = e["layout"]
         cards.append(
             f'<div class="pane"><div class="tag">{esc(name)}</div>'
-            f'{_shot(job_id, key, f"Layout {name}", key in images)}'
+            f'{_shot(job_id, key, f"Layout {name}", key in images, tag)}'
             f'<div class="difflabels">{badge} {master}</div></div>')
     return f'<div class="lgrid">{"".join(cards)}</div>'
 
 
 def _master_view(*, job_id: str, previews: dict, used_after: dict,
-                 used_before: dict, masters: int, truncated: bool) -> str:
+                 used_before: dict, masters: int, truncated: bool,
+                 tag: str = "") -> str:
     images = set((previews or {}).get("images", {}))
     before = (previews or {}).get("before") or []
     after = (previews or {}).get("after") or []
@@ -142,12 +159,12 @@ This is the template comparison; the Deck tab is the slide-by-slide one.</p>
 <div class="card">
   <div class="tag">Before</div>
   <h2 style="margin-top:0">Layouts the deck arrived with</h2>
-  {_layout_cards(job_id, "before", before, used_before, images)}
+  {_layout_cards(job_id, "before", before, used_before, images, tag)}
 </div>
 <div class="card">
   <div class="tag">After</div>
   <h2 style="margin-top:0">Layouts the deck has now</h2>
-  {_layout_cards(job_id, "after", after, used_after, images)}
+  {_layout_cards(job_id, "after", after, used_after, images, tag)}
 </div>{cut}"""
 
 
@@ -164,7 +181,7 @@ def _change_row(job_id: str, change, undone: set, notes: dict,
 
     if cid and cid in undone:
         control = ('<span class="pill ok">undone</span> '
-                   f'<span class="note">{esc(notes.get(cid, ""))}</span>')
+                   f'<div class="note">{esc(notes.get(cid, ""))}</div>')
     elif getattr(change, "undo", None) and cid:
         # What the button will actually do, on the button. Each step on a slide
         # was computed on the state the steps before it left, so this one cannot
@@ -174,16 +191,21 @@ def _change_row(job_id: str, change, undone: set, notes: dict,
                    f'change{"s" if brings != 1 else ""} on this slide</div>'
                    if brings else "")
         control = (f'<button class="btn ghost" type="submit" name="change_ids" '
-                   f'value="{esc(cid)}">Undo</button>{with_it}')
+                   f'value="{esc(cid)}" data-busy="Putting that change back">'
+                   f'Undo</button>{with_it}')
     else:
         why = _WHY_NOTHING.get(change.action, "this pass recorded it but did "
                                               "not change the slide")
         control = f'<span class="note">{esc(why)}</span>'
 
+    # No nowrap on the cell. The undone note that lands here is a whole sentence
+    # naming what the piece now prints over, and holding it on one line made the
+    # last column claim the table and collapse Detail (table.chg fixes the
+    # widths; this lets the sentence use its own).
     style = ' style="background:rgba(255,124,74,0.07)"' if alert else ""
     return (f"<tr{style}><td>{action}</td>"
             f"<td class='note'>{esc(change.detail)}</td>"
-            f"<td style='white-space:nowrap'>{control}</td></tr>")
+            f"<td>{control}</td></tr>")
 
 
 def _plan_line(plan, error: str | None) -> str:
@@ -220,7 +242,9 @@ def _pager(job_id: str, page: int, page_size: int, reviewable: int) -> str:
         if not on:
             return f'<span class="btn ghost" aria-disabled="true">{label}</span>'
         return (f'<a class="btn ghost" href="/format/{esc(job_id)}/review'
-                f'?view=deck&amp;page={target}">{label}</a>')
+                f'?view=deck&amp;page={target}" '
+                f'data-busy="Rendering page {target + 1} of the slides">'
+                f'{label}</a>')
     return (f'<div class="actionbar no-print">{where}<span class="grow"></span>'
             f'{link(page - 1, "&larr; Previous", page > 0)}'
             f'{link(page + 1, "Next &rarr;", page + 1 < pages)}</div>')
@@ -229,7 +253,7 @@ def _pager(job_id: str, page: int, page_size: int, reviewable: int) -> str:
 def _deck_view(*, job_id: str, previews: dict, changes: list, plans: list,
                errors: dict, undone: set, notes: dict, shown: list,
                total_slides: int, reviewable: int = 0, page: int = 0,
-               page_size: int = 20) -> str:
+               page_size: int = 20, tag: str = "") -> str:
     images = set((previews or {}).get("images", {}))
     by_slide: dict[int, list] = {}
     for c in changes:
@@ -260,12 +284,12 @@ def _deck_view(*, job_id: str, previews: dict, changes: list, plans: list,
  <div class="panes">
   <div class="pane"><div class="tag">Before</div>
    {_shot(job_id, f"slide_before_{idx}", f"Slide {idx + 1} as uploaded",
-          f"slide_before_{idx}" in images)}</div>
+          f"slide_before_{idx}" in images, tag)}</div>
   <div class="pane"><div class="tag">After</div>
    {_shot(job_id, f"slide_after_{idx}", f"Slide {idx + 1} rebuilt",
-          f"slide_after_{idx}" in images)}</div>
+          f"slide_after_{idx}" in images, tag)}</div>
  </div>
- <table class="w3">
+ <table class="w3 chg">
   <thead><tr><th>Change</th><th>Detail</th><th>Put it back</th></tr></thead>
   <tbody>{rows}</tbody>
  </table>
@@ -313,12 +337,13 @@ def render_review(*, deck_name: str, profile_name: str, job_id: str,
                   used_after: dict | None = None,
                   truncated: bool = False,
                   render_error: str | None = None,
-                  undo_error: str | None = None) -> str:
+                  undo_error: str | None = None,
+                  img_tag: str = "", job_tabs: str = "") -> str:
     view = "deck" if view == "deck" else "master"
     head = f"""
 <span class="kicker">Review &middot; {esc(profile_name)}</span>
 <h1 class="file">{esc(Path(deck_name).name)}</h1>
-{_tabs(job_id, view)}{_render_note(render_error)}"""
+{job_tabs}{_tabs(job_id, view)}{_render_note(render_error)}"""
     if undo_error:
         head += f'<div class="banner warn">The undo failed: {esc(undo_error)}</div>'
 
@@ -326,7 +351,8 @@ def render_review(*, deck_name: str, profile_name: str, job_id: str,
         body = _master_view(job_id=job_id, previews=previews or {},
                             used_after=used_after or {},
                             used_before=used_before or {},
-                            masters=masters, truncated=truncated)
+                            masters=masters, truncated=truncated,
+                            tag=img_tag)
     else:
         body = _deck_view(job_id=job_id, previews=previews or {},
                           changes=changes or [], plans=plans or [],
@@ -334,7 +360,7 @@ def render_review(*, deck_name: str, profile_name: str, job_id: str,
                           notes=notes or {}, shown=shown or [],
                           total_slides=total_slides,
                           reviewable=reviewable or len(shown or []),
-                          page=page, page_size=page_size)
+                          page=page, page_size=page_size, tag=img_tag)
     style = """
 <style>
 .lgrid{display:grid;gap:0.9rem;grid-template-columns:repeat(auto-fill,minmax(230px,1fr))}

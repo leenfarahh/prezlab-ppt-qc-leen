@@ -36,7 +36,6 @@ ISSUE_LABELS = {
     "margin_alignment.uneven_spacing": "Uneven spacing",
     "margin_alignment.outside_safe_zone": "Outside safe zone",
     "margin_alignment.heading_past_margin": "Heading past the margin (ask the client)",
-    "margin_alignment.body_band_intrusion": "Content in the reserved header band",
     "margin_alignment.text_overlap": "Text overlapping text",
     "margin_alignment.squeezed_text": "Squeezed text box",
     "margin_alignment.text_anchor_mismatch": "Text anchored differently in an aligned row",
@@ -55,6 +54,10 @@ ISSUE_LABELS = {
     "header_footer.text_mismatch": "Footer text wrong",
     "header_footer.missing": "Header/footer missing",
     "preflight.unmodifiable_content": "Preserved as-is",
+    # This key was listed twice, with two different labels; the one above lost
+    # silently and only this one ever reached a designer. Kept as the survivor
+    # so nothing on the page changes, and the dead one is gone rather than
+    # sitting there reading like the label in use (30/08/2026).
     "margin_alignment.body_band_intrusion": "Body in the header's clear strip",
     "margin_alignment.body_below_band": "Body starts below its guide",
     "margin_alignment.overlap_check_capped": "Slide too crowded to check fully",
@@ -101,6 +104,27 @@ a:hover { text-decoration-color: var(--teal); }
   color: var(--teal); }
 .kicker { color: var(--slate); font-size: 11px; font-weight: 600;
   letter-spacing: 0.16em; text-transform: uppercase; }
+/* One nav, four destinations, on every page. The tool had two links in a
+   sentence and seven pages behind them, which is how a designer ends up on the
+   design cards with no way back to the profile they are auditing against. */
+.nav { display: flex; gap: 0.2rem; flex-wrap: wrap; }
+.nav a { font-size: 0.86rem; font-weight: 700; text-decoration: none;
+  color: var(--slate-text); padding: 0.3rem 0.7rem; border-radius: 999px; }
+.nav a:hover { background: var(--hover); color: var(--teal); }
+.nav a[aria-current="page"] { background: var(--teal); color: var(--offwhite); }
+
+/* The tab strip on every view of one prepared deck. Sits under the title and
+   above the page's own content, so a designer always knows which of the six
+   they are on and can reach the other five. */
+.jobtabs { display: flex; gap: 0.15rem; flex-wrap: wrap; margin: 0 0 1.2rem;
+  border-bottom: 1px solid var(--line); padding-bottom: 0.1rem; }
+.jobtabs a { font-size: 0.9rem; font-weight: 700; text-decoration: none;
+  color: var(--slate-text); padding: 0.5rem 0.9rem; border-radius: 8px 8px 0 0;
+  border: 1px solid transparent; border-bottom: 0; margin-bottom: -1px; }
+.jobtabs a:hover { background: var(--hover); color: var(--teal); }
+.jobtabs a[aria-current="page"] { background: #fff; color: var(--teal);
+  border-color: var(--line); }
+.jobtabs a b { font-variant-numeric: tabular-nums; }
 h1 { font-family: 'PP Editorial New', Georgia, 'Times New Roman', serif;
   font-weight: 400; font-size: 2.3rem; letter-spacing: -0.01em;
   margin: 0 0 0.35rem; text-wrap: balance; }
@@ -242,6 +266,11 @@ td.msg { color: #1d3f44; }
 .pill.warning { background: var(--orange); color: var(--teal); }
 .pill.info { background: var(--slate); color: var(--offwhite); }
 .pill.ar { background: var(--lavender); color: var(--teal); margin-left: 0.35rem; }
+/* A finding the visual model noticed. Marked rather than merely sorted
+   first, so it stays identifiable once a filter or a search has
+   rearranged the list. */
+.pill.vision { background: var(--teal-light); color: var(--teal);
+  margin-left: 0.35rem; }
 .pill.changed { background: var(--teal-light); color: var(--teal); }
 
 .clean { text-align: center; padding: 3.4rem 1rem; }
@@ -252,10 +281,30 @@ td.msg { color: #1d3f44; }
   margin: 0 0 0.3rem; }
 .clean p { color: var(--slate); }
 
+/* The per-slide change table on the review page. Columns are FIXED, because
+   the last cell's content changes when a change is undone: a short "Undo"
+   button becomes a sentence saying where the piece went back. With
+   content-driven widths that sentence claimed the table and squeezed Detail to
+   a few characters a column, so the page a designer was reading re-laid itself
+   out underneath them every time they pressed a button (design lead,
+   26/08/2026). Fixed widths mean an undo changes one cell and nothing else. */
+table.chg { table-layout: fixed; }
+table.chg th:first-child, table.chg td:first-child { width: 9.5rem; }
+table.chg th:last-child, table.chg td:last-child { width: 16rem; }
+table.chg td { overflow-wrap: anywhere; }
+@media (max-width: 60rem) {
+  table.chg th:first-child, table.chg td:first-child { width: 7rem; }
+  table.chg th:last-child, table.chg td:last-child { width: 10rem; }
+}
+
 /* before/after diff */
 .diffslide { background: #fff; border: 1px solid var(--line-soft); border-radius: 12px;
   padding: 1rem 1.2rem 1.2rem; margin: 1rem 0; }
 .diffslide h3 { margin: 0 0 0.2rem; font-size: 1.05rem; }
+/* An untouched slide is present but quiet: it is there to be checked, not to
+   compete with the slides that actually changed. */
+.diffslide.unchanged { background: var(--sand); }
+.diffslide.unchanged .difflabels { font-family: inherit; }
 .difflabels { color: var(--slate-text); font-size: 0.8rem; margin-bottom: 0.8rem;
   font-family: 'Cascadia Mono', Consolas, monospace; }
 .panes { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
@@ -403,7 +452,10 @@ def _shell(title: str, body: str) -> str:
 <body>{demo_strip}<div class="wrap">
 <div class="brandrow"><span class="wordmark">prezlab:</span>
 <span class="kicker">Pre-delivery QC</span>
-<span style="flex:1"></span><span class="note"><a href="/">Run an audit</a> &middot; <a href="/master">Read a master</a> &middot; <a href="/format">Apply a master</a> &middot; <a href="/profiles">Profiles</a> &middot; <a href="/team">Team</a> &middot; <a href="/stats">Stats</a></span><span id="who" class="note"></span></div>
+<span style="flex:1"></span>
+<nav class="nav"><a href="/prep">Prepare a deck</a><a href="/">Audit only</a><a
+ href="/profiles">Profiles</a><a href="/team">Team</a></nav>
+<span id="who" class="note"></span></div>
 {body}
 </div>
 <div class="busy" id="busy" hidden role="status" aria-live="polite">
@@ -416,9 +468,62 @@ function showBusy(msg, sub) {{
   document.getElementById('busysub').textContent = sub || '';
   document.getElementById('busy').hidden = false;
 }}
+function busyShowing() {{ return !document.getElementById('busy').hidden; }}
+function hideBusy() {{ document.getElementById('busy').hidden = true; }}
 // back/forward cache restores must never resurrect the overlay
-window.addEventListener('pageshow', () => {{
-  document.getElementById('busy').hidden = true;
+window.addEventListener('pageshow', () => {{ hideBusy(); }});
+
+// Every POST on every page gets the overlay, without each page having to
+// remember to ask for one. Undo was the case that made this the default rather
+// than a per-form opt-in: it re-exports the slides it is about to redraw, so it
+// is one of the SLOWEST buttons in the tool and it was one of the few with no
+// feedback at all - press it, watch nothing happen, press it again (design
+// lead, 26/08/2026). A page with a better sentence than the generic one still
+// sets its own, either by calling showBusy in onsubmit or with data-busy.
+//
+// The submitter is NOT disabled. Half the buttons here carry the payload in
+// their own name and value (an Undo button is name=change_ids value=<id>), and
+// a button disabled before the browser serialises the form takes its value out
+// of the request. The overlay covers the viewport, which is what actually stops
+// a second click.
+const BUSY_SUB = 'Slides are re-rendered through PowerPoint, so this can take '
+  + 'a minute on a long deck. Leave this page open.';
+document.addEventListener('submit', e => {{
+  if (e.defaultPrevented) return;
+  const form = e.target;
+  if (!(form instanceof HTMLFormElement)) return;
+  if (form.dataset.busy === 'off') return;
+  if (busyShowing()) return;   // an onsubmit handler already said something better
+  const btn = e.submitter;
+  showBusy((btn && btn.dataset.busy) || form.dataset.busy || 'Working on it',
+           (btn && btn.dataset.busysub) || form.dataset.busysub || BUSY_SUB);
+}});
+
+// Links get it too, but only the ones that turn out to be slow. The overlay is
+// armed on a timer the navigation itself cancels by tearing this document down,
+// so a page that arrives quickly never flashes it and a page that has to render
+// twenty slides does. Marking the slow links by hand was the alternative, and
+// the ones that get missed are exactly the ones nobody thought were slow.
+document.addEventListener('click', e => {{
+  if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey
+      || e.shiftKey || e.altKey) return;
+  const a = e.target.closest && e.target.closest('a[href]');
+  if (!a || a.dataset.busy === 'off' || a.hasAttribute('download')) return;
+  if (a.target && a.target !== '_self') return;
+  const href = a.getAttribute('href') || '';
+  // In-page anchors, JS hooks and mailto go nowhere: no navigation, no overlay.
+  if (!href || href.startsWith('#') || href.startsWith('mailto:')) return;
+  let url;
+  try {{ url = new URL(href, location.href); }} catch (_) {{ return; }}
+  if (url.origin !== location.origin) return;
+  // A download leaves this page standing, so an overlay put up for one would
+  // never come down.
+  if (/\\/(download|export)/.test(url.pathname)) return;
+  if (url.pathname === location.pathname && url.search === location.search) return;
+  if (busyShowing()) return;
+  const label = a.dataset.busy || 'Loading';
+  const timer = setTimeout(() => showBusy(label, BUSY_SUB), 350);
+  window.addEventListener('pagehide', () => clearTimeout(timer), {{once: true}});
 }});
 // signed-in state in the header; signing in lives on its own page
 fetch('/me').then(r => r.json()).then(d => {{
@@ -459,6 +564,11 @@ def render_index(profiles: list[dict], modules: tuple, message: str = "") -> str
 master it was built from, or the deck's own conventions. You get a slide-by-slide
 read on what matches and what needs a designer's eye. The deck is read, never
 changed.</p>
+<p class="note">Putting a master on this deck as well? Do both at once on
+<a href="/prep"><b>Prepare a deck</b></a>. The order matters: an audit of the
+raw file reports margins the master is about to reset and fonts it is about to
+replace, so auditing first means working through a list about a file you are
+going to overwrite.</p>
 {banner}
 <form action="/audit" method="post" enctype="multipart/form-data" id="f">
   <div class="drop" id="drop" tabindex="0" role="button"
@@ -478,7 +588,7 @@ changed.</p>
     <strong>Drop the master .pptx here</strong> or click to browse
     <div class="hint">Read for its theme, layouts, and grid. The master is not
     changed and not kept; only the rules it declares carry into this audit.
-    <a href="/master">See what gets read</a>.</div>
+    <a href="/prep">See what gets read</a>.</div>
     <div class="file" id="mname" aria-live="polite"></div>
     <input type="file" name="master" id="master" accept=".pptx" hidden>
   </div>
@@ -550,6 +660,48 @@ syncRuleSource();
 _SEV_RANK = {"error": 0, "warning": 1, "info": 2}
 
 
+# Every view of one prepared deck, in the order a designer reads them. Six pages
+# with no way between them was the single biggest complaint about the tool: the
+# design cards did not link to the findings, the findings did not link to the
+# before/after, and the only route from any of them back to the others was the
+# browser's back button (design lead, 31/08/2026).
+#
+# They stayed separate URLs rather than becoming one route with a query
+# parameter. Each renders a genuinely different page - one is a table of two
+# thousand rows, one renders every slide twice - and merging them would mean
+# building all six to show one. The tab strip is what makes them read as one
+# destination; the addresses underneath it are an implementation detail.
+JOB_TABS = (
+    ("overview", "Overview", "/prep/{id}"),
+    ("design", "Design QC", "/design/{id}"),
+    ("findings", "Findings", "/audit/{id}"),
+    ("review", "Before / after", "/format/{id}/review"),
+    ("checklist", "Checklist", "/checklist/{id}"),
+    ("changes", "Changes", "/diff/{id}"),
+)
+
+
+def job_tabs(job_id: str, active: str, available=None, counts=None) -> str:
+    """The tab strip, for a page that belongs to one job.
+
+    `available` names the tabs this job actually has - a run whose audit failed
+    has no findings and no design cards, and a tab that 404s is worse than an
+    absent one. None means all of them. `counts` puts a number on a tab when
+    there is one worth seeing before clicking.
+    """
+    counts = counts or {}
+    out = []
+    for key, label, href in JOB_TABS:
+        if available is not None and key not in available:
+            continue
+        n = counts.get(key)
+        badge = f' <b>{esc(str(n))}</b>' if n else ""
+        current = ' aria-current="page"' if key == active else ""
+        out.append(f'<a href="{esc(href.format(id=job_id))}"{current}>'
+                   f'{esc(label)}{badge}</a>')
+    return f'<nav class="jobtabs no-print">{"".join(out)}</nav>'
+
+
 def render_report(manifest: dict, job_id: str, can_fix: bool = False,
                   banner: str = "", has_cleaned: bool = False,
                   diff_href: str | None = None,
@@ -558,14 +710,26 @@ def render_report(manifest: dict, job_id: str, can_fix: bool = False,
                   comments: dict | None = None,
                   archived: bool = False,
                   assist: bool = False,
-                  design: int | None = None) -> str:
+                  design: int | None = None,
+                  tabs: str = "") -> str:
     from .fixer import is_fixable, tick_reason
 
     s = manifest["summary"]
     sev = s.get("by_severity", {})
     deck = esc(Path(manifest["deck"]).name)
-    records = sorted(manifest["records"],
-                     key=lambda r: (r["slide_index"], _SEV_RANK.get(r["severity"], 3)))
+    # VISION LEADS (design lead, 31/08/2026). Within a slide, what the model
+    # said a designer would change sorts above what the rules measured. The two
+    # are different kinds of claim - "this looks wrong" against "this run is
+    # Arial and the profile says Georgia" - and interleaved by severity alone
+    # the interesting four rows sat under two hundred boring ones. Severity
+    # still orders within each half; the record's own `source` decides which
+    # half it is in (qc.records.FindingRecord.source).
+    records = sorted(
+        manifest["records"],
+        key=lambda r: (r["slide_index"],
+                       0 if r.get("source") == "vision" else 1,
+                       _SEV_RANK.get(r["severity"], 3)))
+    n_vision = sum(1 for r in records if r.get("source") == "vision")
     any_fixable = can_fix and any(is_fixable(r) for r in records)
     triage = triage or {}
     promoted = promoted or set()
@@ -689,12 +853,16 @@ def render_report(manifest: dict, job_id: str, can_fix: bool = False,
                 else:
                     pin_cell = ""
                 data_pin = f' data-pin="{pin}"' if pin is not None else ""
+                seen_by = "1" if r.get("source") == "vision" else "0"
+                eye = ('<span class="pill vision" title="The visual model '
+                       'noticed this; the numbers behind it were measured '
+                       'here">seen</span>' if seen_by == "1" else "")
                 rows.append(
                     f"""<tr{tri_cls} data-sev="{esc(r['severity'])}" data-ar="{'1' if r['arabic_flag'] else '0'}"
- data-mod="{esc(r['module'])}" data-type="{esc(r['issue_type'])}" data-fix="{fixable_row}" data-record="{esc(r['record_id'])}"{data_pin}>
+ data-mod="{esc(r['module'])}" data-type="{esc(r['issue_type'])}" data-fix="{fixable_row}" data-record="{esc(r['record_id'])}" data-seen="{seen_by}"{data_pin}>
 <td class="fix">{fix_cell}</td>
 <td class="pinc">{pin_cell}</td>
-<td class="sev"><span class="pill {esc(r['severity'])}">{esc(r['severity'])}</span>{ar}</td>
+<td class="sev"><span class="pill {esc(r['severity'])}">{esc(r['severity'])}</span>{ar}{eye}</td>
 <td class="code">{esc(r['issue_type'])}</td>
 <td class="msg" dir="auto">{esc(r['message'])}</td>
 <td class="trit">{tri_cell}</td></tr>""")
@@ -784,6 +952,7 @@ def render_report(manifest: dict, job_id: str, can_fix: bool = False,
   {_chip("Warnings", sev.get('warning', 0), "warning")}
   {_chip("Info", sev.get('info', 0), "info")}
   {_chip("Arabic", s.get('arabic_flagged', 0), "ar")}
+  {_chip("Seen by the model", n_vision, "seen")}
   {_chip("Fixable", sum(1 for r in records if can_fix and is_fixable(r)), "fix")}
   <span class="vdiv"></span>
   {mod_chips}
@@ -805,7 +974,8 @@ function refresh() {
   rows.forEach(tr => {
     const okSev = sevFilter === 'all' || tr.dataset.sev === sevFilter ||
                   (sevFilter === 'ar' && tr.dataset.ar === '1') ||
-                  (sevFilter === 'fix' && tr.dataset.fix === '1');
+                  (sevFilter === 'fix' && tr.dataset.fix === '1') ||
+                  (sevFilter === 'seen' && tr.dataset.seen === '1');
     const okMod = !modFilter || tr.dataset.mod === modFilter;
     const okType = !typeFilter || tr.dataset.type === typeFilter;
     const okQ = !q || tr.textContent.toLowerCase().includes(q);
@@ -1059,7 +1229,7 @@ if (askBtn) askBtn.addEventListener('click', async () => {
        <span class="note">${escq(q.rationale)} ${escq(q.impact)}</span></span></label>`).join('') +
       `<div class="assistrow">
         <button type="button" class="btn primary" id="assistapply">Apply accepted answers</button>
-        <span class="note">${data.source.startsWith('fallback') ? 'Offline phrasing' : 'Phrased by Claude'}
+        <span class="note">${data.source.startsWith('fallback') ? 'Offline phrasing' : 'Phrased by the model'}
          · updates profile <b>${escq(data.profile)}</b></span></div>`;
     document.getElementById('assistapply').addEventListener('click', async () => {
       const ids = [...out.querySelectorAll('.assistq input:checked')].map(b => b.value);
@@ -1102,24 +1272,24 @@ refresh();
  <div class="copilotrow">
   <form method="post" action="/copilot/{esc(job_id)}"
     onsubmit="showBusy('Design copilot is reviewing the slides',
-     'Rendering each slide, then asking Claude what a designer would adjust. A full deck takes a minute or two.')">
-   <button class="btn ghost" type="submit">Layout review with Claude vision</button>
+     'Rendering each slide, then asking the visual model what a designer would adjust. A full deck takes a minute or two.')">
+   <button class="btn ghost" type="submit">Layout review with vision</button>
   </form>
-  <span class="note">Sends slide <b>images</b> to the Anthropic API
+  <span class="note">Sends slide <b>images</b> to the Gemini API
    (unlike the assistant above). Use only on decks approved for cloud
    processing. Suggestions arrive tickable, never pre-selected.</span>
  </div>
  <div class="copilotrow">
   <form method="post" action="/components/{esc(job_id)}"
     onsubmit="showBusy('Working out what the components are',
-     'Claude names the things on each slide and which line they belong on; the geometry is measured here. A full deck takes a minute or two.')">
+     'The model names the things on each slide and which line they belong on; the geometry is measured here. A full deck takes a minute or two.')">
    <button class="btn ghost" type="submit">Component review</button>
   </form>
   <span class="note">Answers the two questions geometry cannot: which
    shapes are <b>one thing</b> (a card with its icon and label), and which
    line they were meant to share &mdash; the master's frame, or another
-   component. Claude never supplies a coordinate; every target is measured
-   here. Slide <b>images</b> are sent, as above.</span>
+   component. The model never supplies a coordinate; every target is
+   measured here. Slide <b>images</b> are sent, as above.</span>
  </div>
 </div>"""
     fix_note = ("""<p class="note no-print">Confident fixes (errors and
@@ -1133,6 +1303,7 @@ refresh();
 <p class="sub">Profile <b>{esc(manifest['profile_id'])}</b>
  v{esc(manifest['profile_version'])} &middot; <b>{n_slides}</b>
  slide{'s' if n_slides != 1 else ''}</p>
+{tabs}
 {actionbar}
 {banner_html}
 <div class="kpis">
@@ -1153,16 +1324,23 @@ refresh();
 
 
 def render_diff(deck_name: str, job_id: str, diff: dict | None,
+                tabs: str = "",
                 error: str = "") -> str:
     deck = esc(Path(deck_name).name)
+    # The tab strip replaces the ad-hoc back link when there is one. A
+    # `history.back()` button is a guess about where someone came from, and it
+    # guesses wrong every time this page is reached from a bookmark or a reload.
+    back = ('<a class="btn ghost" href="javascript:history.back()">Back to '
+            'report</a>' if not tabs else "")
     top = f"""
 <span class="kicker">Before / after review</span>
 <h1 class="file">{deck}</h1>
+{tabs}
 <div class="actionbar no-print">
   <span class="grow"></span>
   <a class="btn primary" href="/download/{esc(job_id)}" download>Download cleaned .pptx</a>
   <a class="btn ghost" href="/diff/{esc(job_id)}.pdf">Export review PDF</a>
-  <a class="btn ghost" href="javascript:history.back()">Back to report</a>
+  {back}
   <a class="btn ghost" href="/">New audit</a>
 </div>"""
 
@@ -1182,10 +1360,24 @@ def render_diff(deck_name: str, job_id: str, diff: dict | None,
                 for r in rects)
 
         n = sl["changes"]
+        # A slide nothing was fixed on is still shown, and says so. Leaving it
+        # out made "this slide was fine" and "this slide was skipped" look
+        # identical, which is the one thing a before/after review must not do.
+        if n:
+            count = (f'<span class="grpcounts">{n} '
+                     f'change{"s" if n != 1 else ""}</span>')
+            labels = f'<div class="difflabels">{esc(" · ".join(sl["labels"]))}</div>'
+        else:
+            count = '<span class="pill info">no changes</span>'
+            labels = ('<div class="difflabels">Nothing was applied to this '
+                      'slide. It is here so the review covers the whole deck: '
+                      'check it, do not assume it was looked at and passed on '
+                      'your behalf.</div>')
+
         slides_html.append(f"""
-<div class="diffslide">
- <h3>Slide {idx + 1} <span class="grpcounts">{n} change{'s' if n != 1 else ''}</span></h3>
- <div class="difflabels">{esc(' · '.join(sl['labels']))}</div>
+<div class="diffslide{'' if n else ' unchanged'}">
+ <h3>Slide {idx + 1} {count}</h3>
+ {labels}
  <div class="panes">
   <div class="pane"><div class="tag">Before</div>
    <div class="shot"><img src="/render/{esc(job_id)}/before-{idx}.png"
@@ -1197,8 +1389,11 @@ def render_diff(deck_name: str, job_id: str, diff: dict | None,
 </div>""")
 
     n_slides = len(diff["slides"])
+    n_changed = sum(1 for sl in diff["slides"] if sl["changes"])
     legend = f"""
-<p class="sub">{n_slides} slide{'s' if n_slides != 1 else ''} changed. Rendered by
+<p class="sub">All {n_slides} slide{'s' if n_slides != 1 else ''}, {n_changed} changed.
+ The untouched ones are here so the review covers the deck: a slide missing from
+ it reads as a slide nobody looked at. Rendered by
  PowerPoint on this machine; images stay in memory and are never written to disk.</p>
 <div class="legend">
  <span><span class="swatch" style="border:2px dashed var(--orange);
@@ -1207,38 +1402,6 @@ def render_diff(deck_name: str, job_id: str, diff: dict | None,
   background:rgba(14,124,102,0.10)"></span>same element, after the fix</span>
 </div>"""
     return _shell(f"Review: {deck_name}", top + legend + "".join(slides_html))
-
-
-def render_stats(rows: list[dict]) -> str:
-    if not rows:
-        body = """
-<span class="kicker">Detection quality</span>
-<h1>Triage stats</h1>
-<p class="sub">No triage data yet. Open an audit report and use the
- &#10003; / &#10005; buttons on findings; every judgment lands here and
- tunes which fixes graduate to one-click.</p>
-<p><a class="btn ghost" href="/">Back to audits</a></p>"""
-        return _shell("Triage stats", body)
-
-    trs = []
-    for r in rows:
-        pct = round(r["fp_rate"] * 100)
-        bar = f'<span class="fpbar" style="width:{max(2, pct)}px"></span>' if pct else ""
-        trs.append(
-            f"""<tr><td class="code">{esc(r['issue_type'])}</td>
-<td>{esc(MODULE_LABELS.get(r['module'], r['module']))}</td>
-<td>{r['reviewed']}</td><td>{r['confirmed']}</td>
-<td>{r['false_alarms']}</td><td>{bar}{pct}%</td></tr>""")
-    body = f"""
-<span class="kicker">Detection quality</span>
-<h1>Triage stats</h1>
-<p class="sub">Latest designer judgment per finding, aggregated per check.
- High false-alarm rates point at rules to tune; low ones qualify fixes for
- one-click. <a href="/">Back to audits</a></p>
-<table class="stats"><thead><tr><th>Check</th><th>Module</th><th>Reviewed</th>
-<th>Agreed</th><th>False alarms</th><th>False-alarm rate</th></tr></thead>
-<tbody>{''.join(trs)}</tbody></table>"""
-    return _shell("Triage stats", body)
 
 
 def render_signin(users: list[dict], message: str = "") -> str:
@@ -1272,32 +1435,3 @@ def render_signin(users: list[dict], message: str = "") -> str:
  </div>
 </form>"""
     return _shell("Sign in", body)
-
-
-def render_history(rows: list[dict]) -> str:
-    trs = []
-    for r in rows:
-        when = r["created_at"].replace("T", " ")[:16]
-        kind = ('<span class="pill changed">fix pass</span>' if r["kind"] == "fix"
-                else '<span class="pill info">audit</span>')
-        trs.append(f"""<tr>
-<td>{esc(when)}</td><td class="code">{esc(r['deck'])}</td>
-<td>{esc(r['profile_id'])} v{esc(r['profile_version'])}</td>
-<td>{esc(r['user_name'])}</td><td>{r['slides']}</td>
-<td><span class="pill error">{r['errors']}</span>
- <span class="pill warning">{r['warnings']}</span>
- <span class="pill ar">{r['arabic']}</span></td>
-<td>{kind}</td>
-<td><a href="/history/{r['id']}">Open</a></td></tr>""")
-    table = ("""<table class="stats"><thead><tr><th>When (UTC)</th><th>Deck</th>
-<th>Profile</th><th>By</th><th>Slides</th><th>Findings</th><th>Type</th><th></th></tr></thead>
-<tbody>""" + "".join(trs) + "</tbody></table>") if trs else (
-        '<p class="note">No audits recorded yet. Run one and it lands here.</p>')
-    body = f"""
-<span class="kicker">Audit history</span>
-<h1>History.</h1>
-<p class="sub">Every audit and fix pass, kept with its full findings record.
- Reports stay readable here even after the working copy leaves memory.
- Decks themselves are never stored. <a href="/">Back to audits</a></p>
-{table}"""
-    return _shell("Audit history", body)

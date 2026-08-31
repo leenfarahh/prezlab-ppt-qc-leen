@@ -1,5 +1,5 @@
 """Design copilot: the code-side precision gate over vision observations,
-and the route wiring. The Claude API is never called in tests."""
+and the route wiring. The model API is never called in tests."""
 
 import io
 
@@ -112,7 +112,7 @@ def test_copilot_route_merges_records(fixtures_dir, monkeypatch):
                    arabic_flag=False, profile_rule_id=None,
                    message="Design copilot: canned.", locator=None,
                    created_at="")]
-    monkeypatch.setattr("qc.assist.api_configured", lambda: True)
+    monkeypatch.setattr("qc.llm.api_configured", lambda: True)
     monkeypatch.setattr("qc.copilot.run_copilot",
                         lambda deck, thumbs, manifest: (canned, 3))
     monkeypatch.setattr(web, "_ensure_thumbs", lambda jid, job:
@@ -132,7 +132,69 @@ def test_copilot_route_without_key(fixtures_dir, monkeypatch):
                                     "application/octet-stream")},
                     data={"profile": "prezlab_en"})
     job_id = job_id_of(r)
-    monkeypatch.setattr("qc.assist.api_configured", lambda: False)
+    monkeypatch.setattr("qc.llm.api_configured", lambda: False)
     r = client.post(f"/copilot/{job_id}")
     assert r.status_code == 200
-    assert "needs an Anthropic API key" in r.text
+    assert "needs an API key for the configured model provider" in r.text
+
+
+def test_the_copilot_asks_through_the_one_door(monkeypatch):
+    """It built its own model client until 30/08/2026, which made it the
+    only judgment pass with no timeout, no retry and no truncation guard - and
+    put a second model id in the config. What this pins is the seam: the pass
+    states a system prompt, a schema and an image, and qc.llm decides who
+    answers."""
+    import qc.copilot as CP
+
+    seen = {}
+
+    def _fake(*, system, prompt, schema, images=None, max_tokens=8192):
+        seen.update(system=system, prompt=prompt, schema=schema,
+                    images=images)
+        return {"observations": [{"action": "align_left",
+                                  "shape_ids": ["1", "2", "3"],
+                                  "rationale": "three cards, one edge"}]}
+
+    monkeypatch.setattr(CP, "ask_json", _fake)
+    out = CP._ask_vision(b"png", [{"id": "1"}])
+
+    assert out == [{"action": "align_left", "shape_ids": ["1", "2", "3"],
+                    "rationale": "three cards, one edge"}]
+    assert seen["schema"] is CP.OBSERVATIONS_SCHEMA, "its own schema, unaltered"
+    assert seen["images"] == [b"png"]
+    assert not hasattr(CP, "anthropic"), "no SDK is imported in this module"
+
+
+def test_an_unreachable_model_skips_the_slide_rather_than_sinking_the_run(
+        monkeypatch):
+    """qc.llm raises LLMUnavailable for "could not ask", which is never the same
+    as "asked and found nothing clean". run_copilot has always skipped a bad
+    slide; what changed is that a timeout and a 429 now ARRIVE as that, instead
+    of hanging the worker or being counted as a clean slide."""
+    import io
+
+    from pptx import Presentation
+    from pptx.util import Emu
+
+    import qc.copilot as CP
+    from qc.llm import LLMUnavailable
+
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Emu(12192000), Emu(6858000)
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    for i in range(3):
+        slide.shapes.add_shape(1, Emu(914400 * (i + 1)), Emu(914400),
+                               Emu(914400), Emu(914400))
+    buf = io.BytesIO()
+    prs.save(buf)
+
+    def _down(**kwargs):
+        raise LLMUnavailable("the model could not be reached")
+
+    monkeypatch.setattr(CP, "ask_json", _down)
+    records, reviewed = CP.run_copilot(buf.getvalue(), {0: b"png"},
+                                       {"records": []})
+
+    assert records == [] and reviewed == 0, (
+        "a slide that could not be asked about is skipped, never counted as "
+        "reviewed and never recorded as clean")

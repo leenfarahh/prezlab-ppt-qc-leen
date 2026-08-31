@@ -1,6 +1,6 @@
 """Assistant triage: aggregation, question generation (offline fallback and
 API-failure fallback), action validation, profile updates, and the web routes.
-All tests are hermetic - the Claude API is never called."""
+All tests are hermetic - the model API is never called."""
 
 import io
 import json
@@ -90,7 +90,7 @@ def test_api_failure_falls_back(monkeypatch):
     def boom(agg):
         raise RuntimeError("no network")
 
-    monkeypatch.setattr(assist, "_ask_claude", boom)
+    monkeypatch.setattr(assist, "_ask_model", boom)
     records = [_rec("color_palette.off_palette_rgb", "B02E27")] * 4
     agg = assist.aggregate(_manifest(records), None, PROFILE_CFG)
     questions, source = assist.generate_questions(agg)

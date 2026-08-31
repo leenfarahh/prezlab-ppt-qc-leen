@@ -120,12 +120,14 @@ def test_triage_unknown_record_404(fixtures_dir, tmp_path, monkeypatch):
     assert r.status_code == 404
 
 
-def test_stats_page_renders_with_empty_log(tmp_path, monkeypatch):
-    _isolate_log(monkeypatch, tmp_path)  # nonexistent file: stats() -> []
-    r = client.get("/stats")
-    assert r.status_code == 200
-    assert "text/html" in r.headers["content-type"]
-    assert "Triage stats" in r.text
+def test_stats_are_empty_without_a_log(tmp_path, monkeypatch):
+    """There is no stats page. The numbers behind it still drive which fixes
+    graduate to one-click, so the empty case still has to be a list."""
+    from qc.triage import stats
+
+    _isolate_log(monkeypatch, tmp_path)  # nonexistent file
+    assert stats() == []
+    assert client.get("/stats").status_code == 404
 
 
 def test_triage_persists_across_requests(fixtures_dir, tmp_path, monkeypatch):

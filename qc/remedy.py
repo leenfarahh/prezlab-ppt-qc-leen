@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from lxml import etree
 from pptx import Presentation
 from pptx.dml.color import RGBColor
+from pptx.util import Emu
 
 from spike.ns import find
 
@@ -371,6 +372,50 @@ def _do_autofit(prs, params, notes, touched, undo):
     return None
 
 
+def _do_set_insets(prs, params, notes, touched, undo):
+    """Set one text box's internal margins.
+
+    The cheapest fix for text that does not fit: padding is invisible on the
+    slide, so returning it to the default gives the words room without moving
+    the shape or touching the type scale. Every edge is written explicitly
+    rather than cleared, because clearing an attribute leaves the box inheriting
+    from a placeholder that may state its own padding, and "the default" then
+    means something different per slide.
+    """
+    idx = params.get("slide_index")
+    if idx is None or not (0 <= idx < len(prs.slides)):
+        return "that slide is no longer in the deck"
+    shape = _by_id(prs.slides[idx]).get(str(params.get("shape_id")))
+    if shape is None or not getattr(shape, "has_text_frame", False):
+        return "that text box is no longer on the slide"
+
+    edges = {}
+    for edge in ("left", "right", "top", "bottom"):
+        value = params.get(edge)
+        if value is None:
+            continue
+        value = int(value)
+        if value < 0:
+            return "a negative margin is not a margin"
+        edges[edge] = value
+    if not edges:
+        return "no margins to set"
+
+    op = _replace_undo(shape, "margins")
+    if op is None:
+        return "that shape could not be copied, so nothing was changed"
+    undo.append(dict(op, slide_index=idx))
+    touched.append((idx, str(shape.shape_id)))
+
+    frame = shape.text_frame
+    for edge, value in edges.items():
+        setattr(frame, f"margin_{edge}", Emu(value))
+    notes.append(f"{shape.name!r} internal margins set to "
+                 + ", ".join(f"{e} {v / 914400:.2f}in"
+                             for e, v in sorted(edges.items())))
+    return None
+
+
 def _do_front(prs, params, notes, touched, undo):
     """Bring one shape to the front of the drawing order."""
     idx = params.get("slide_index")
@@ -452,6 +497,7 @@ def _do_set_theme_color(prs, params, notes, touched, undo):
 _OPS = {"set_color": _do_set_color, "offset": _do_offset,
         "offset_many": _do_offset, "zorder": _do_zorder, "delete": _do_delete,
         "resize": _do_resize, "scale_text": _do_scale_text,
+        "set_insets": _do_set_insets,
         "autofit": _do_autofit, "front": _do_front,
         "set_theme_color": _do_set_theme_color}
 

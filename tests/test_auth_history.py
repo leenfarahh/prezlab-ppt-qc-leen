@@ -69,16 +69,15 @@ def test_audit_recorded_in_history(store, fixtures_dir):
     assert audits[0]["user_name"] == "anonymous"
     assert audits[0]["errors"] > 0
 
-    h = client.get("/history")
-    assert h.status_code == 200 and "mixed_layouts.pptx" in h.text
+    # There is no history page. The record is still kept - it is what
+    # attributes an audit to whoever ran it - and it still carries the whole
+    # manifest, so nothing is lost but a page nobody navigated to.
+    assert client.get("/history").status_code == 404
 
-    view = client.get(f"/history/{audits[0]['id']}")
-    assert view.status_code == 200
-    assert "Archived audit" in view.text
-    assert "font.family_out_of_set" in view.text
-    # archived views are read-only: no apply form, no live exports
-    assert 'id="applyform"' not in view.text
-    assert "/report/" not in view.text
+    kept = store.get_audit(audits[0]["id"])
+    assert kept["deck"] == "mixed_layouts.pptx"
+    assert any(r["issue_type"] == "font.family_out_of_set"
+               for r in kept["manifest"]["records"])
 
 
 def test_history_attributes_signed_in_user(store, fixtures_dir):
@@ -92,8 +91,8 @@ def test_history_attributes_signed_in_user(store, fixtures_dir):
     assert store.list_audits()[0]["user_name"] == "Sanad"
 
 
-def test_unknown_history_id_404(store):
-    assert TestClient(app).get("/history/99999").status_code == 404
+def test_an_unknown_audit_record_is_none_rather_than_a_crash(store):
+    assert store.get_audit(99999) is None
 
 
 def test_lan_mode_enforces_signin(store, monkeypatch, fixtures_dir):

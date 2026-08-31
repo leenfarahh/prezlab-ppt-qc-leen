@@ -56,7 +56,7 @@ from dataclasses import dataclass
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
 
-from spike.ns import find
+from spike.ns import find, findall
 from .util import (full_height_panel, heading_ids, iter_shapes_deep,
                    max_font_pt, recurring_anchors, slide_is_rtl)
 
@@ -143,6 +143,14 @@ class ContentChange:
     # and a wrong guess here silently damages a deck a designer has approved.
     change_id: str | None = None
     undo: list[dict] | None = None
+    # A removal this pass PROPOSES rather than performs, and how to perform it:
+    # {"kind": "shape"|"background", "slide_index", "shape_id"}. Nothing leaves
+    # a slide unless a designer ticks it (design lead, 26/08/2026), so this is
+    # the normal state of every removal the pass finds. `remove_id` is the
+    # handle the page ticks, stamped once the order is final, for the same
+    # reason change_id is.
+    remove_op: dict | None = None
+    remove_id: str | None = None
 
     def __str__(self) -> str:
         mark = "!! " if self.severity == "alert" else ""
@@ -154,6 +162,30 @@ def _box(shape):
     if None in (l, t, w, h) or w <= 0 or h <= 0:
         return None
     return (l, t, l + w, t + h)
+
+
+def _carries_content(shape) -> bool:
+    """Whether this shape would LOSE something by going off the page.
+
+    Words, or a picture/chart/table. An empty text box, a stub or a rule is not
+    nothing - it still travels with its block - but it has nothing to lose, so
+    it does not get to veto a move the rest of the slide needs. The same
+    division _anchor_boxes draws for the block's edges, applied to the clamp
+    that keeps content on the canvas.
+    """
+    try:
+        if _text_of(shape).strip():
+            return True
+    except Exception:
+        pass
+    try:
+        if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+            return True
+        if shape.has_chart or shape.has_table:
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _anchor_boxes(boxes) -> list:
@@ -202,6 +234,34 @@ def _text_of(shape) -> str:
 def _delete(shape):
     el = shape._element
     el.getparent().remove(el)
+
+
+def _removal(slide_index, shape, *, remove: bool, done_action: str,
+             done_detail: str, kept_action: str, kept_detail: str
+             ) -> ContentChange:
+    """One removal, performed or proposed - and proposed is the default.
+
+    The same evidence travels either way: what the piece says, its own XML, and
+    a handle. A performed removal carries the undo that puts it back; a proposed
+    one carries the op that would take it out. So the page reads one shape of
+    record whether the piece is gone or still sitting on the slide, and nothing
+    downstream has to ask which mode the run was in.
+    """
+    xml = _shape_xml(shape)
+    text = _text_of(shape) or None
+    if remove:
+        change = ContentChange(
+            slide_index, done_action, done_detail, severity="alert",
+            removed_text=text, removed_xml=xml,
+            restore_id=f"{slide_index}-{shape.shape_id}",
+            undo=[{"op": "insert", "xml": xml}] if xml else None)
+        _delete(shape)
+        return change
+    return ContentChange(
+        slide_index, kept_action, kept_detail, severity="alert",
+        removed_text=text, removed_xml=xml,
+        remove_op={"kind": "shape", "slide_index": slide_index,
+                   "shape_id": str(shape.shape_id)})
 
 
 def _shape_xml(shape) -> str | None:
@@ -672,7 +732,8 @@ def _ph_label(ph) -> str:
             PP_PLACEHOLDER.BODY: "body"}.get(kind, str(kind).split()[0].lower())
 
 
-def _drop_background_override(slide, slide_index) -> list[ContentChange]:
+def _drop_background_override(slide, slide_index,
+                              remove: bool = False) -> list[ContentChange]:
     """Delete the slide's own p:bg so the master's background shows through.
 
     A slide-level background beats the layout's and the master's, and exported
@@ -708,6 +769,18 @@ def _drop_background_override(slide, slide_index) -> list[ContentChange]:
     from lxml import etree
 
     kept = [etree.tostring(bg, encoding="unicode") for bg in own]
+    if not remove:
+        # Stated as a consequence rather than as a finding, because this is the
+        # one proposal whose cost is paid by NOT taking it: the slide keeps the
+        # wrong ground until somebody says so.
+        return [ContentChange(
+            slide_index, "background override left in place",
+            "the slide carries its own background, which beats the master's, "
+            "so the master's background does not show on this slide. Removing "
+            "the override is what lets it through; nothing here picks a new "
+            "colour",
+            severity="alert",
+            remove_op={"kind": "background", "slide_index": slide_index})]
     for bg in own:
         cSld.remove(bg)
     return [ContentChange(
@@ -717,7 +790,8 @@ def _drop_background_override(slide, slide_index) -> list[ContentChange]:
         undo=[{"op": "bg", "xml": x} for x in kept if x])]
 
 
-def _remove_duplicates(slide_index, free, filled_phs) -> list[ContentChange]:
+def _remove_duplicates(slide_index, free, filled_phs,
+                       remove: bool = False) -> list[ContentChange]:
     """Drop free shapes repeating text that just went into a placeholder.
 
     Runs BEFORE the content block moves. Ordering matters: the block move
@@ -734,13 +808,22 @@ def _remove_duplicates(slide_index, free, filled_phs) -> list[ContentChange]:
                 continue
             if _overlap_share(_box(shape), ph_box) < MIN_COLLISION_SHARE:
                 continue
-            changes.append(ContentChange(
-                slide_index, "removed duplicated text",
-                f"{_text_of(shape)[:40]!r} was a second copy of the text now "
-                f"in the {_ph_label(ph)} placeholder",
-                undo=_insert_undo(shape)))
-            free.remove(shape)
-            _delete(shape)
+            snippet = _text_of(shape)[:40]
+            changes.append(_removal(
+                slide_index, shape, remove=remove,
+                done_action="removed duplicated text",
+                done_detail=f"{snippet!r} was a second copy of the text now in "
+                            f"the {_ph_label(ph)} placeholder",
+                kept_action="duplicated text left in place",
+                kept_detail=f"{snippet!r} is a second copy of the text now in "
+                            f"the {_ph_label(ph)} placeholder, so the line "
+                            f"prints twice - once styled by the master and once "
+                            f"not"))
+            if remove:
+                free.remove(shape)
+            # Left in `free` when it stays, because it IS still on the slide:
+            # the later passes have to reason about the slide as it will ship,
+            # not as it would have been.
     return changes
 
 
@@ -1062,7 +1145,7 @@ def _is_page_furniture(shape, slide_number: int, sh_height: int,
 
 
 def migrate_slide(slide, slide_index: int, prs, anchors=None,
-                  strays=None) -> list[ContentChange]:
+                  strays=None, remove: bool = False) -> list[ContentChange]:
     """`anchors` is qc.util.recurring_anchors and `strays` is stray_texts, both
     read over the WHOLE deck: one tells page furniture from content low on a
     single slide, the other tells a boilerplate note from content sitting high.
@@ -1073,7 +1156,8 @@ def migrate_slide(slide, slide_index: int, prs, anchors=None,
         anchors = recurring_anchors(prs)
     if strays is None:
         strays = stray_texts(prs)
-    changes: list[ContentChange] = _drop_background_override(slide, slide_index)
+    changes: list[ContentChange] = _drop_background_override(
+        slide, slide_index, remove)
     by_type = _placeholders_by_type(slide)
     title_ph = next(iter(sum((by_type.get(t, []) for t in _TITLE_TYPES), [])), None)
     sub_ph = next(iter(sum((by_type.get(t, []) for t in _SUBTITLE_TYPES), [])), None)
@@ -1097,12 +1181,16 @@ def migrate_slide(slide, slide_index: int, prs, anchors=None,
             what = _is_page_furniture(shape, slide_index + 1, prs.slide_height,
                                       master_footer)
             if what:
-                changes.append(ContentChange(
-                    slide_index, "removed duplicate furniture",
-                    f"{what} {_text_of(shape)!r}; the master supplies this",
-                    undo=_insert_undo(shape)))
-                free.remove(shape)
-                _delete(shape)
+                changes.append(_removal(
+                    slide_index, shape, remove=remove,
+                    done_action="removed duplicate furniture",
+                    done_detail=f"{what} {_text_of(shape)!r}; the master "
+                                f"supplies this",
+                    kept_action="duplicate furniture left in place",
+                    kept_detail=f"{what} {_text_of(shape)!r}; the master "
+                                f"supplies this too, so it appears twice"))
+                if remove:
+                    free.remove(shape)
 
     # --- 2. title and subtitle into their placeholders -------------------
     # Title candidates are searched at every depth, not just the top level. A
@@ -1163,7 +1251,8 @@ def migrate_slide(slide, slide_index: int, prs, anchors=None,
     filled_now = [ph for ph in (title_ph, sub_ph)
                   if ph is not None and _text_of(ph)]
     if filled_now:
-        changes.extend(_remove_duplicates(slide_index, free, filled_now))
+        changes.extend(_remove_duplicates(slide_index, free, filled_now,
+                                          remove))
 
     # --- 3. remaining content into the master's content region -----------
     header_phs = [p for p in (title_ph, sub_ph) if p is not None]
@@ -1331,18 +1420,19 @@ def migrate_slide(slide, slide_index: int, prs, anchors=None,
         where = (f"ended at {box[3] / 914400:.2f}in, above the "
                  f"{body_top_target / 914400:.2f}in where the body begins"
                  if body_top_target else "sat above the body")
-        changes.append(ContentChange(
-            slide_index, "removed unplaced text",
-            f"{text!r} {where}, and the master has no placeholder for it. "
-            f"Removed rather than carried into the content: put it back with "
-            f"Undo if it belongs in the deck",
-            severity="alert", removed_text=text,
-            removed_xml=_shape_xml(shape),
-            restore_id=f"{slide_index}-{shape.shape_id}",
-            undo=_insert_undo(shape)))
-        if shape in free:
+        changes.append(_removal(
+            slide_index, shape, remove=remove,
+            done_action="removed unplaced text",
+            done_detail=f"{text!r} {where}, and the master has no placeholder "
+                        f"for it. Removed rather than carried into the content: "
+                        f"put it back with Undo if it belongs in the deck",
+            kept_action="unplaced text left in place",
+            kept_detail=f"{text!r} {where}, and the master has no placeholder "
+                        f"for it. Left where it is, which is above the body: "
+                        f"check it against the master's own header before "
+                        f"removing it"))
+        if remove and shape in free:
             free.remove(shape)
-        _delete(shape)
     if anchors:
         cl = min(b[0] for b in anchors)
         ct = min(b[1] for b in anchors)
@@ -1452,6 +1542,44 @@ def migrate_slide(slide, slide_index: int, prs, anchors=None,
             il, ir, dx = cl, cr, 0
         too_wide = (ir - il) > (region[2] - region[0])
 
+        # SEATING ONE EDGE MUST NOT PUSH REAL CONTENT OFF THE PAGE.
+        #
+        # dx is chosen from the start edge alone: seat the block's leftmost
+        # shape on the left margin (rightmost on the right margin in Arabic).
+        # That is right while the block fits, and actively harmful when it does
+        # not. A block already spanning the full canvas gets shifted by the
+        # whole left margin, so its far edge ends up that far PAST the slide
+        # edge - content that will not print, moved there by this pass, on a
+        # slide where it printed before (30/08/2026, reproduced against
+        # data/templates/test.pptx: a 13.33in block on a 13.33in slide with a
+        # 0.92in inferred margin landed at 0.92-14.25in, and the report graded
+        # it "info").
+        #
+        # WHAT MAY VETO THE SEAT IS NOT WHAT MAY DEFINE THE BLOCK. Clamping on
+        # every travelling shape re-introduces, from the other end, the bug
+        # _anchor_boxes exists to prevent: an empty 1in stamp near the right
+        # edge would stop the whole slide being seated, exactly as a think-cell
+        # stub at (0.002in, 0.002in) once made itself the block's corner. A
+        # shape with nothing in it loses nothing by going off the page, so it
+        # travels and keeps quiet; a shape carrying words or a picture is
+        # content, and content does not get moved off the canvas to tidy an
+        # edge.
+        #
+        # The clamp only ever REDUCES a move that would spill. A block with
+        # slack on its far side is seated exactly as before.
+        # Bleed elements and their riders are excluded because they do not move
+        # sideways at all (see the loop below), so dx cannot push them anywhere:
+        # letting a logo parked on a footer band clamp the move would strand the
+        # title it has nothing to do with.
+        far = [b for s, b in body
+               if b is not None and not _bleeds(b) and _carries_content(s)]
+        if far:
+            content_l, content_r = min(b[0] for b in far), max(b[2] for b in far)
+            if dx > 0:
+                dx = min(dx, max(0, prs.slide_width - content_r))
+            elif dx < 0:
+                dx = max(dx, -max(0, content_l))
+
         # The MOVE is decided from the anchors; the OVERFLOW is measured from
         # everything that actually travels. They are different sets now that a
         # legend low on the page rides along without saying where the block ends,
@@ -1535,13 +1663,32 @@ def migrate_slide(slide, slide_index: int, prs, anchors=None,
             # slide edge is content that will not print at all.
             over_margin = (low + dy) - region[3]
             over_canvas = (low + dy) - prs.slide_height
+            # SIDEWAYS COUNTS TOO. Both of these were measured from `low`, the
+            # block's BOTTOM, so a block hanging off the side of the page had an
+            # empty spill list and was graded "info" - the one severity that
+            # says there is nothing to look at. A two-column block wider than
+            # the content area is exactly that case, and it is the commonest
+            # way this pass leaves content off the printable page
+            # (30/08/2026).
+            past_right = (ir + dx) - region[2]
+            past_left = region[0] - (il + dx)
+            off_right = (ir + dx) - prs.slide_width
+            off_left = -(il + dx)
             spill = []
             if over_margin > 0:
                 spill.append(f"{over_margin / 914400:.2f}in past the bottom "
                              f"margin")
+            for amount, side in ((past_right, "right"), (past_left, "left")):
+                if amount > 0:
+                    spill.append(f"{amount / 914400:.2f}in past the {side} "
+                                 f"margin")
             if over_canvas > 0:
                 spill.append(f"{over_canvas / 914400:.2f}in past the slide edge, "
                              f"where it will not print")
+            for amount, side in ((off_right, "right"), (off_left, "left")):
+                if amount > 0:
+                    spill.append(f"{amount / 914400:.2f}in past the {side} edge "
+                                 f"of the slide, where it will not print")
             where = ("; it now runs " + " and ".join(spill)) if spill else ""
             held = (" The line the master states for the top of its body was "
                     "held, so the strip under the header is still clear."
@@ -1559,7 +1706,12 @@ def migrate_slide(slide, slide_index: int, prs, anchors=None,
                 slide_index, "content does not fit",
                 f"{size}{where}. Left for a designer (not scaled: shrinking a "
                 f"text box does not shrink its type).{held}",
-                severity="alert" if over_canvas > 0 else "info"))
+                # Anything off the CANVAS is an alert, on whichever side: it is
+                # content that will not print. Graded off over_canvas alone,
+                # a block hanging off the page sideways came out as "info".
+                severity=("alert"
+                          if max(over_canvas, off_right, off_left) > 0
+                          else "info")))
 
     # --- 3b. collisions this pass would otherwise ship -------------------
     # Runs AFTER the block move, so it only sees what the block move could not
@@ -1584,12 +1736,16 @@ def migrate_slide(slide, slide_index: int, prs, anchors=None,
         if ph_type in _FURNITURE_TYPES:
             continue  # footer/slide-number placeholders are meant to be empty
         if not _text_of(ph):
-            changes.append(ContentChange(
-                slide_index, "removed empty placeholder",
-                f"{ph_type} had nothing to hold; its prompt text would show "
-                f"in the editor",
-                undo=_insert_undo(ph)))
-            _delete(ph)
+            changes.append(_removal(
+                slide_index, ph, remove=remove,
+                done_action="removed empty placeholder",
+                done_detail=f"{ph_type} had nothing to hold; its prompt text "
+                            f"would show in the editor",
+                kept_action="empty placeholder left in place",
+                kept_detail=f"{ph_type} has nothing to hold, so its prompt "
+                            f"text shows in the editor. It does not print, and "
+                            f"it is a box waiting for content rather than "
+                            f"content"))
 
     # --- 5. headings outside the margin frame ----------------------------
     # Last, so it describes the slide as it will actually ship rather than an
@@ -1598,8 +1754,86 @@ def migrate_slide(slide, slide_index: int, prs, anchors=None,
     return changes
 
 
-def migrate_deck(deck_bytes: bytes) -> tuple[bytes, list[ContentChange]]:
-    """Run the content migration over every slide of an already-restyled deck."""
+def apply_removals(deck_bytes: bytes,
+                   ops: list[dict]) -> tuple[bytes, list[ContentChange]]:
+    """Take out exactly the pieces a designer ticked, and nothing else.
+
+    `ops` are the `remove_op` dicts off the proposals the migration produced.
+    Each one that succeeds comes back as an ordinary ContentChange carrying its
+    own undo, so a removal a designer regrets is taken back by the same Undo
+    button as every other change rather than by a separate restore path.
+
+    Anything that cannot be found is reported and skipped. A shape id that has
+    gone means the deck moved on since the proposal was made, and guessing which
+    shape was meant is exactly the kind of guess that loses content.
+    """
+    prs = Presentation(io.BytesIO(deck_bytes))
+    changes: list[ContentChange] = []
+
+    for op in ops or []:
+        idx = op.get("slide_index")
+        if idx is None or not (0 <= idx < len(prs.slides)):
+            changes.append(ContentChange(
+                idx if isinstance(idx, int) else 0, "removal skipped",
+                "that slide is no longer in the deck", severity="alert"))
+            continue
+        slide = prs.slides[idx]
+        kind = op.get("kind")
+
+        if kind == "background":
+            cSld = find(slide._element, "p:cSld")
+            own = findall(cSld, "p:bg")
+            if not own:
+                changes.append(ContentChange(
+                    idx, "removal skipped",
+                    "the slide no longer carries its own background",
+                    severity="alert"))
+                continue
+            from lxml import etree
+
+            kept = [etree.tostring(bg, encoding="unicode") for bg in own]
+            for bg in own:
+                cSld.remove(bg)
+            changes.append(ContentChange(
+                idx, "dropped background override",
+                "the slide's own background is gone, so the master's applies",
+                severity="alert",
+                undo=[{"op": "bg", "xml": x} for x in kept if x]))
+            continue
+
+        wanted = str(op.get("shape_id"))
+        shape = next((s for s in slide.shapes if str(s.shape_id) == wanted),
+                     None)
+        if shape is None:
+            changes.append(ContentChange(
+                idx, "removal skipped",
+                f"shape {wanted} is no longer on slide {idx + 1}",
+                severity="alert"))
+            continue
+        text = _text_of(shape)
+        xml = _shape_xml(shape)
+        label = f"{text[:40]!r}" if text else f"{shape.name!r}"
+        _delete(shape)
+        changes.append(ContentChange(
+            idx, "removed on request", f"{label} taken out of slide {idx + 1}",
+            severity="alert", removed_text=text or None, removed_xml=xml,
+            restore_id=f"{idx}-{wanted}",
+            undo=[{"op": "insert", "xml": xml}] if xml else None))
+
+    out = io.BytesIO()
+    prs.save(out)
+    return out.getvalue(), changes
+
+
+def migrate_deck(deck_bytes: bytes,
+                 remove: bool = False) -> tuple[bytes, list[ContentChange]]:
+    """Run the content migration over every slide of an already-restyled deck.
+
+    `remove` is False by design: nothing leaves a slide unless a designer asks
+    (design lead, 26/08/2026). Every removal the pass finds comes back as a
+    proposal carrying `remove_op`, and qc.migrate.apply_removals performs the
+    ticked ones. Passing True restores the old behaviour and exists for the
+    tests that exercise what a removal DOES."""
     prs = Presentation(io.BytesIO(deck_bytes))
     changes: list[ContentChange] = []
     # Read once for the deck: what recurs across slides is the only way to tell
@@ -1611,7 +1845,8 @@ def migrate_deck(deck_bytes: bytes) -> tuple[bytes, list[ContentChange]]:
     strays = stray_texts(prs)
     for idx, slide in enumerate(prs.slides):
         try:
-            changes.extend(migrate_slide(slide, idx, prs, anchors, strays))
+            changes.extend(migrate_slide(slide, idx, prs, anchors, strays,
+                                         remove))
         except Exception as exc:
             changes.append(ContentChange(
                 idx, "migration skipped",
@@ -1621,6 +1856,8 @@ def migrate_deck(deck_bytes: bytes) -> tuple[bytes, list[ContentChange]]:
     # after the order is final, and never re-derived from the change's own text.
     for n, change in enumerate(changes):
         change.change_id = f"c{n}"
+        if change.remove_op is not None:
+            change.remove_id = f"r{n}"
     out = io.BytesIO()
     prs.save(out)
     return out.getvalue(), changes

@@ -19,6 +19,13 @@ import qc.modules.font as font_module
 import qc.modules.margin_alignment as ma
 from qc.fixer import apply_fixes, is_fixable
 from qc.migrate import migrate_deck, restore_shapes
+
+
+def _migrate_removing(data):
+    """The migration with its removals performed. Removal is opt-in as of
+    26/08/2026; this test is about what a removed piece KEEPS, not about whether
+    the pass takes it out unasked."""
+    return migrate_deck(data, remove=True)
 from qc.profile import Profile
 from qc.stylespec import dominant_master, infer_grid
 
@@ -550,7 +557,7 @@ def test_a_removed_piece_carries_its_own_xml_and_comes_back_whole():
     original = next(s for s in before.shapes
                     if s.has_text_frame and s.text_frame.text == AR_EYEBROW)
 
-    out, changes = migrate_deck(source)
+    out, changes = _migrate_removing(source)
     removed = [c for c in changes if c.removed_text == AR_EYEBROW]
     assert removed, "the eyebrow has no slot in the master and is swept"
     assert AR_EYEBROW not in _texts(out)

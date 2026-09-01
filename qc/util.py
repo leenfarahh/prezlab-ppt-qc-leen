@@ -91,6 +91,13 @@ def full_height_panel(top, height, slide_h) -> bool:
 # comes apart.
 
 SATELLITE_GAP_EMU = 360000     # 10mm: a caption, rule or mark beside its anchor
+
+# How much of a satellite has to sit ON its anchor before the two are one
+# object. Half, because the cases this rule exists for - a rule across a photo,
+# a chip on its box, a label on its card - are at or near the whole of the
+# satellite, and the case it must exclude - two text boxes whose empty margins
+# lap over each other - is a fraction of one.
+WELD_MIN_SHARE = 0.5
 BACKDROP_SLIDE_SHARE = 0.35    # covering this much canvas: a backdrop, not a
                                # partner, and it rides nothing
 
@@ -123,7 +130,27 @@ def rides_with(sat, anchor, along: str | None = None,
     ox = min(sr, ar) - max(sl, al)
     oy = min(sb, ab) - max(st, at)
     if ox > 0 and oy > 0:
-        return True                      # overlapping: composed by definition
+        # OVERLAPPING IS NOT THE SAME AS TOUCHING. Any overlap at all used to
+        # weld the two, and on a deck of text boxes that is most of the slide:
+        # a box is routinely much bigger than the words in it, so a full-width
+        # title's box laps over the header below it while nothing visible
+        # touches. The engine then treated the title as a passenger of the
+        # header, and a fix asked to nudge the header 0.3in moved the title
+        # too - into the next column's header, which the collision guard
+        # correctly refused, so the whole fix was dropped and the page said
+        # "Applied 0 fixes" (reproduced 01/09/2026 on a two-column slide).
+        #
+        # A weld is when the satellite LIVES on the anchor: a corner rule drawn
+        # across a photo, a chip on its box, a label on its card - the overlap
+        # is most of the satellite. A graze is measured against the satellite's
+        # own area rather than the anchor's because the question is whether
+        # THIS shape would be torn by being left behind, and a shape with a
+        # corner over the mover would not.
+        if ox * oy >= WELD_MIN_SHARE * (sr - sl) * (sb - st):
+            return True                  # composed by definition
+        # Otherwise it is only a graze, and it still gets the ordinary
+        # stacked/beside test below: a caption whose box laps its image is
+        # carried for sharing its column, not for touching it.
     cx, cy = (sl + sr) // 2, (st + sb) // 2
     stacked = al <= cx <= ar and -oy <= gap     # same column, small gap
     beside = at <= cy <= ab and -ox <= gap      # same row, small gap

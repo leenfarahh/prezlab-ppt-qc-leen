@@ -185,14 +185,22 @@ def _do_offset(prs, params, notes, touched, undo):
         shape = _by_id(prs.slides[idx]).get(str(target.get("shape_id")))
         if shape is None or shape.left is None or shape.top is None:
             continue
+        # A TARGET MAY STATE ITS OWN MOVE. One delta for a group of shapes is
+        # right when they are the same shape repeated in the same place and
+        # wrong the moment they are not: the frame remedy bins its members to a
+        # tenth of an inch, so a shared delta computed off the first of them
+        # leaves the others outside by their difference. `in` rather than `or`,
+        # because a legitimate delta on one axis is very often zero.
+        t_dx = int(target["dx"]) if "dx" in target else dx
+        t_dy = int(target["dy"]) if "dy" in target else dy
         undo.append({"op": "offset", "slide_index": idx,
                      "shape_id": str(shape.shape_id),
                      "left": int(shape.left), "top": int(shape.top)})
         touched.append((idx, str(shape.shape_id)))
-        shape.left = int(shape.left) + dx
-        shape.top = int(shape.top) + dy
-        notes.append(f"{shape.name!r} moved {dx / 914400:+.2f}in, "
-                     f"{dy / 914400:+.2f}in")
+        shape.left = int(shape.left) + t_dx
+        shape.top = int(shape.top) + t_dy
+        notes.append(f"{shape.name!r} moved {t_dx / 914400:+.2f}in, "
+                     f"{t_dy / 914400:+.2f}in")
     return None
 
 

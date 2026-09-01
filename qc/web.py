@@ -1880,8 +1880,7 @@ def apply(request: Request, job_id: str = Form(...),
     note = (f"Applied {fx.applied} fix{'es' if fx.applied != 1 else ''}. "
             f"Re-audit of the cleaned deck: {after_total} findings remain "
             f"(was {before_total}).")
-    if skipped:
-        note += f" Skipped {len(skipped)}."
+    note += _skip_note(skipped)
     if stale:
         note += f" {stale}"
     from .auth import current_user
@@ -1952,6 +1951,29 @@ def design_count(job) -> int | None:
                if f.finding_id not in answered)
 
 
+def _skip_note(skipped: list) -> str:
+    """" Skipped 2: <why>; <why>." - or "" when nothing was.
+
+    THE REASON IS THE WHOLE POINT. "Applied 0 fixes. Skipped 1." is the page
+    saying it did nothing and declining to say why, and the sentence it is
+    withholding is one a designer can act on: "snapping would push shape 4 into
+    shape 7; left for manual fix" names the collision, and moving that shape by
+    hand takes ten seconds. The design page has said this since it was written;
+    the report page and the ask box each counted the skips and threw the
+    reasons away (01/09/2026, chasing "the errors are not being fixed" - they
+    were being skipped, loudly, into a string nobody printed).
+
+    Reasons are de-duplicated because twelve records skipped for one cause is
+    one thing to know, not twelve.
+    """
+    if not skipped:
+        return ""
+    reasons = sorted({o.reason for o in skipped if o.reason})
+    if not reasons:
+        return f" Skipped {len(skipped)}."
+    return f" Skipped {len(skipped)}: " + "; ".join(reasons) + "."
+
+
 def _reaudit_in_place(job) -> str | None:
     """Re-run the audit over the deck as the design pass has left it, keeping
     the SAME job.
@@ -1977,8 +1999,59 @@ def _reaudit_in_place(job) -> str | None:
         tmp.unlink(missing_ok=True)
     manifest = result.to_manifest()
     manifest["deck"] = job["filename"]
+    survivors = _surviving_vision(job, manifest)
     job["manifest"] = manifest
+    if survivors:
+        _merge_records(job, survivors)   # re-counts the summary in one place
     return None
+
+
+def _surviving_vision(job, fresh: dict) -> list:
+    """The model-raised records that outlive a re-audit.
+
+    The re-audit rebuilds the manifest from qc.engine, which only knows the
+    MEASURED modules - so without this, every copilot and component suggestion
+    on the page is destroyed by the first fix a designer applies, whatever that
+    fix was. They are not re-derivable: it took a vision call per slide to get
+    them, and nothing in the audit can produce them again.
+
+    Each one is re-checked against the deck as the fix has left it
+    (qc.fixer.still_open), so a suggestion that has gone stale is dropped
+    rather than carried forward with a target read off the old geometry. One
+    that the re-audit has independently found is dropped too: the measured
+    record says the same thing about the same edge, and two cards moving one
+    shape to one place is how a designer stops trusting the list.
+    """
+    from pptx import Presentation
+
+    from .fixer import still_open
+
+    old = (job.get("manifest") or {}).get("records") or []
+    vision = [r for r in old if r.get("source") == "vision"]
+    if not vision or job.get("deck") is None:
+        return []
+    measured = {(r["slide_index"], str(r["shape_id"]), r["issue_type"],
+                 r.get("property")) for r in fresh.get("records") or []}
+    try:
+        slides = list(Presentation(io.BytesIO(job["deck"])).slides)
+    except Exception:
+        return []
+
+    kept = []
+    for rec in vision:
+        idx = rec["slide_index"]
+        if idx >= len(slides):
+            continue
+        if (idx, str(rec["shape_id"]), rec["issue_type"],
+                rec.get("property")) in measured:
+            continue
+        try:
+            if still_open(rec, slides[idx]):
+                kept.append(rec)
+        except Exception:
+            # A record this cannot re-check is a record this cannot vouch for.
+            continue
+    return kept
 
 
 # How many slides are rendered per PowerPoint call. Flipping one slide at a time
@@ -2385,10 +2458,7 @@ def design_fix(job_id: str, record_ids: list[str] = Form(None),
             f"Re-audit of the deck: "
             f"{job['manifest']['summary']['total']} findings remain "
             f"(was {before_total}).")
-    if skipped:
-        note += (f" Skipped {len(skipped)}: "
-                 + "; ".join(sorted({o.reason for o in skipped if o.reason}))
-                 + ".")
+    note += _skip_note(skipped)
     return _design_page(job_id, job, current=back_to, banner=note, error=stale)
 
 
@@ -2869,9 +2939,8 @@ def _perform_plan(job, plan) -> tuple[str, bool]:
         after = job["manifest"]["summary"]["total"]
         note = (f"Applied {fx.applied} fix{'es' if fx.applied != 1 else ''}. "
                 f"Re-audit of the deck: {after} findings remain (was {before}).")
-        skipped = [o for o in fx.outcomes if o.outcome == "skipped"]
-        if skipped:
-            note += f" Skipped {len(skipped)}."
+        note += _skip_note([o for o in fx.outcomes
+                            if o.outcome == "skipped"])
         return note + (f" {stale}" if stale else ""), True
 
     if plan.name == "decide":

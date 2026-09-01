@@ -163,13 +163,35 @@ def _shared_edge(shapes, edge) -> int:
     return edge(spine)
 
 
+def _claim(issue: str, shape_id, prop, locator) -> tuple:
+    """What makes two records the same finding, for the de-duplication against
+    what the audit already recorded.
+
+    An EDGE record is claimed by its shape and its AXIS. "Shape 8's top edge is
+    off the line it shares" is one finding however many passes notice it, and
+    the axis is in `property` (both the measured module and this one write
+    spPr.xfrm.off.y for a top). The locator cannot be the key any more because
+    it now carries the alignment CLUSTER rather than the record's identity: a
+    measured record states no cluster, so keying on it would let the same shape
+    be reported twice on the same edge and offer the designer two cards that
+    move it to the same place.
+
+    Everything else keeps the locator, which is where a distribution states
+    which row it is about.
+    """
+    if issue == "margin_alignment.edge_misaligned":
+        return (issue, str(shape_id), prop)
+    return (issue, str(shape_id), locator)
+
+
 def synthesize(slide, s_idx: int, observations: list[dict],
                existing: list[dict]) -> list[dict]:
     """Code is the precision gate: re-verify each observation against the
     real geometry and emit ordinary FindingRecords with computed targets.
     Anything that does not check out is dropped silently."""
     by_id = {str(sh.shape_id): sh for sh in slide.shapes}
-    seen = {(r["issue_type"], str(r["shape_id"]), r.get("locator"))
+    seen = {_claim(r["issue_type"], r["shape_id"], r.get("property"),
+                   r.get("locator"))
             for r in existing if r["slide_index"] == s_idx}
     out: list[dict] = []
 
@@ -179,7 +201,7 @@ def synthesize(slide, s_idx: int, observations: list[dict],
         kw = {"severity": "warning", "confidence": "medium", **kw}
         rec = make_record(slide_index=s_idx, action="flagged",
                           source="vision", **kw)
-        key = (rec.issue_type, rec.shape_id, rec.locator)
+        key = _claim(rec.issue_type, rec.shape_id, rec.property, rec.locator)
         if key not in seen:
             seen.add(key)
             out.append(rec.to_dict())
@@ -225,6 +247,23 @@ def synthesize(slide, s_idx: int, observations: list[dict],
             left = action == "align_left"
             edge = (lambda s: s.left) if left else (lambda s: s.top)
             target = _shared_edge(shapes, edge)
+            # THE PEER SET TRAVELS WITH THE RECORD, and this is the whole
+            # difference between a fix that works and one that makes the slide
+            # worse. qc.fixer infers what must travel with a moving shape from
+            # overlap and adjacency, and for a vertical move that means "what
+            # sits beside it in the same row" - which, on a row of cards being
+            # aligned to each other, is every other card. So the stray was
+            # seated on the line and its neighbours, already on that line, were
+            # dragged the same distance off it (reproduced 01/09/2026 on a
+            # ten-circle grid: one circle came onto the line and two left it).
+            #
+            # Geometry cannot tell a satellite from a peer here. The model
+            # already did: these ids are the set it said shares a line. Naming
+            # them in the locator is how that answer reaches the fix, exactly
+            # as qc.components names a component's members in "comp:".
+            peers = ",".join(str(s.shape_id)
+                             for s in sorted(shapes, key=lambda s: s.shape_id))
+            cluster = f"align-{'x' if left else 'y'}:{peers}"
             for s in shapes:
                 off = abs(edge(s) - target)
                 if off <= TOL_EMU:
@@ -239,6 +278,7 @@ def synthesize(slide, s_idx: int, observations: list[dict],
                      confidence="medium" if snappable else "low",
                      property="spPr.xfrm.off.x" if left
                      else "spPr.xfrm.off.y",
+                     locator=cluster,
                      old_value=edge(s),
                      new_value=int(target) if snappable else None,
                      profile_rule_id="geometry.alignment.edge_tolerance_emu",

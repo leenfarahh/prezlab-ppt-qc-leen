@@ -143,6 +143,31 @@ def _quota_message(exc, code) -> str:
                 f"(the provider reports a limit of zero), so waiting will not "
                 f"help. Enable billing on the project, or set QC_LLM_MODEL to a "
                 f"model the key can call.")
+
+    # A DAILY allowance is not a rate limit, and telling someone to "run the
+    # pass again shortly" when they have spent the day's requests is advice
+    # that cannot work. The two arrive as the same 429 with the same
+    # RESOURCE_EXHAUSTED status and are told apart only by the quotaId in the
+    # body: ...PerDayPerProjectPerModel-FreeTier is the day's ration,
+    # ...PerMinute... is the blip the SDK's retries are for.
+    #
+    # Found 01/09/2026 on the free tier, where gemini-3.5-flash allows twenty
+    # requests A DAY: the chat box, the copilot and the component review all
+    # reported "run the pass again shortly" for hours, and every retry spent
+    # nothing because there was nothing left to spend. The API's own
+    # retry-in-25s hint is the wait until the next per-minute window, not until
+    # the quota resets, so quoting it here is worse than saying nothing.
+    per_day = re.search(r"quotaId['\"]?:\s*['\"]?([A-Za-z]*PerDay[A-Za-z]*)",
+                        body)
+    if per_day or "PerDay" in body:
+        allowance = re.search(r"limit:\s*(\d+)", body)
+        cap = f" of {allowance.group(1)} requests" if allowance else ""
+        return (f"this API key's DAILY allowance{cap} for '{LLM_MODEL}' is "
+                f"spent, so every pass that asks a model will fail until it "
+                f"resets (midnight Pacific). This is not a fault in the deck "
+                f"and not something retrying fixes: use a key with billing "
+                f"enabled, or set QC_LLM_MODEL to a model with allowance left.")
+
     return (f"the model's rate limit was reached and three attempts did not "
             f"clear it.{retry} Nothing is wrong with the deck; run the pass "
             f"again shortly, or lower QC_LLM_CONCURRENCY.")

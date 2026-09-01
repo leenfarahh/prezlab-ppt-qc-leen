@@ -328,6 +328,68 @@ def _find_shape(slide, shape_id: str):
     return None
 
 
+# The perceptual floor, the same 0.03in qc.copilot and qc.components measure
+# against. Stated again rather than imported because importing a judgment pass
+# into the fixer would invert the dependency: the fixer is what those passes
+# feed, and it must not need them present to run.
+ON_THE_LINE_EMU = 28575
+
+
+def _measured_now(shape, record):
+    """The value this record's `old_value` was read from, re-read off the deck
+    as it stands now, or None when the record does not name a measurable."""
+    prop = record.get("property") or ""
+    if prop.endswith(".x"):
+        return shape.left
+    if prop.endswith(".y"):
+        return shape.top
+    if prop == "spPr.xfrm.ext":
+        return f"{shape.width}x{shape.height}"
+    return None
+
+
+def still_open(record: dict, slide) -> bool:
+    """Whether a MODEL-RAISED record still describes this deck.
+
+    A measured record is re-derived by the re-audit after every fix, so it can
+    never go stale. A vision record cannot be re-derived without asking the
+    model again, and until now that meant it was simply dropped: applying one
+    unrelated font fix re-audited the deck, replaced the manifest, and took
+    every copilot and component suggestion on the page with it (reproduced
+    01/09/2026 - one font fix, five suggestions gone, no message). The designer
+    then had to spend another slide's worth of API calls to get back a list
+    they had already been shown.
+
+    So they are carried across instead, and each one is re-checked here against
+    the geometry it was measured from. Three answers:
+
+      the shape is gone            drop it, there is nothing to move
+      it has moved or resized      drop it: the model judged a slide that no
+                                   longer exists, and its computed target was
+                                   read off the old positions
+      it is already on the line    drop it, something else fixed it
+
+    Anything else survives with its target intact, because nothing it depends
+    on has changed. Kept deliberately strict: a stale target is a wrong move
+    applied with confidence, which is worse than a suggestion a designer has to
+    ask for again.
+    """
+    shape = _find_shape(slide, str(record["shape_id"]))
+    if shape is None:
+        return False
+    current = _measured_now(shape, record)
+    if current is None:
+        return True                     # nothing to re-measure; the judgment stands
+    if str(current) != str(record.get("old_value")):
+        return False
+    try:
+        if abs(int(record["new_value"]) - int(current)) <= ON_THE_LINE_EMU:
+            return False
+    except (TypeError, ValueError, KeyError):
+        pass
+    return True
+
+
 def _slide_rects(slide) -> dict:
     """{shape_id: (container, (l, t, r, b), texty)}. Group children carry
     their group's id as container: their EMU live in group space, so
@@ -484,6 +546,80 @@ def _carried_contents(slide, container, along: str | None = None) -> list:
                 and not _pinned_furniture(slide, shape, l, t)):
             carried.append(shape)
     return carried
+
+
+# An alignment record that states the set it was measured against, written by
+# the pass that knows it (qc.copilot.synthesize) as "align-x:6,8,10" /
+# "align-y:...". A record without one is every record this tool has ever
+# written before now, and it behaves exactly as it did.
+_ALIGN_LOCATORS = ("align-x:", "align-y:")
+
+
+def _cluster_ids(record) -> set:
+    """The peer set an alignment record was measured against, or empty."""
+    loc = record.get("locator") or ""
+    if not loc.startswith(_ALIGN_LOCATORS):
+        return set()
+    return {sid for sid in loc.split(":", 1)[1].split(",") if sid}
+
+
+def _peer_pinned(slide, record, target_id) -> set:
+    """Ids that must NOT ride the shape this record moves: the other members of
+    its alignment cluster, and whatever lives inside them.
+
+    A SHAPE BEING HELD TO A LINE CANNOT ALSO BE A SATELLITE OF A SHAPE BEING
+    MOVED ONTO THAT LINE. _carried_contents cannot see the difference - it
+    reads overlap and adjacency, and for a vertical move it carries what sits
+    beside the mover, which on a row of cards is the rest of the row. The fix
+    then seats the stray on the line and drags its neighbours, already on that
+    line, the same distance off it. Measured on a ten-circle grid (01/09/2026):
+    the row's spread went from 0.184in to 0.163in, one circle came onto the line
+    and two left it. qc.fixer._fix_space_edge and _fix_component_edge each say
+    the same thing about their own membership; this is the third place it is
+    true and the first where a model supplied the membership.
+
+    WELDED MEMBERS ARE NOT PINNED. Overlapping shapes are one object in this
+    engine's terms (qc.util.rides_with: "composed by definition"), so a badge
+    sitting on top of a peer travels with whichever of them moves. Only
+    neighbours that merely share the line are held still.
+
+    A peer's own CONTENTS are pinned with it: an icon inside the card beside
+    ours sits well within the satellite gap of ours, and carrying it would tear
+    it off the card it belongs to. Containment is not chained - contents are
+    tested against the peers, never against each other - so one crowded slide
+    cannot pin itself solid.
+    """
+    peers = _cluster_ids(record) - {str(target_id)}
+    if not peers:
+        return set()
+    rects = _slide_rects(slide)
+    target = rects.get(str(target_id))
+    if target is None:
+        return set()
+    t_container, t_box, _texty = target
+
+    pinned = set()
+    for pid in peers:
+        entry = rects.get(pid)
+        if entry is None or entry[0] != t_container:
+            continue
+        if _overlap_area(entry[1], t_box) > 0:
+            continue                       # welded to the mover: it travels
+        pinned.add(pid)
+
+    held = [(rects[pid][0], rects[pid][1]) for pid in pinned]
+    for sid, (container, box, _t) in rects.items():
+        if sid in pinned or sid == str(target_id):
+            continue
+        area = (box[2] - box[0]) * (box[3] - box[1])
+        if area <= 0:
+            continue
+        for p_container, p_box in held:
+            if p_container == container and \
+                    _overlap_area(box, p_box) >= _CONTAIN_MIN * area:
+                pinned.add(sid)
+                break
+    return pinned
 
 
 def _translate(shapes, dx: int, dy: int) -> str | None:
@@ -698,8 +834,17 @@ def _planned_movers(slide, rec) -> set:
         for bid in base:
             sh = by_id.get(bid)
             if sh is not None:
+                # Pinned peers are subtracted here for the same reason they are
+                # in _fix_edge: the guard has to check and restore the set that
+                # ACTUALLY moves, and the claim set has to leave the other
+                # strays in the cluster free to be fixed in the same round -
+                # otherwise the first record claims the whole row and every
+                # other stray on it comes back "shares shapes with a fix
+                # already applied".
+                pinned = _peer_pinned(slide, rec, bid)
                 moved.update(str(c.shape_id)
-                             for c in _carried_contents(slide, sh, axis))
+                             for c in _carried_contents(slide, sh, axis)
+                             if str(c.shape_id) not in pinned)
     if loc.startswith(("row:", "col:")):
         sats = _collection_riders(slide, sorted(moved),
                                   "x" if loc.startswith("row:") else "y")
@@ -1042,8 +1187,16 @@ def _fix_edge(shape, record, slide=None) -> str | None:
         return error
     vertical = (record.get("property") or "").endswith(".y")
     delta = value - (shape.top if vertical else shape.left)
-    carried = (_carried_contents(slide, shape, "y" if vertical else "x")
-               if slide is not None else [])
+    carried = []
+    if slide is not None:
+        # The record's own peers never ride it. Without this the shapes that
+        # DEFINE the line get dragged off it by the shape being moved onto it
+        # (see _peer_pinned). A record naming no cluster pins nothing, which is
+        # the behaviour every measured edge record has always had.
+        pinned = _peer_pinned(slide, record, shape.shape_id)
+        carried = [c for c in _carried_contents(slide, shape,
+                                                "y" if vertical else "x")
+                   if str(c.shape_id) not in pinned]
     return _translate([shape] + carried,
                       0 if vertical else delta,
                       delta if vertical else 0)

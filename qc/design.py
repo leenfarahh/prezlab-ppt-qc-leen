@@ -536,6 +536,49 @@ def _raw_box(shape):
     return (l, t, l + w, t + h)
 
 
+def rendered_box(shape, box):
+    """`box` widened to what the shape actually COVERS: the axis-aligned bounds
+    of its four corner VERTICES after rotation.
+
+    A shape's stored rectangle is its unrotated footprint. PowerPoint rotates
+    about the box centre, so the ink of a rotated shape reaches outside that
+    rectangle - a wide banner at 45 degrees by nearly half its own width on
+    every side - and a check that reads the stored box is measuring a rectangle
+    nothing was drawn in. qc.components says the same thing from the other side
+    and refuses to measure a rotated shape at all.
+
+    It matters most where a shape is MOVED to bring it inside the presentation
+    space. The shortest move that seats the STORED box on the frame leaves the
+    vertices hanging outside it, so the shape is reported again on the next pass
+    having just been "fixed" - and the designer is told a move happened that
+    they can see did not work (qc.design._frame_findings).
+
+    What this does not model is ink outside the geometry: a custom-geometry path
+    whose points exceed their own path extent, and the outer half of a thick
+    outline. Both are small next to rotation, neither is readable without
+    resolving the shape's geometry, so the rotated box is where this stops.
+    """
+    if box is None:
+        return None
+    try:
+        rot = float(getattr(shape, "rotation", 0) or 0) % 360.0
+    except (TypeError, ValueError):
+        # A shape whose rotation will not read is not a rotated shape; it is
+        # one this cannot answer for, and its stored box is the best available.
+        return box
+    if not rot:
+        return box
+    left, top, right, bottom = box
+    half_w, half_h = (right - left) / 2.0, (bottom - top) / 2.0
+    cx, cy = left + half_w, top + half_h
+    radians = math.radians(rot)
+    cos, sin = abs(math.cos(radians)), abs(math.sin(radians))
+    reach_x = half_w * cos + half_h * sin
+    reach_y = half_w * sin + half_h * cos
+    return (int(round(cx - reach_x)), int(round(cy - reach_y)),
+            int(round(cx + reach_x)), int(round(cy + reach_y)))
+
+
 def _group_transform(group):
     """(dx, dy, sx, sy) mapping this group's CHILD coordinates into its parent's.
 
@@ -2156,6 +2199,11 @@ def _frame_findings(prs) -> list[DesignFinding]:
                 continue  # the master's own furniture, where the master put it
             if not _text_of(shape):
                 continue  # a rule or a mark outside the frame is a composition
+            # From here on the box is the RENDERED one. Everything below either
+            # decides whether the shape is outside the frame or works out the
+            # move that brings it in, and both questions are about the ink
+            # rather than about the stored rectangle (qc.design.rendered_box).
+            box = rendered_box(shape, box)
             if _is_backdrop(box, slide_w, slide_h):
                 continue
             inside = _cover(box, (fl, ft, fr, fb))
@@ -2178,22 +2226,37 @@ def _frame_findings(prs) -> list[DesignFinding]:
         what = ("a number" if numeric else f"{_label(first[1])!r}")
         # The move that brings it inside: the shortest translation that seats
         # its own top-left on the frame's nearest corner region.
-        dx = max(0, fl - box[0]) or min(0, fr - box[2])
-        dy = max(0, ft - box[1]) or min(0, fb - box[3])
+        #
+        # ONE offer, but A DELTA PER SHAPE. The members of a finding are the
+        # same furniture repeated across the deck, grouped to a tenth of an inch
+        # (POS_BIN), so they sit NEAR each other rather than on top of each
+        # other - and one delta read off the first of them leaves every other
+        # member outside the frame by whatever it differs by, on a card that
+        # said it had moved them all inside. Each target carries its own move,
+        # measured from its own rendered box.
+        moves = []
+        for m_idx, m_shape, m_box, _share in members:
+            m_dx = max(0, fl - m_box[0]) or min(0, fr - m_box[2])
+            m_dy = max(0, ft - m_box[1]) or min(0, fb - m_box[3])
+            moves.append({"slide_index": m_idx,
+                          "shape_id": str(m_shape.shape_id),
+                          "dx": int(m_dx), "dy": int(m_dy)})
+        dx = moves[0]["dx"] if moves else 0
+        dy = moves[0]["dy"] if moves else 0
         options = []
-        if dx or dy:
+        if any(m["dx"] or m["dy"] for m in moves):
+            uniform = len({(m["dx"], m["dy"]) for m in moves}) == 1
+            how = (f"({dx / EMU_IN:+.2f}in, {dy / EMU_IN:+.2f}in)" if uniform
+                   else "each by its own shortest distance")
             options.append(Remedy(
                 "inside", f"Move {'each' if len(members) > 1 else 'it'} inside "
-                          f"the frame ({dx / EMU_IN:+.2f}in, {dy / EMU_IN:+.2f}in)",
+                          f"the frame {how}",
                 f"Moves {_plural(len(members), 'shape')} the shortest distance that "
                 f"puts them inside the presentation space. They may then "
                 f"overlap what is already there - the overlap check below runs "
                 f"again after you apply this.",
                 op="offset_many",
-                params={"dx": int(dx), "dy": int(dy),
-                        "targets": [{"slide_index": m[0],
-                                     "shape_id": str(m[1].shape_id)}
-                                    for m in members]}))
+                params={"dx": int(dx), "dy": int(dy), "targets": moves}))
         options.append(Remedy(
             "remove", f"Remove {'them' if len(members) > 1 else 'it'} "
                       f"({_plural(len(members), 'shape')})",

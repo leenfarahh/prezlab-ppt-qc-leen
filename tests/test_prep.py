@@ -163,9 +163,16 @@ def test_planning_rebuilds_nothing(monkeypatch):
         raise AssertionError("planning touched the rebuild")
 
     monkeypatch.setattr("qc.applymaster.apply_master", _never)
-    prepared = plan(_deck(), "client.pptx", _master())
+    # The SAME bytes in and out. _deck() rebuilds the file on every call and a
+    # .pptx is a zip, so its local headers carry the time it was written: two
+    # calls either side of a two-second DOS-timestamp boundary differ at byte
+    # 10 and the comparison failed for reasons that had nothing to do with
+    # planning (flake found 01/09/2026). What the test means to assert is that
+    # plan() hands back what it was given, which needs one deck, not two.
+    data = _deck()
+    prepared = plan(data, "client.pptx", _master())
     assert prepared.slides == 3
-    assert prepared.source == _deck()
+    assert prepared.source == data
     assert [l["name"] for l in prepared.layouts]
 
 

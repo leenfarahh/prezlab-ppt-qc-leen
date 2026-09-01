@@ -663,6 +663,96 @@ def test_a_badge_outside_the_frame_is_one_finding_for_the_whole_deck():
     assert len(remove.params["targets"]) == 3, "the choice applies deck-wide"
 
 
+def test_rendered_box_covers_the_rotated_vertices():
+    """A rotated shape's stored rectangle is not what it covers.
+
+    Turn a 2in by 0.4in badge on its side and it occupies 0.4in by 2in about the
+    same centre. Every check that reads the stored box is measuring a rectangle
+    nothing was drawn in, and the move offered off the back of it is short by
+    the difference.
+    """
+    from qc.design import rendered_box
+
+    prs = _deck()
+    badge = _text(prs.slides[0], 0.5, 0.1, 2.0, 0.4, "02", 12)
+    box = (badge.left, badge.top, badge.left + badge.width,
+           badge.top + badge.height)
+
+    assert rendered_box(badge, box) == box, "an unrotated shape is its own box"
+
+    badge.rotation = 90
+    turned = rendered_box(badge, box)
+    assert turned[2] - turned[0] == pytest.approx(int(0.4 * IN), abs=2)
+    assert turned[3] - turned[1] == pytest.approx(int(2.0 * IN), abs=2)
+    # Same centre, and it now reaches above the top of the slide, which is
+    # exactly the fact the stored box was hiding.
+    assert (turned[0] + turned[2]) // 2 == pytest.approx((box[0] + box[2]) // 2,
+                                                         abs=2)
+    assert turned[1] < 0
+
+
+def test_a_rotated_badge_is_moved_by_its_vertices_not_by_its_stored_box():
+    """The move that seats the STORED box inside the frame leaves a rotated
+    shape's ink outside it, so the finding comes back on the next pass having
+    just been "fixed" - and the designer is told a move happened that they can
+    see did not work.
+    """
+    prs = _deck()
+    _text(prs.slides[0], 3.0, 3.0, 4, 0.6, "Content", 14)
+    badge = _text(prs.slides[0], 0.5, 0.1, 2.0, 0.4, "02", 12)
+    badge.name, badge.rotation = "Badge", 90
+    from qc.pspace import ensure_presentation_space
+    data, _notes = ensure_presentation_space(
+        _bytes(prs), fallback_box=(int(1.5 * IN), int(1.5 * IN),
+                                   12192000 - int(1.5 * IN),
+                                   6858000 - int(1.5 * IN)),
+        fallback_size=(Emu(12192000), Emu(6858000)))
+
+    finding = next(f for f in scan(data, PALETTE) if f.kind == "frame")
+    inside = next(o for o in finding.options if o.remedy_id == "inside")
+    fixed, applied = apply_remedies(data, [(finding, inside)])
+    assert applied[0].done
+
+    from qc.design import rendered_box
+
+    moved = next(s for s in Presentation(io.BytesIO(fixed)).slides[0].shapes
+                 if s.name == "Badge")
+    box = rendered_box(moved, (moved.left, moved.top, moved.left + moved.width,
+                               moved.top + moved.height))
+    assert box[0] >= int(1.5 * IN) and box[1] >= int(1.5 * IN), \
+        f"the badge's vertices are still outside the frame: {box}"
+
+
+def test_offset_many_moves_each_target_by_its_own_delta():
+    """One delta for a group of shapes is right only while they sit in the same
+    place. The frame remedy groups its members to a tenth of an inch, so a
+    shared delta read off the first of them leaves the rest outside by their
+    difference, on a card that said it moved them all inside."""
+    from qc.design import DesignFinding, Remedy
+
+    prs = _deck(slides=2)
+    a = _text(prs.slides[0], 0.20, 0.20, 0.5, 0.4, "01", 12)
+    b = _text(prs.slides[1], 0.60, 0.20, 0.5, 0.4, "02", 12)
+    a.name = b.name = "Badge"
+    data = _bytes(prs)
+
+    finding = DesignFinding(finding_id="t1", kind="frame", headline="h",
+                            detail="d", severity="info", slides=[0, 1],
+                            options=[])
+    remedy = Remedy("inside", "move", "", op="offset_many",
+                    params={"dx": 0, "dy": 0, "targets": [
+                        {"slide_index": 0, "shape_id": str(a.shape_id),
+                         "dx": int(1.0 * IN), "dy": 0},
+                        {"slide_index": 1, "shape_id": str(b.shape_id),
+                         "dx": int(0.6 * IN), "dy": 0}]})
+    fixed, applied = apply_remedies(data, [(finding, remedy)])
+    assert applied[0].done
+    assert _positions(fixed, 0)["Badge"][0] == pytest.approx(int(1.2 * IN),
+                                                             abs=2)
+    assert _positions(fixed, 1)["Badge"][0] == pytest.approx(int(1.2 * IN),
+                                                             abs=2)
+
+
 def test_content_inside_the_frame_is_not_reported():
     found = [f for f in scan(_framed_deck(badge=False), PALETTE)
              if f.kind == "frame"]

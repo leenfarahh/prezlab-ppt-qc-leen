@@ -52,16 +52,19 @@ Usage
 -----
     .venv\\Scripts\\python model_probe.py --master MASTER.pptx --deck MESSY.pptx
 
-    --slides 0,4,7      which slides pass 1 asks about (default: first 3)
-    --max-slides 3      cap on slides each vision pass reviews (default 3)
+    --slides 0,4,7      which slides pass 1 asks about (default: all of them)
+    --max-slides 3      cap on slides each vision pass reviews
+                        (default 0, meaning no cap)
     --pass layout|design|all
     --profile NAME      a saved profile, for the palette and the frame
     --out DIR           where the run folder goes (default: out/probe/<stamp>)
     --brief             shorten the prompts and schemas to 800 characters
                         (the answers are never shortened)
 
-Every call costs a vision request against a dense image, so the defaults are
-small. Raise them deliberately.
+Every call costs a vision request against a dense image, and the default now
+reviews the WHOLE deck: a probe that silently looked at three slides of forty
+answered a question nobody asked. Narrow it with --slides and --max-slides
+when a run is only about one slide.
 """
 
 import argparse
@@ -613,9 +616,15 @@ def audit_design(deck_bytes: bytes, palette_cfg: dict, space,
     n = len(Presentation(io.BytesIO(deck_bytes)).slides)
     manifest = {"records": [], "slides": n}
     wanted = vision_slides(deck_bytes, max_slides)
+    # The passes read their own budget off a module global, and 0 there means
+    # "review nothing" rather than "no cap" - so an uncapped run is handed the
+    # length of the list it is being given, not the flag.
+    budget = max(max_slides or len(wanted), 1)
     kv("slides in the deck", n)
-    kv("slides worth a call", f"{[i + 1 for i in wanted]} (the first "
-                              f"{max_slides} with three or more shapes)")
+    kv("slides worth a call",
+       f"{[i + 1 for i in wanted]} ("
+       + (f"the first {max_slides}" if max_slides else "every slide")
+       + " with three or more shapes)")
     thumbs = render(deck_bytes, wanted, tag) if wanted else {}
     if not wanted:
         out("  No slide in this deck has three shapes on it, so neither "
@@ -627,7 +636,7 @@ def audit_design(deck_bytes: bytes, palette_cfg: dict, space,
     else:
         import qc.copilot as copilot
 
-        copilot.MAX_SLIDES = max_slides
+        copilot.MAX_SLIDES = budget
         label("pass 2c design copilot")
         records, reviewed = copilot.run_copilot(deck_bytes, thumbs, manifest)
         out("")
@@ -641,7 +650,7 @@ def audit_design(deck_bytes: bytes, palette_cfg: dict, space,
     else:
         import qc.components as components
 
-        components.MAX_SLIDES = max_slides
+        components.MAX_SLIDES = budget
         kv("frame handed to the model",
            "the master's presentation space" if space is not None
            else "none stated, so component-to-component lines only")
@@ -655,7 +664,8 @@ def audit_design(deck_bytes: bytes, palette_cfg: dict, space,
 
 
 def vision_slides(deck_bytes: bytes, cap: int) -> list:
-    """The slides a vision pass would actually ask about, capped.
+    """The slides a vision pass would actually ask about. A `cap` of 0 (the
+    default) means every one of them.
 
     Not "the first `cap` slides", which is what this did on its first run and
     why a budget of one slide bought zero calls: both passes skip a slide with
@@ -675,7 +685,7 @@ def vision_slides(deck_bytes: bytes, cap: int) -> list:
     for idx, slide in enumerate(prs.slides):
         if len(inventory(slide, slide_w, slide_h)) >= 3:
             picked.append(idx)
-        if len(picked) >= cap:
+        if cap and len(picked) >= cap:
             break
     return picked
 
@@ -731,9 +741,17 @@ def frame_of(deck_bytes: bytes, profile_obj):
 # --- main -----------------------------------------------------------------
 
 
-def parse_slides(text: str, default_n: int = 3) -> list:
-    if not text:
-        return list(range(default_n))
+def parse_slides(text: str, total: int) -> list:
+    """The slides pass 1 asks about: every slide in the deck unless --slides
+    names some.
+
+    The default used to be the first three, which reads as a broken flag
+    rather than as a budget - a forty-slide deck reported on three of them
+    and nothing on the command line said three. `total` is the deck's own
+    slide count, so an empty --slides means the whole deck at whatever length
+    it happens to be."""
+    if not text or not text.strip():
+        return list(range(total))
     out_ = []
     for bit in text.replace(" ", "").split(","):
         if not bit:
@@ -756,9 +774,10 @@ def main(argv=None) -> int:
     ap.add_argument("--deck", required=True, help="the messy client .pptx")
     ap.add_argument("--slides", default="",
                     help="slides pass 1 asks about, 0-based: 0,4,7 or 0-2 "
-                         "(default: the first 3)")
-    ap.add_argument("--max-slides", type=int, default=3,
-                    help="cap on slides each vision pass reviews (default 3)")
+                         "(default: every slide in the deck)")
+    ap.add_argument("--max-slides", type=int, default=0,
+                    help="cap on slides each vision pass reviews "
+                         "(default 0, meaning no cap)")
     ap.add_argument("--pass", dest="which", default="all",
                     choices=("layout", "design", "all"))
     ap.add_argument("--profile", default="",
@@ -829,7 +848,11 @@ def main(argv=None) -> int:
 
     started = time.perf_counter()
     if args.which in ("layout", "all"):
-        probe_layouts(deck_bytes, master_bytes, parse_slides(args.slides))
+        from pptx import Presentation
+
+        n_slides = len(Presentation(io.BytesIO(deck_bytes)).slides)
+        probe_layouts(deck_bytes, master_bytes,
+                      parse_slides(args.slides, n_slides))
 
     if args.which in ("design", "all"):
         rebuilt, prep = apply_master(deck_bytes, master_bytes, deck_path.name)

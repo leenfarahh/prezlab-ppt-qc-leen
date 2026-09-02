@@ -6,8 +6,10 @@ deck, same master, same answer, on a machine with no network and no PowerPoint.
 
 Four claims:
 
-  - only UNCERTAIN slides are put in front of a designer, because a page that
-    asks forty questions to surface four gets pressed through unread;
+  - EVERY slide is put in front of a designer and only the uncertain ones are
+    counted as questions, because a page that asks forty questions to surface
+    four gets pressed through unread and a page that hides thirty six of them
+    cannot be checked against the deck (02/09/2026);
   - a layout that FITS outranks a layout that is merely close, whatever the
     arithmetic says, since "this can hold your content" is a different class of
     answer from "this is nearly the right shape";
@@ -22,7 +24,8 @@ from pptx import Presentation
 from pptx.util import Inches
 
 from qc.applymaster import SlidePlan, plan_assignments
-from qc.layoutpick import LEAVE, apply_picks, choices, note, rank
+from qc.layoutpick import (LEAVE, apply_picks, choices, note, rank,
+                          undecided)
 from qc.stylespec import dominant_master, extract_layouts
 
 
@@ -79,17 +82,56 @@ def _plans(prs, layouts, rule=None):
 # ------------------------------------------------- what gets asked about
 
 
-def test_only_the_uncertain_slides_are_offered():
-    """A slide whose name matched a layout its content fits is not a question.
+def test_every_slide_is_offered_and_only_some_are_questions():
+    """The deck is on the page; the questions are flagged.
 
-    The whole reason the page is short. Offering every slide "for approval" is
-    the same page as offering none: nobody reads forty rows to find four."""
+    This used to assert the opposite - a slide that matched by name onto a
+    layout its content fits produced NO Choice at all, and the page replaced it
+    with a line saying how many were "not listed because there is nothing to
+    decide about them". A designer approving a rebuild wants to see the deck
+    (design lead, 02/09/2026).
+
+    The reasoning that motivated the omission is intact and now lives in
+    `settled`: nobody reads forty rows to find four, so the four are what the
+    count and the styling lead on. What changed is that the other thirty six
+    exist, can be checked, and can be moved."""
     layouts = _layouts()
     deck, plans = _plans(_two_column_deck(3), layouts)
     for plan in plans:
         assert plan.match_rule == "name", "the fixture must match by name"
 
-    assert choices(deck, layouts, plans) == []
+    offered = choices(deck, layouts, plans)
+
+    assert [c.slide_index for c in offered] == [0, 1, 2]
+    assert all(c.settled for c in offered)
+    assert undecided(offered) == 0, "a matched slide is not a question"
+
+
+def test_a_settled_slide_is_pre_selected_where_it_already_is():
+    """Not where the ranking would put it. The file's name match is a designer's
+    stated intent and the score is arithmetic; a page that silently moves
+    matched slides on load is a page whose defaults cannot be trusted."""
+    layouts = _layouts()
+    deck, plans = _plans(_two_column_deck(1), layouts)
+
+    choice = choices(deck, layouts, plans)[0]
+
+    assert choice.settled
+    assert choice.suggested == choice.current
+    assert choice.candidates[0].name == choice.current,         "where the slide is going has to be visible, not buried in the select"
+
+
+def test_the_layout_a_settled_slide_is_on_is_always_one_of_its_options():
+    """The shortlist is by score and a name match is not, so the layout a slide
+    is already going onto can rank seventh. Pre-selecting something the card
+    does not show would leave a designer looking at five wrong options and no
+    indication of where the slide actually goes."""
+    layouts = _layouts()
+    deck, plans = _plans(_two_column_deck(2), layouts)
+
+    for choice in choices(deck, layouts, plans):
+        assert choice.current in {c.name for c in choice.candidates}
+        assert len(choice.candidates) <= 5, "the shortlist is still a shortlist"
 
 
 def test_a_slide_nothing_matched_is_offered_with_a_reason():
@@ -290,6 +332,32 @@ def test_the_note_counts_what_happened_rather_than_asserting_it_went_well():
     refused = note(4, 1, 1, refused=3)
     assert "3 had no layout in this master that fits" in refused
     assert "left on the fallback" not in refused
+
+
+def test_moving_a_slide_the_file_matched_is_counted_apart():
+    """A designer overruling a match nobody flagged is not one of the questions
+    the page asked, and it only became possible when every slide went on the
+    page (02/09/2026). Counted separately so a run where the tool was never in
+    doubt does not read as a run with open questions."""
+    line = note(4, 3, 2, 0, overridden=1)
+
+    assert "4 slides needed a layout decision" in line
+    assert "2 moved to a layout you picked" in line
+    assert "1 of the moves was a slide the file had already matched" in line
+    # 4 questions = 1 moved + 1 kept + 2 nobody answered. The override is one of
+    # the 2 moves and is NOT one of the 4.
+    assert "1 kept the suggestion" in line
+    assert "2 were left on the fallback" in line
+
+
+def test_an_override_on_a_deck_with_no_questions_still_says_something():
+    """Every slide matched and the designer moved one anyway. "There was
+    nothing to choose" would be a run note that contradicts the file."""
+    line = note(0, 1, 1, 0, overridden=1)
+
+    assert "nothing to choose" not in line
+    assert "1 moved to a layout you picked" in line
+    assert "already matched" in line
 
 
 # --------------------------------------------------------- what it never does

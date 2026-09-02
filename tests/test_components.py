@@ -255,19 +255,37 @@ def test_a_line_already_held_produces_nothing(make_prs):
     assert _synth(prs, layout) == []
 
 
-def test_a_gap_too_big_to_be_drift_is_a_composition(make_prs):
-    """Past the window it is an indent or a layout, not a mistake."""
+def test_a_gap_too_big_to_move_is_reported_rather_than_dropped(make_prs):
+    """Past the window the model's answer is SHOWN, not overruled.
+
+    This used to assert the opposite - a 3in gap produced nothing, on the
+    grounds that it must be a deliberate indent. That is a ruler overruling a
+    judgment: the model looked at the slide and said these two were meant to
+    share a left edge, and WINDOW_EMU is a threshold for deciding intent in the
+    passes where nothing supplies it. Here something does. The further out a
+    component sat, the more certain the silence, which is backwards.
+
+    What the window still decides is whether it is a ONE-CLICK move. Past it
+    the record carries no target and low confidence, so it is not tickable
+    (qc.fixer.is_fixable) - the designer sees what the model saw and decides.
+    """
     prs = _deck()
     slide = prs.slides.add_slide(prs.slide_layouts[BLANK])
     a = _box(slide, 0.5, 2, 2, 1)
-    b = _box(slide, 3.5, 3, 2, 1)          # 3in in: plainly deliberate
+    b = _box(slide, 3.5, 3, 2, 1)          # 3in in
     layout = {
         "components": [{"name": "a", "shape_ids": [str(a.shape_id)]},
                        {"name": "b", "shape_ids": [str(b.shape_id)]}],
         "alignments": [{"axis": "left", "anchor": "a",
                         "components": ["a", "b"], "rationale": "x"}],
     }
-    assert _synth(prs, layout) == []
+    recs = _synth(prs, layout)
+    assert len(recs) == 1, "the model's answer was thrown away by a ruler"
+    rec = recs[0]
+    assert rec["confidence"] == "low"
+    assert rec["new_value"] is None, "no target: this is not a one-click move"
+    assert "too far to move for you" in rec["message"]
+    assert not is_fixable(rec)
 
 
 def test_a_rotated_member_makes_its_component_unmeasurable(make_prs):

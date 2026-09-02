@@ -369,7 +369,8 @@ def synthesize(slide, s_idx: int, layout: dict, space, existing: list[dict],
     by_id = _boxes(slide)
     comps = _component_boxes(layout.get("components") or [], by_id)
     seen = {(r["issue_type"], str(r["shape_id"]), r.get("locator"))
-            for r in existing if r["slide_index"] == s_idx}
+            for r in existing
+            if r["slide_index"] == s_idx and r.get("source") == "vision"}
     out: list[dict] = []
     out.extend(_grouping_records(slide, s_idx, layout, comps, seen))
 
@@ -425,23 +426,31 @@ def synthesize(slide, s_idx: int, layout: dict, space, existing: list[dict],
             # and the measurement threw the answer away (31/08/2026, on a
             # two-column comparison slide whose left heading sat 9mm out).
             gap = off if anchor_is_frame else abs(off)
-            # A gap past WINDOW is a composition, not a mistake.
-            if not (TOL_EMU < gap <= WINDOW_EMU):
-                continue
+            if gap <= TOL_EMU:
+                continue          
+            snappable = gap <= WINDOW_EMU
             ids = ",".join(comp["ids"])
             rec = make_record(
                 slide_index=s_idx, shape_id=comp["ids"][0], shape_path=None,
                 module="margin_alignment",
                 issue_type="margin_alignment.component_edge_misaligned",
-                severity="warning", confidence="medium", action="flagged",
+                severity="warning",
+                confidence="medium" if snappable else "low",
+                action="flagged",
                 source="vision",
                 locator=f"comp:{axis}:{ids}",
                 property=prop,
-                old_value=edge_of(comp["box"]), new_value=int(anchor),
+                old_value=edge_of(comp["box"]),
+                new_value=int(anchor) if snappable else None,
                 profile_rule_id="geometry.alignment.edge_tolerance_emu",
                 message=(f"{name!r} sits {gap / 36000:.1f}mm off the {axis} "
                          f"edge of {why}; the fix moves its "
                          f"{len(comp['ids'])} element(s) together. "
+                         f"Component review: {rationale}"
+                         if snappable else
+                         f"{name!r} sits {gap / 36000:.0f}mm off the {axis} "
+                         f"edge of {why}, which is too far to move for you: "
+                         f"check whether it belongs on that line at all. "
                          f"Component review: {rationale}"),
             )
             key = (rec.issue_type, rec.shape_id, rec.locator)

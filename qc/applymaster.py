@@ -136,6 +136,34 @@ def _norm(name: str) -> str:
     return " ".join((name or "").split()).casefold()
 
 
+def _most_content(target_layouts: list[dict]):
+    """The last-resort home for a slide nothing else could place: the layout
+    that offers the most room for content, ties going to file order.
+
+    IT USED TO BE target_layouts[0], WHICH IS THE COVER. Masters are written
+    front to back and the cover is the first layout in most of them, so on any
+    master whose layouts carry no archetype tokens - which is most masters
+    built by a designer rather than generated, since PowerPoint only writes the
+    token for its own built-in layouts - every slide the file could not place
+    fell back onto the title layout. A deck of content slides was rebuilt as a
+    deck of covers, and the note said "content may be orphaned" without saying
+    that it certainly would be: a cover has nowhere to put any (design lead,
+    02/09/2026).
+
+    Ordering by body placeholders rather than by position asks the only
+    question a blind fallback can answer: which of these can hold the most of
+    what is on the slide. It is still a guess, still labelled "fallback", and
+    still the thing qc.layoutpick puts in front of a designer.
+    """
+    from .layoutgap import layout_signature
+
+    ranked = sorted(
+        enumerate(target_layouts),
+        key=lambda pair: (-int(layout_signature(pair[1], 1).get("bodies") or 0),
+                          pair[0]))
+    return ranked[0][1]
+
+
 def plan_assignments(deck_prs, target_layouts: list[dict]) -> list[SlidePlan]:
     """Choose a target layout for every slide, and record WHY.
 
@@ -157,7 +185,7 @@ def plan_assignments(deck_prs, target_layouts: list[dict]) -> list[SlidePlan]:
             fallback = by_type[want][0]
             break
     if fallback is None and target_layouts:
-        fallback = target_layouts[0]
+        fallback = _most_content(target_layouts)
 
     plans = []
     for idx, slide in enumerate(deck_prs.slides):

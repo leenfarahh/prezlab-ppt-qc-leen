@@ -176,15 +176,155 @@ def test_a_host_with_no_renderer_still_gets_a_usable_page(client,
     assert 'name="pick_0"' in page, "and the choice is still makeable"
 
 
-def test_every_slide_matching_skips_the_questions_but_not_the_press(
+def test_a_matched_deck_with_no_renderer_says_so_rather_than_404ing(
         client, profile_with_master, no_renderer):
-    """Certainty is not a reason to rebuild without being asked. The page states
-    what it is about to do and waits."""
+    """The page hands out an image URL per slide and renders them on demand, so
+    the ONE render a fully-matched deck attempts - the layout catalogue - is
+    also the only evidence about whether this host can render at all. Swallow
+    its failure and every card points at a 404."""
+    page = _start(client, profile_with_master).text
+
+    assert "could not be rendered" in page
+    assert "/plan-img/" not in page, "image URLs on a host that cannot render"
+    assert 'name="pick_0"' in page, "the choice is still makeable"
+
+
+def test_every_slide_matching_still_lists_every_slide(
+        client, profile_with_master, no_renderer):
+    """Certainty is not a reason to rebuild without being asked, and it is not a
+    reason to hide the deck either.
+
+    This used to assert a page with no slides on it at all: "Every slide matched
+    a layout in this master... so there is nothing to choose", and a press. The
+    press was right and the empty page was not - a designer approving a rebuild
+    of their client's deck is approving what happens to each slide, and they
+    could not see any of them (design lead, 02/09/2026)."""
     page = _start(client, profile_with_master)
+    flat = " ".join(page.text.split())
+
     assert page.status_code == 200
-    assert "Every slide matched a layout in this master" in page.text
-    # The button wraps in the source, so compare on collapsed whitespace.
+    assert "Every slide matched" in flat
+    assert "Apply master to all 2 slides" in flat
+    # both slides are on the page, both changeable
+    assert 'name="pick_0"' in page.text and 'name="pick_1"' in page.text
+    assert flat.count("Matched") >= 2
+    assert "not listed because there is nothing to decide" not in flat
+
+
+def test_a_deck_whose_choices_cannot_be_built_still_gets_a_page_and_a_press(
+        client, profile_with_master, no_renderer, monkeypatch):
+    """The degraded path, which is now the ONLY thing that reaches the
+    no-choices page.
+
+    It used to be the "every slide matched" page as well, and that conflation
+    is what let a working deck arrive at a page with no slides on it. Now a
+    matched deck gets the ordinary page and only a plan whose per-slide review
+    could not be computed lands here - qc.prep.plan swallows that rather than
+    raising, because a deck that rebuilds on the targets plan_assignments picked
+    is still a rebuilt deck."""
+    monkeypatch.setattr("qc.layoutpick.choices",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+
+    page = _start(client, profile_with_master)
+
+    assert page.status_code == 200
+    assert "could not be built for this deck" in page.text
     assert "Apply master to 2 slides" in " ".join(page.text.split())
+
+
+def test_showing_every_slide_does_not_render_every_slide(
+        client, profile_with_master, monkeypatch):
+    """The first press has to stay cheap. Every slide is on the page, and the
+    matched cards are folded with lazy images, so nothing is rendered for them
+    until somebody opens one - otherwise a 200-slide deck would go through
+    PowerPoint before the page appeared."""
+    calls = []
+
+    def _count(decks, indices, *a, **k):
+        calls.append(sorted(indices))
+        return {f"s:{i}": b"png" for i in indices}
+
+    monkeypatch.setattr("qc.render.export_decks_png", _count)
+    monkeypatch.setattr("qc.render.layout_catalogue",
+                        lambda *a, **k: (b"", [], None))
+
+    page = _start(client, profile_with_master)
+    plan_id = next(reversed(web._plans))
+
+    assert web._plans[plan_id].get("shots", {}) == {},         "a matched deck went through PowerPoint before anyone asked"
+    slide_calls = [c for c in calls if c and max(c) < 2]
+    assert slide_calls == [], f"slides rendered up front: {slide_calls}"
+    # and the cards still point at a picture, so the browser can fetch one
+    assert f"/plan-img/{plan_id}/slide-0.png" in page.text
+    assert 'loading="lazy"' in page.text
+
+
+def test_opening_a_folded_card_renders_its_window(
+        client, profile_with_master, monkeypatch):
+    """And when somebody does ask, the picture arrives - a window at a time,
+    because PowerPoint charges per call rather than per slide."""
+    monkeypatch.setattr("qc.render.export_decks_png",
+                        lambda decks, indices, *a, **k:
+                        {f"s:{i}": b"png" for i in indices})
+    monkeypatch.setattr("qc.render.layout_catalogue",
+                        lambda *a, **k: (b"", [], None))
+    _start(client, profile_with_master)
+    plan_id = next(reversed(web._plans))
+
+    got = client.get(f"/plan-img/{plan_id}/slide-1.png")
+
+    assert got.status_code == 200
+    assert got.content == b"png"
+    # the window came with it, so the neighbour is free
+    assert 0 in web._plans[plan_id]["shots"]
+
+
+def test_a_matched_slide_says_where_it_is_going_and_can_be_moved(
+        client, profile_with_master, no_renderer):
+    """The two things the old page could not do: show the layout each slide is
+    headed for, and let a designer disagree with one."""
+    page = _start(client, profile_with_master).text
+
+    assert "Going onto" in page
+    assert "Where it is now" in page, "the pre-selected option says what it is"
+    assert 'value="Blank" checked' in page,         "a matched slide pre-selects where it already is"
+
+
+def test_scrolling_past_a_matched_slide_decides_nothing(
+        client, profile_with_master, no_powerpoint, no_renderer):
+    """Every slide posts a radio now, and a matched card's radio is pre-set to
+    where the slide already is. Passing those through to apply_picks would
+    stamp "chosen by the designer" onto a whole deck nobody opened, and the
+    coverage report is built on that distinction."""
+    _start(client, profile_with_master)
+    plan_id = next(reversed(web._plans))
+    plan = web._plans[plan_id]["plan"]
+    posted = {f"pick_{c.slide_index}": c.current for c in plan.choices}
+
+    client.post(f"/prep/{plan_id}/layouts", data=posted)
+
+    rules = {p.match_rule for p in no_powerpoint["plans"]}
+    assert "chosen" not in rules, "a slide nobody looked at was recorded as decided"
+    assert all(not p.review for p in no_powerpoint["plans"])
+
+
+def test_moving_a_matched_slide_is_recorded_as_the_designers(
+        client, profile_with_master, no_powerpoint, no_renderer):
+    """The capability that did not exist before: overruling a match the file
+    made. It is a real decision and it is recorded as one."""
+    _start(client, profile_with_master)
+    plan_id = next(reversed(web._plans))
+    plan = web._plans[plan_id]["plan"]
+    first = plan.choices[0]
+    assert first.settled and first.current != "Two Content"
+
+    client.post(f"/prep/{plan_id}/layouts",
+                data={f"pick_{first.slide_index}": "Two Content"})
+
+    moved = no_powerpoint["plans"][first.slide_index]
+    assert moved.target_layout == "Two Content"
+    assert moved.match_rule == "chosen"
+    assert moved.review == "chosen by the designer"
 
 
 # -------------------------------------------------------- the second press

@@ -1359,7 +1359,7 @@ def _prep_layout_review(job_id: str, job) -> None:
         job["layout_ok"] = False
         return
 
-    _merge_records(job, new_records)
+    superseded = _merge_records(job, new_records)
     n = len(new_records)
     job["layout_note"] = (
         f"The visual model looked at {reviewed} slide"
@@ -1367,7 +1367,8 @@ def _prep_layout_review(job_id: str, job) -> None:
         f"{'thing' if n == 1 else 'things'} a designer would adjust"
         + (", listed with the rest below and tickable like any other finding."
            if n else
-           ". Nothing on the slides it saw reads as out of line."))
+           ". Nothing on the slides it saw reads as out of line.")
+        + _superseded_note(superseded))
 
 
 def _prep_page(job_id: str, job, banner: str = "", error: str | None = None):
@@ -1535,40 +1536,53 @@ def prep_deck(request: Request, deck: UploadFile = File(...),
 
 
 # ---------------------------------------------- Step 2: choosing the layouts
-# The one page between an upload and a rewritten file. Only the slides the file
-# could not place with confidence appear on it; everything else is a count.
+# The one page between an upload and a rewritten file. EVERY slide appears on
+# it; the ones the file could not place with confidence are what it leads on
+# (qc.layoutpick.choices, qc.ui_layouts).
+
+
+# How many slides one on-demand render covers. The page carries every slide
+# now, and rendering a 200-slide deck through PowerPoint before showing anything
+# would break the property the whole step exists for: the first press is
+# supposed to cost a moment, not a rebuild. A window is the same trade the
+# design page already makes (DESIGN_WINDOW) - the first picture pays for eight,
+# the next seven are free, and a designer who never scrolls past slide 12 never
+# renders slide 90.
+LAYOUT_WINDOW = 8
 
 
 def _layout_shots(plan_id: str, held: dict) -> None:
-    """Render the uncertain slides and the master's layouts, once per plan.
+    """Render the slides that are QUESTIONS, and the master's layouts, once.
 
-    Two renders, both capped by what the page shows: the slides in question
-    (never the whole deck) and the master's layout catalogue (which is one
-    small file whatever the deck's length). Cached on the held plan because a
-    designer who changes one radio and reloads must not pay for them twice.
+    The questions are the cards that open expanded, so they are what the page
+    needs pictures for on load. Every other slide is on the page too, folded,
+    and its picture is fetched by the browser when someone opens the card
+    (_ensure_plan_shot, via the img route). Both are cached on the held plan
+    because a designer who changes one radio and reloads must not pay twice.
 
     DEGRADES TO WORDS. A host with no renderer still gets the page - layout
     names, what each one holds, and what the slide is asking for are all read
     from the files - and it says so rather than showing broken images.
     """
-    if held.get("shots") or held.get("render_note"):
+    if held.get("shot_pass") or held.get("render_note"):
         return
+    held["shot_pass"] = True
     plan = held["plan"]
-    wanted = [c.slide_index for c in plan.choices]
-    if not wanted:
-        return
     from .render import export_decks_png, layout_catalogue
 
-    try:
-        pngs = export_decks_png({"s": plan.source}, wanted)
-        held["shots"] = {int(k.split(":", 1)[1]): v for k, v in pngs.items()}
-    except Exception as exc:
-        held["render_note"] = (
-            f"The slides could not be rendered on this machine "
-            f"({type(exc).__name__}), so the pictures are missing. What each "
-            f"slide holds and what each layout offers are read from the files "
-            f"and are unaffected.")
-        return
+    # The questions, which are the cards that open expanded. On a deck where
+    # everything matched this is empty and no slide is rendered until someone
+    # opens a card - which is right: nothing on that page is showing a picture
+    # yet.
+    wanted = sorted(c.slide_index for c in plan.choices if not c.settled)
+    if wanted:
+        try:
+            pngs = export_decks_png({"s": plan.source}, wanted)
+            held["shots"] = {int(k.split(":", 1)[1]): v
+                             for k, v in pngs.items()}
+        except Exception as exc:
+            held["render_note"] = _no_render_note(exc)
+            return
     try:
         catalogue, entries, _ = layout_catalogue(held["master"])
         shots = export_decks_png({"l": catalogue},
@@ -1576,11 +1590,29 @@ def _layout_shots(plan_id: str, held: dict) -> None:
         by_index = {int(k.split(":", 1)[1]): v for k, v in shots.items()}
         held["layout_thumbs"] = {e["layout"]: by_index[e["index"]]
                                  for e in entries if e["index"] in by_index}
-    except Exception:
+    except Exception as exc:
         # The slide pictures are the ones that matter; a missing layout preview
         # leaves a named option with a description, which is still a choice a
         # designer can make.
         held["layout_thumbs"] = {}
+        if not wanted:
+            # ...except on a deck where every slide matched, because then this
+            # was the ONLY render attempted and it is also the only evidence
+            # about whether this host can render at all. Without the note the
+            # page hands out an image URL per slide, every one of them 404s,
+            # and a designer gets broken pictures where the honest sentence
+            # belongs.
+            held["render_note"] = _no_render_note(exc)
+
+
+def _no_render_note(exc: Exception) -> str:
+    """What the layout page says when it has no pictures to show. One wording,
+    because it is reached from two places and a designer reading two different
+    sentences about one condition would go looking for two problems."""
+    return (f"The slides could not be rendered on this machine "
+            f"({type(exc).__name__}), so the pictures are missing. What each "
+            f"slide holds and what each layout offers are read from the files "
+            f"and are unaffected.")
 
 
 def _layouts_page(plan_id: str, message: str = "", status: int = 200):
@@ -1607,9 +1639,15 @@ def _layouts_page(plan_id: str, message: str = "", status: int = 200):
         deck_name=plan.filename, profile_name=profile_name, plan_id=plan_id,
         choices=plan.choices,
         layout_names=[l["name"] for l in plan.layouts if l.get("name")],
-        matched=plan.slides - plan.undecided,
-        slide_shots={i: f"/plan-img/{plan_id}/slide-{i}.png"
-                     for i in held.get("shots", {})},
+        # A URL FOR EVERY SLIDE, not only the ones already rendered. The route
+        # renders a window on first request (_ensure_plan_shot) and the images
+        # are lazy, so a folded card costs nothing until somebody opens it.
+        # When there is no renderer at all, render_note is set and this is
+        # empty - which is what puts the honest sentence in each card instead
+        # of an image that would never load.
+        slide_shots=({} if held.get("render_note") else
+                     {i: f"/plan-img/{plan_id}/slide-{i}.png"
+                      for i in range(plan.slides)}),
         layout_thumbs={n: f"/plan-img/{plan_id}/layout-{i}.png"
                        for i, n in enumerate(held.get("layout_thumbs", {}))},
         render_note=held.get("render_note", ""), message=message),
@@ -1619,6 +1657,45 @@ def _layouts_page(plan_id: str, message: str = "", status: int = 200):
 @app.get("/prep/{plan_id}/layouts", response_class=HTMLResponse)
 def prep_layouts(plan_id: str):
     return _layouts_page(plan_id)
+
+
+def _ensure_plan_shot(held: dict, index: int):
+    """The picture for one slide of a held plan, rendering a window of the deck
+    around it if this is the first time anybody has asked.
+
+    THE PAGE SHOWS EVERY SLIDE AND RENDERS ALMOST NONE OF THEM UP FRONT. The
+    matched cards are folded and their images carry loading="lazy", so the
+    browser only asks for a picture when a designer opens a card - and by then
+    the wait is on one interaction rather than on the press that was supposed to
+    be free. A window rather than a single slide because PowerPoint charges per
+    call, not per slide (qc.render), and someone opening one folded card usually
+    opens its neighbours.
+
+    Returns None when there is nothing to show, which the route answers 404 to.
+    The page has already said in words that rendering is unavailable if it is.
+    """
+    shots = held.setdefault("shots", {})
+    if index in shots:
+        return shots[index]
+    plan = held.get("plan")
+    if plan is None or held.get("render_note"):
+        return None
+    start = (index // LAYOUT_WINDOW) * LAYOUT_WINDOW
+    wanted = [i for i in range(start, min(plan.slides, start + LAYOUT_WINDOW))
+              if i not in shots]
+    if not wanted:
+        return None
+    from .render import export_decks_png
+
+    try:
+        pngs = export_decks_png({"s": plan.source}, wanted)
+    except Exception:
+        # Silent here on purpose: the page is already drawn and already says
+        # what it can and cannot show. A 404 leaves the card's alt text, and a
+        # designer can still read what the slide holds and pick a layout.
+        return None
+    shots.update({int(k.split(":", 1)[1]): v for k, v in pngs.items()})
+    return shots.get(index)
 
 
 @app.get("/plan-img/{plan_id}/{key}.png")
@@ -1635,7 +1712,7 @@ def plan_img(plan_id: str, key: str):
     png = None
     if key.startswith("slide-"):
         try:
-            png = held.get("shots", {}).get(int(key[6:]))
+            png = _ensure_plan_shot(held, int(key[6:]))
         except ValueError:
             png = None
     elif key.startswith("layout-"):
@@ -1673,6 +1750,7 @@ async def prep_apply_layouts(request: Request, plan_id: str):
     plan = held["plan"]
     form = await request.form()
     picks = {}
+    overridden = 0
     for choice in plan.choices:
         idx = choice.slide_index
         # The select wins over the radio when it names something: it is only
@@ -1680,13 +1758,30 @@ async def prep_apply_layouts(request: Request, plan_id: str):
         # default nobody had to touch.
         other = (form.get(f"other_{idx}") or "").strip()
         wanted = other or (form.get(f"pick_{idx}") or "").strip()
-        if wanted:
-            picks[idx] = wanted
+        if not wanted:
+            continue
+        # A SETTLED SLIDE THAT DID NOT MOVE IS NOT A DECISION. Every slide is on
+        # the page now, so every slide posts a radio - and the radio on a matched
+        # card is pre-set to where the slide already is. Passing those through
+        # would stamp match_rule "chosen" and review "chosen by the designer"
+        # onto the whole deck, and the coverage report is built on exactly that
+        # distinction: a designer confirming a suggestion and a designer never
+        # having opened the card are different facts (qc.layoutpick.apply_picks,
+        # qc.layoutgap.Coverage.not_reviewed).
+        #
+        # A settled slide the designer DID move is a real decision and is
+        # counted separately, because it is not one of the questions the page
+        # asked - it is a designer overruling a match the file made.
+        if choice.settled:
+            if wanted == choice.current:
+                continue
+            overridden += 1
+        picks[idx] = wanted
 
     moved = apply_picks(plan.plans, picks, plan.layouts)
     refused = sum(1 for v in picks.values() if v == LEAVE)
-    match_note = layout_note(len(plan.choices), len(picks) - refused, moved,
-                             refused)
+    match_note = layout_note(plan.undecided, len(picks) - refused, moved,
+                             refused, overridden)
 
     try:
         prep = run_prep(plan, held["master"], held["profile_obj"],
@@ -1999,14 +2094,14 @@ def _reaudit_in_place(job) -> str | None:
         tmp.unlink(missing_ok=True)
     manifest = result.to_manifest()
     manifest["deck"] = job["filename"]
-    survivors = _surviving_vision(job, manifest)
+    survivors = _surviving_vision(job)
     job["manifest"] = manifest
     if survivors:
         _merge_records(job, survivors)   # re-counts the summary in one place
     return None
 
 
-def _surviving_vision(job, fresh: dict) -> list:
+def _surviving_vision(job) -> list:
     """The model-raised records that outlive a re-audit.
 
     The re-audit rebuilds the manifest from qc.engine, which only knows the
@@ -2017,10 +2112,20 @@ def _surviving_vision(job, fresh: dict) -> list:
 
     Each one is re-checked against the deck as the fix has left it
     (qc.fixer.still_open), so a suggestion that has gone stale is dropped
-    rather than carried forward with a target read off the old geometry. One
-    that the re-audit has independently found is dropped too: the measured
-    record says the same thing about the same edge, and two cards moving one
-    shape to one place is how a designer stops trusting the list.
+    rather than carried forward with a target read off the old geometry. That
+    is the only test it has to pass.
+
+    IT USED TO HAVE TO PASS A SECOND ONE, and it was the wrong way round: a
+    suggestion the re-audit had independently found was dropped, on the grounds
+    that the measured record says the same thing about the same edge. It does
+    say the same thing - and it says it without the sentence explaining why a
+    designer would care, which is the whole reason a vision call was made. So
+    the model's record survives now and the measured twin is evicted when this
+    lands (_merge_records -> qc.records.vision_wins). Still exactly one card
+    per shape per move; it is just the useful one.
+
+    That is also why this no longer takes the fresh manifest: the only thing it
+    read it for was the comparison it should not have been making.
     """
     from pptx import Presentation
 
@@ -2030,8 +2135,6 @@ def _surviving_vision(job, fresh: dict) -> list:
     vision = [r for r in old if r.get("source") == "vision"]
     if not vision or job.get("deck") is None:
         return []
-    measured = {(r["slide_index"], str(r["shape_id"]), r["issue_type"],
-                 r.get("property")) for r in fresh.get("records") or []}
     try:
         slides = list(Presentation(io.BytesIO(job["deck"])).slides)
     except Exception:
@@ -2041,9 +2144,6 @@ def _surviving_vision(job, fresh: dict) -> list:
     for rec in vision:
         idx = rec["slide_index"]
         if idx >= len(slides):
-            continue
-        if (idx, str(rec["shape_id"]), rec["issue_type"],
-                rec.get("property")) in measured:
             continue
         try:
             if still_open(rec, slides[idx]):
@@ -3325,26 +3425,50 @@ def copilot(request: Request, job_id: str):
 
     new_records, reviewed = run_copilot(job["deck"], job["thumbs"],
                                         job["manifest"])
-    _merge_records(job, new_records)
+    superseded = _merge_records(job, new_records)
     return _report(f"Design copilot reviewed {reviewed} slide"
                    f"{'s' if reviewed != 1 else ''} and added "
                    f"{len(new_records)} suggestion"
                    f"{'s' if len(new_records) != 1 else ''} "
-                   "(tickable, never pre-selected).")
+                   "(tickable, never pre-selected)."
+                   + _superseded_note(superseded))
 
 
-def _merge_records(job, new_records: list[dict]) -> None:
-    """Fold reviewed suggestions into the manifest and re-count it.
+def _superseded_note(n: int) -> str:
+    """What to say when the model's answer replaced a measured one. Said out
+    loud rather than left as a quiet drop in the count, because a designer who
+    reads "added 4" against a total that moved by 1 is reading a bug."""
+    if not n:
+        return ""
+    return (f" {n} measured finding{'s' if n != 1 else ''} about the same "
+            f"shape and the same move {'were' if n != 1 else 'was'} replaced "
+            f"by the model's, which says the same thing with a reason on it.")
+
+
+def _merge_records(job, new_records: list[dict]) -> int:
+    """Fold reviewed suggestions into the manifest, evict the measured records
+    they supersede, and re-count it. Returns how many were superseded.
 
     Shared by the copilot and the component review: two passes appending to one
     manifest with two copies of the summary arithmetic is how the counts on the
-    report start disagreeing with the rows under them."""
+    report start disagreeing with the rows under them.
+
+    THE EVICTION IS THE POINT, and it is the one place it happens. When the
+    model and a measured rule name the same shape and the same move, the
+    manifest keeps the model's record and drops the rule's - it says the same
+    thing with a reason attached, and two cards moving one shape to one place
+    is how a designer stops trusting the list (qc.records.vision_wins)."""
     from collections import Counter
 
+    from .records import vision_wins
+
     if not new_records:
-        return
+        return 0
     manifest = job["manifest"]
     manifest["records"].extend(new_records)
+    before = len(manifest["records"])
+    manifest["records"] = vision_wins(manifest["records"])
+    superseded = before - len(manifest["records"])
     records = manifest["records"]
     manifest["summary"] = {
         "by_severity": dict(Counter(r["severity"] for r in records)),
@@ -3354,6 +3478,7 @@ def _merge_records(job, new_records: list[dict]) -> None:
         "total": len(records),
     }
     job["rects"] = None  # pins are renumbered on next preview
+    return superseded
 
 
 @app.post("/components/{job_id}", response_class=HTMLResponse)
@@ -3430,14 +3555,15 @@ def components(request: Request, job_id: str):
 
     new_records, reviewed = run_components(job["deck"], job["thumbs"],
                                            job["manifest"], space)
-    _merge_records(job, new_records)
+    superseded = _merge_records(job, new_records)
     frame = "against the master's frame" if space is not None \
         else "with no frame stated, so only component-to-component lines"
     return _report(f"Component review looked at {reviewed} slide"
                    f"{'s' if reviewed != 1 else ''} {frame} and added "
                    f"{len(new_records)} suggestion"
                    f"{'s' if len(new_records) != 1 else ''} "
-                   "(tickable, never pre-selected).")
+                   "(tickable, never pre-selected)."
+                   + _superseded_note(superseded))
 
 
 @app.get("/slide/{job_id}/{idx}")

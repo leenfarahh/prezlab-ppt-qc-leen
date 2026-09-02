@@ -214,7 +214,8 @@ def signature(slide, slide_w: int, slide_h: int) -> dict:
     """
     area = float(slide_w) * float(slide_h) or 1.0
     title = False
-    kinds = {"text": 0, "image": 0, "chart": 0, "table": 0, "group": 0}
+    kinds = {"text": 0, "image": 0, "chart": 0, "table": 0, "group": 0,
+             "shape": 0}
     centres: list[float] = []
     placeholders = 0
 
@@ -255,7 +256,8 @@ def signature(slide, slide_w: int, slide_h: int) -> dict:
     return {"title": title, "blocks": blocks, "columns": _columns(centres),
             "text": kinds["text"], "images": kinds["image"],
             "charts": kinds["chart"], "tables": kinds["table"],
-            "groups": kinds["group"], "placeholders": placeholders}
+            "groups": kinds["group"], "shapes": kinds["shape"],
+            "placeholders": placeholders}
 
 
 def _plural(n: int, one: str, many: str | None = None) -> str:
@@ -270,7 +272,8 @@ def describe(sig: dict) -> str:
     blocks = []
     for key, word in (("text", "text block"), ("images", "picture"),
                       ("charts", "chart"), ("tables", "table"),
-                      ("groups", "grouped element")):
+                      ("groups", "grouped element"),
+                      ("shapes", "drawn shape")):
         if sig.get(key):
             blocks.append(_plural(sig[key], word))
     if blocks:
@@ -296,6 +299,7 @@ def cluster_key(sig: dict) -> tuple:
         min(sig["blocks"], CONTENT_BUCKET_CAP),
         bool(sig["images"]),
         bool(sig["charts"] or sig["tables"]),
+        bool(sig.get("shapes")),
     )
 
 

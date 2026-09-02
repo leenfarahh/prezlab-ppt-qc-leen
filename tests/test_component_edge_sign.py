@@ -19,6 +19,7 @@ from pptx import Presentation
 from pptx.util import Emu, Pt
 
 from qc.components import synthesize
+from qc.fixer import is_fixable
 
 IN = 914400
 SLIDE_W, SLIDE_H = 12192000, 6858000
@@ -133,18 +134,32 @@ def test_a_component_outboard_of_the_FRAME_is_still_left_to_the_margin_rule():
         "a breach of the frame belongs to the margin rule, not to this one"
 
 
-def test_a_gap_too_big_to_be_drift_is_still_a_composition():
-    """Past the window it is a layout decision, whichever side it falls."""
+def test_a_gap_too_big_to_move_is_shown_without_a_target():
+    """Past the window the model is not overruled, only held to advice.
+
+    The sign fix in this file made the pass see misalignments on both sides of
+    the line. The window then threw the big ones away again - and a component
+    3in off the edge the model named is the misalignment a designer sees from
+    across the room, not the one they miss.
+
+    So it is reported with no target and low confidence: not tickable, no
+    computed move, and the model's sentence in front of the person who decides
+    (02/09/2026, with the same reasoning qc.copilot applies at its snap rail).
+    """
     slide, ids = _slide([
         (0.9, 0.5, 11.5, 0.8, "Comparing Methods"),
-        (4.0, 1.6, 2.6, 0.4, "Method 1"),      # 3.1in out: nobody nudged that
+        (4.0, 1.6, 2.6, 0.4, "Method 1"),      # 3.1in out
         (0.9, 2.2, 5.0, 3.4, "1 2 3 4 5"),
     ])
 
-    out = synthesize(slide, 0, _layout(ids), None, [], SLIDE_W, SLIDE_H)
+    out = [r for r in synthesize(slide, 0, _layout(ids), None, [],
+                                 SLIDE_W, SLIDE_H)
+           if r["issue_type"].endswith("component_edge_misaligned")]
 
-    assert not [r for r in out
-                if r["issue_type"].endswith("component_edge_misaligned")]
+    assert len(out) == 1, "the model's answer was dropped by a threshold"
+    assert out[0]["confidence"] == "low"
+    assert out[0]["new_value"] is None
+    assert not is_fixable(out[0]), "a gap this big is not a one-click move"
 
 
 @pytest.mark.parametrize("offset_in", [0.02, 0.0])

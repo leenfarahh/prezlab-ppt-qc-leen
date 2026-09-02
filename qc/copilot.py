@@ -188,11 +188,21 @@ def synthesize(slide, s_idx: int, observations: list[dict],
                existing: list[dict]) -> list[dict]:
     """Code is the precision gate: re-verify each observation against the
     real geometry and emit ordinary FindingRecords with computed targets.
-    Anything that does not check out is dropped silently."""
+    Anything that does not check out is dropped silently.
+
+    WHAT `existing` SUPPRESSES IS ANOTHER VISION RECORD, AND ONLY THAT. It used
+    to be every record on the manifest, which meant the measured module got
+    first claim on any edge it had already flagged and the model's answer about
+    that edge was thrown away - the reverse of the order these two belong in
+    (qc.records.vision_wins). The measured twin is now evicted downstream when
+    this record lands, so suppressing here would delete the winner before the
+    contest.
+    """
     by_id = {str(sh.shape_id): sh for sh in slide.shapes}
     seen = {_claim(r["issue_type"], r["shape_id"], r.get("property"),
                    r.get("locator"))
-            for r in existing if r["slide_index"] == s_idx}
+            for r in existing
+            if r["slide_index"] == s_idx and r.get("source") == "vision"}
     out: list[dict] = []
 
     def emit(**kw):

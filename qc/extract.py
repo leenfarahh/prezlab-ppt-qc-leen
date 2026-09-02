@@ -285,12 +285,53 @@ def _paragraphs(shape, slide, prs, master) -> list[dict]:
 # ------------------------------------------------------------------- shapes
 
 
+# Shape types that DRAW something whether or not anyone typed in them: a card,
+# a badge, a panel, an arrow, a diagram node, an embedded object. Listed rather
+# than inferred, because the discriminator that matters is "does this paint
+# geometry", and the type token is the file's own statement of that.
+#
+# WHY THIS LIST EXISTS. content_type used to return None for every one of these
+# unless it happened to hold text, and None means "not content" to every caller
+# downstream. On a designed deck that is most of the slide: 153 of the 754
+# top-level shapes on the corpus deck (26 slides) are AUTO_SHAPE, FREEFORM,
+# LINE or EMBEDDED_OLE_OBJECT. A slide built out of shape-drawn cards with the
+# words set in separate boxes therefore read as "no content blocks", and a
+# slide that holds nothing is a cover - so qc.layoutgap.signature reported an
+# empty slide, qc.layoutpick ranked the master's title layout against it, and
+# the coverage report clustered a deck of diagrams as a deck of covers
+# (02/09/2026). Text is one KIND of content, not the definition of it.
+#
+# Resolved to enum MEMBERS, not to the names: `shape.shape_type` returns a
+# member, and a set of strings would never match one - which is a silent miss
+# rather than an error, and it is exactly the bug this list was written with.
+# getattr guards the tokens a future python-pptx may drop.
+_DRAWN_TYPES = frozenset(
+    member for member in
+    (getattr(MSO_SHAPE_TYPE, name, None) for name in (
+        "AUTO_SHAPE", "FREEFORM", "LINE", "CALLOUT", "TEXT_EFFECT", "INK",
+        "DIAGRAM", "IGX_GRAPHIC", "CANVAS", "MEDIA", "WEB_VIDEO",
+        "EMBEDDED_OLE_OBJECT", "LINKED_OLE_OBJECT", "OLE_CONTROL_OBJECT",
+        "FORM_CONTROL",
+    )) if member is not None)
+
+
 def content_type(shape) -> str | None:
     """What the shape IS, one word, resolved in a fixed order.
 
     A chart and a table are graphic frames that also answer to has_text_frame,
     so the order matters: read the wrong one first and every chart on the deck
-    is reported as a text box."""
+    is reported as a text box.
+
+    Text is read BEFORE the drawn types on purpose: an autoshape with words in
+    it is a text block that happens to have a fill, and calling it a shape
+    would take the labelled cards off the text count the layout rules read.
+    What changed is only the floor - a wordless drawn shape is now "shape"
+    rather than None (see _DRAWN_TYPES).
+
+    None still means "not content", and it still has two occupants: an EMPTY
+    text box or placeholder, which paints nothing and is invisible on the
+    rendered slide, and anything whose type this cannot read.
+    """
     try:
         if shape.has_chart:
             return "chart"
@@ -298,15 +339,18 @@ def content_type(shape) -> str | None:
             return "table"
     except Exception:
         pass
-    if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+    kind = shape.shape_type
+    if kind == MSO_SHAPE_TYPE.PICTURE or kind == MSO_SHAPE_TYPE.LINKED_PICTURE:
         return "image"
-    if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+    if kind == MSO_SHAPE_TYPE.GROUP:
         return "group"
     try:
         if shape.has_text_frame and shape.text_frame.text.strip():
             return "text"
     except Exception:
         pass
+    if kind in _DRAWN_TYPES:
+        return "shape"
     return None
 
 

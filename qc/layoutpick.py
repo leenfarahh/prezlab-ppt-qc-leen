@@ -36,8 +36,8 @@ of them survived the move. A hundred-slide deck gets a hundred answers.
 
 from dataclasses import dataclass, field
 
-from .layoutgap import (CONTENT_BUCKET_CAP, describe, fits, layout_signature,
-                        signature)
+from .layoutgap import (CONTENT_BUCKET_CAP, MIN_BOXES_TO_JUDGE, describe,
+                        fits, layout_signature, signature)
 
 # --- calibration ----------------------------------------------------------
 #
@@ -98,19 +98,28 @@ class Candidate:
 
 @dataclass
 class Choice:
-    """One slide the file could not place with confidence, and what it could
-    be placed on instead."""
+    """One slide, the layout it is going onto, and what else it could go on."""
     slide_index: int
     current: str | None       # what plan_assignments picked unaided
     rule: str                 # how it picked: "fallback", "name", "archetype"
     reason: str               # why the designer is being asked about this one
     wants: str                # what the slide holds, as a sentence
     candidates: list = field(default_factory=list)
+    settled: bool = False
 
     @property
     def suggested(self) -> str | None:
-        """The top-ranked layout, which is what the form pre-selects. Not
-        "the answer": it is where the designer's eye starts."""
+        """What the form pre-selects.
+
+        A settled slide pre-selects WHERE IT ALREADY IS, not what the ranking
+        would have chosen. The ranking is arithmetic and the file's own name
+        match is a designer's stated intent; moving a matched slide because a
+        score preferred something else would rewrite decisions nobody asked to
+        revisit, and a page that does that on load is a page whose defaults
+        cannot be trusted.
+        """
+        if self.settled:
+            return self.current
         return self.candidates[0].name if self.candidates else self.current
 
 
@@ -149,6 +158,42 @@ def _score(sig: dict, lay: dict, entry: dict, source_type: str | None,
     return score
 
 
+def _holds_content(sig: dict, lay: dict, ok: bool, why: str) -> tuple[bool, str]:
+    """The one place where "cannot be judged" must not read as "fits".
+
+    qc.layoutgap.fits answers a DIFFERENT question - is this placed slide a
+    misfit worth reporting - and it answers "no" for a layout with no content
+    boxes on purpose: a slide sitting on Blank is the migration pass's business,
+    not the coverage report's (MIN_BOXES_TO_JUDGE).
+
+    Reused here unguarded, that abstention became the top of the dropdown. The
+    ranking sorts fitting layouts above non-fitting ones whatever the score, so
+    a Cover - a title layout with zero body placeholders, which every master
+    has - was the only "fitting" candidate for any slide with content, carrying
+    the worst score in the list. A deck of diagrams was offered a cover, twenty
+    six times (design lead, 02/09/2026).
+
+    A layout that offers nowhere to put content cannot hold a slide that has
+    some. It stays in the dropdown, ranked on its score like everything else;
+    it just stops claiming to fit.
+    """
+    if not ok:
+        return ok, why
+    if int(lay.get("bodies") or 0) >= MIN_BOXES_TO_JUDGE:
+        return ok, why
+    blocks = int(sig.get("blocks") or 0)
+    if not blocks:
+        return ok, why          # an empty slide and an empty layout do agree
+    return False, (f"the layout offers no content boxes and the slide has "
+                   f"{_plural_blocks(blocks)}")
+
+
+def _plural_blocks(n: int) -> str:
+    from .layoutgap import _plural
+
+    return _plural(n, "content block")
+
+
 def rank(slide, layouts: list[dict], slide_w: int, slide_h: int,
          source_type: str | None = None,
          source_name: str = "") -> tuple[list, dict]:
@@ -167,6 +212,7 @@ def rank(slide, layouts: list[dict], slide_w: int, slide_h: int,
             continue
         lay = layout_signature(entry, slide_w)
         ok, why = fits(sig, lay)
+        ok, why = _holds_content(sig, lay, ok, why)
         out.append(Candidate(
             name=name, score=_score(sig, lay, entry, source_type, source_name),
             fits=ok, offers=_offers_sentence(lay), why="" if ok else why))
@@ -186,20 +232,32 @@ def _offers_sentence(lay: dict) -> str:
 
 
 def choices(deck_prs, layouts: list[dict], plans: list) -> list:
-    """The slides worth a designer's decision, each with the master's layouts
-    ranked against it.
+    """EVERY slide, in deck order, with the master's layouts ranked against it
+    and a flag saying whether it is a question.
 
-    Two kinds qualify, and they are different questions wearing the same shirt.
+    Three kinds, and the flag is the difference between them.
+
     A FALLBACK is a slide the file could not place at all: nothing is known and
     the pick is the whole answer. A MISFIT was placed - by name, usually - onto
     a layout whose boxes its content does not fit, which is a claim about intent
     that only a person can settle: a designer who named two layouts the same
     thing may well have meant them to correspond even though the content has
-    outgrown one of them.
+    outgrown one of them. Both are questions, and `settled` is False on them.
 
-    Everything else is left alone. A slide whose name matched a layout that fits
-    it is not a question, and putting it in front of a designer to approve is
-    how a review page becomes a page people click through without reading.
+    A MATCHED slide is one the file placed onto a layout its content fits.
+    `settled` is True: it is not a question, it is not counted as one, and
+    leaving it alone records nothing.
+
+    IT USED TO BE OMITTED ENTIRELY, replaced by a line at the foot of the page
+    saying how many were "not listed because there is nothing to decide about
+    them" - and a designer reviewing a rebuild before it happens wants to SEE
+    the deck, not be told the parts of it they are not allowed to look at
+    (design lead, 02/09/2026). The reasoning behind the omission still holds
+    and is now expressed by the flag rather than by the absence: a page that
+    asks forty questions to surface four gets pressed through unread, so the
+    four are what the count and the styling lead on. What changed is that the
+    other thirty six are visible, checkable against the layout they are going
+    onto, and changeable by anyone who disagrees.
     """
     from .layoutgap import misfits as find_misfits
 
@@ -219,29 +277,58 @@ def choices(deck_prs, layouts: list[dict], plans: list) -> list:
         if idx >= len(slides):
             continue
         misfit = misfit_by_index.get(idx)
+        settled = False
         if plan.match_rule in ("fallback", "none"):
             reason = (plan.note or "the file names no layout this master has")
         elif misfit is not None:
             reason = (f"matched by {plan.match_rule} to "
                       f"'{plan.target_layout}', but {misfit.reason}")
         else:
-            continue
+            settled = True
+            reason = (f"matched by {plan.match_rule} to "
+                      f"'{plan.target_layout}', which has room for what is on "
+                      f"it")
 
         try:
             candidates, sig = rank(slides[idx], layouts, slide_w, slide_h,
                                    source_type=plan.source_type,
                                    source_name=plan.source_layout)
         except Exception:
-            # One unreadable slide must not cost the page. It keeps whatever
-            # plan_assignments gave it and is not offered for a decision, which
-            # is the same outcome as before this step existed.
             continue
 
+        shortlist = _shortlist(candidates, plan.target_layout, settled)
         out.append(Choice(
             slide_index=idx, current=plan.target_layout,
             rule=plan.match_rule, reason=reason, wants=describe(sig),
-            candidates=candidates[:SHORTLIST]))
+            candidates=shortlist, settled=settled))
     return out
+
+
+def _shortlist(candidates: list, current: str | None, settled: bool) -> list:
+    """The five worth reading, with the layout the slide is ALREADY GOING ONTO
+    guaranteed to be among them for a settled slide.
+
+    Without this the page can pre-select something it is not showing: the
+    ranking is by score, a name match is not, and a slide matched by name to a
+    layout that scores seventh has that layout nowhere in its five radios. The
+    designer then sees a card whose options are all wrong and no indication of
+    where the slide is actually going. It leads because it is the answer.
+    """
+    if not settled or not current:
+        return candidates[:SHORTLIST]
+    here = next((c for c in candidates if c.name == current), None)
+    if here is None:
+        return candidates[:SHORTLIST]
+    rest = [c for c in candidates if c.name != current]
+    return [here] + rest[:SHORTLIST - 1]
+
+
+def undecided(choices_list: list) -> int:
+    """How many of those are actually questions. The number the page leads on
+    and the number the run's note is written against - `len(choices)` counts
+    the whole deck now and would report every slide as a decision nobody
+    made."""
+    return sum(1 for c in choices_list if not c.settled)
 
 
 def apply_picks(plans: list, picks: dict, layouts: list[dict]) -> int:
@@ -271,8 +358,6 @@ def apply_picks(plans: list, picks: dict, layouts: list[dict]) -> int:
         if plan is None:
             continue
         if wanted == LEAVE:
-            # The target and the rule are untouched: the slide still rebuilds on
-            # whatever the file gave it. What changes is that somebody looked.
             plan.review = "no fit"
             continue
         real = known.get((wanted or "").strip().casefold())
@@ -288,7 +373,7 @@ def apply_picks(plans: list, picks: dict, layouts: list[dict]) -> int:
 
 
 def note(choices_offered: int, picked: int, moved: int,
-         refused: int = 0) -> str:
+         refused: int = 0, overridden: int = 0) -> str:
     """What happened at the layout step, for the run's own record.
 
     Reads off counts rather than off the plans, so the sentence on the results
@@ -296,21 +381,39 @@ def note(choices_offered: int, picked: int, moved: int,
 
     `refused` is said separately from "left on the fallback" because they are
     different facts: one is a designer saying this master has no home for the
-    slide, the other is a slide nobody got to."""
-    if not choices_offered:
+    slide, the other is a slide nobody got to.
+
+    `overridden` is separate for the same reason and is new with the page
+    showing every slide (02/09/2026): a designer moving a slide the FILE
+    matched is not answering one of the questions the page asked, it is
+    disagreeing with a match nobody flagged. Counted apart so a run where the
+    tool was never in doubt and a designer moved three slides anyway does not
+    read as a run with three open questions. It is included in `moved`, which
+    is the count of slides that actually changed layout.
+    """
+    if not choices_offered and not overridden:
         return ("Every slide matched a layout in this master by name or "
                 "archetype, so there was nothing to choose.")
-    bits = [f"{choices_offered} slide"
-            f"{'s' if choices_offered != 1 else ''} needed a layout decision"]
+    bits = []
+    if choices_offered:
+        bits.append(f"{choices_offered} slide"
+                    f"{'s' if choices_offered != 1 else ''} needed a layout "
+                    f"decision")
     if moved:
         bits.append(f"{moved} moved to a layout you picked")
+    # An override is BOTH a pick and a move, so it cancels out of this one:
+    # subtracting it here as well would report a slide that was answered and
+    # not moved as neither.
     kept = picked - moved
     if kept > 0:
         bits.append(f"{kept} kept the suggestion")
     if refused:
         bits.append(f"{refused} had no layout in this master that fits, which "
                     f"is a gap in the master rather than a fault on the slide")
-    untouched = choices_offered - picked - refused
+    if overridden:
+        bits.append(f"{overridden} of the moves {'were' if overridden != 1 else 'was'} "
+                    f"a slide the file had already matched, which you changed")
+    untouched = choices_offered - (picked - overridden) - refused
     if untouched > 0:
         bits.append(f"{untouched} were left on the fallback the file gave them")
     return ", ".join(bits) + "."

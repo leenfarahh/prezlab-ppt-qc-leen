@@ -154,7 +154,7 @@ class Plan:
     source: bytes
     layouts: list = field(default_factory=list)
     plans: list = field(default_factory=list)        # SlidePlan, all slides
-    choices: list = field(default_factory=list)      # Choice, the uncertain
+    choices: list = field(default_factory=list)      # Choice, EVERY slide
     space: object | None = None
     master_size: tuple = ()
 
@@ -164,7 +164,15 @@ class Plan:
 
     @property
     def undecided(self) -> int:
-        return len(self.choices)
+        """Slides that are a QUESTION, not slides on the page.
+
+        Those were the same number until the layout step started showing the
+        whole deck (qc.layoutpick.choices, 02/09/2026). Counting the page would
+        report every matched slide as a decision nobody made, and the run's own
+        note and the coverage report are both written off this."""
+        from .layoutpick import undecided as count_undecided
+
+        return count_undecided(self.choices)
 
 
 def plan(data: bytes, filename: str, master_bytes: bytes) -> Plan:
